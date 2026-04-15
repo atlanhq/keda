@@ -273,7 +273,7 @@ func buildScaler(ctx context.Context, client client.Client, triggerType string, 
 	case "sumologic":
 		return scalers.NewSumologicScaler(config)
 	case "temporal":
-		return scalers.NewTemporalScaler(ctx, config)
+		return scalers.NewTemporalScaler(ctx, client, config)
 	default:
 		return nil, fmt.Errorf("no scaler found for type: %s", triggerType)
 	}
