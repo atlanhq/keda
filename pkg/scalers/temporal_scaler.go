@@ -224,25 +224,36 @@ func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
 	}
 
 	backlog := getCombinedBacklogCount(resp)
-	metric := backlog
 
+	var runningCount int64
 	if s.metadata.IncludeRunningWorkflowCount {
-		runningCount, err := s.getRunningWorkflowCount(ctx)
+		var err error
+		runningCount, err = s.getRunningWorkflowCount(ctx)
 		if err != nil {
 			s.logger.V(1).Info("failed to get running workflow count, using backlog only", "error", err)
-		} else {
-			metric += runningCount
+			runningCount = 0
 		}
 	}
 
-	usedSlots, err := s.getUsedWorkerSlots(ctx)
-	if err != nil {
-		s.logger.Info("failed to get worker slots metric, excluding from metric", "error", err)
-	} else {
-		metric += usedSlots
+	usedSlots, slotsErr := s.getUsedWorkerSlots(ctx)
+	if slotsErr != nil {
+		s.logger.Info("failed to get worker slots metric, excluding from metric", "error", slotsErr)
 	}
 
-	return metric, nil
+	return composeMetric(backlog, runningCount, usedSlots, slotsErr == nil), nil
+}
+
+// composeMetric returns the composite scaling metric. Slots are gated on
+// runningCount > 0 to avoid the SDK ghost-flicker false positive: when no
+// workflow is running, non-empty poll responses lacking activity_type still
+// mark the slot used (see sdk-core pollers/mod.rs:162-170), keeping cooldown
+// reset forever and blocking scale-to-zero.
+func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable bool) int64 {
+	metric := backlog + runningCount
+	if slotsAvailable && runningCount > 0 {
+		metric += usedSlots
+	}
+	return metric
 }
 
 // getRunningWorkflowCount returns the approximate number of running workflow executions

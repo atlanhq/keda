@@ -679,3 +679,32 @@ func TestGetUsedWorkerSlotsTimeout(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), slots)
 }
+
+func TestComposeMetric(t *testing.T) {
+	tests := []struct {
+		name           string
+		backlog        int64
+		runningCount   int64
+		usedSlots      int64
+		slotsAvailable bool
+		want           int64
+	}{
+		{name: "idle", backlog: 0, runningCount: 0, usedSlots: 0, slotsAvailable: true, want: 0},
+		{name: "ghost flicker — slots without workflow ignored", backlog: 0, runningCount: 0, usedSlots: 1, slotsAvailable: true, want: 0},
+		{name: "ghost flicker (multi)", backlog: 0, runningCount: 0, usedSlots: 5, slotsAvailable: true, want: 0},
+		{name: "active workflow with many activities", backlog: 0, runningCount: 1, usedSlots: 50, slotsAvailable: true, want: 51},
+		{name: "active workflow + backlog + slots", backlog: 100, runningCount: 2, usedSlots: 8, slotsAvailable: true, want: 110},
+		{name: "backlog only", backlog: 25, runningCount: 0, usedSlots: 0, slotsAvailable: true, want: 25},
+		{name: "backlog with ghost flicker", backlog: 7, runningCount: 0, usedSlots: 1, slotsAvailable: true, want: 7},
+		{name: "slots scrape failed, workflow running", backlog: 0, runningCount: 3, usedSlots: 99, slotsAvailable: false, want: 3},
+		{name: "slots scrape failed, no workflow", backlog: 4, runningCount: 0, usedSlots: 99, slotsAvailable: false, want: 4},
+		{name: "slots scrape failed with backlog and workflow", backlog: 10, runningCount: 2, usedSlots: 99, slotsAvailable: false, want: 12},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := composeMetric(tc.backlog, tc.runningCount, tc.usedSlots, tc.slotsAvailable)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
