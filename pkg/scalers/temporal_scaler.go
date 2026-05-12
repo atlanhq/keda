@@ -65,10 +65,28 @@ var (
 		},
 		[]string{"namespace", "task_queue", "reason"},
 	)
+
+	// temporalSlotsBlind is a gauge reflecting current scrape blind state per task queue:
+	//   1 = last scrape attempt fell back to 0 because all pod scrapes failed and the
+	//       cache had expired (scale-down protection is currently lost)
+	//   0 = last scrape produced a fresh value or a cached value within TTL
+	// Use this gauge for alerting instead of the counter so alerts auto-clear on
+	// recovery and do not piggyback on lingering counter history.
+	temporalSlotsBlind = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "keda",
+			Subsystem: "temporal_scaler",
+			Name:      "worker_slots_blind",
+			Help: "Current temporal worker slot scrape blind state. " +
+				"1 when last scrape returned 0 due to all pods failing and cache expiring; 0 otherwise.",
+		},
+		[]string{"namespace", "task_queue"},
+	)
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(temporalSlotsScrapeErrors)
+	ctrlmetrics.Registry.MustRegister(temporalSlotsBlind)
 }
 
 type slotsCache struct {
@@ -300,6 +318,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 	}
 
 	if len(podList.Items) == 0 {
+		temporalSlotsBlind.WithLabelValues(s.podNamespace, s.metadata.TaskQueue).Set(0)
 		return 0, nil
 	}
 
@@ -340,7 +359,10 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 		"podCount", len(podList.Items), "scrapedCount", scrapedCount)
 
 	// No ready pods to scrape (e.g. all pods still starting up) — return 0.
+	// This is not a scrape failure (no scrape was attempted), so do not flag
+	// blind state; rely on cache TTL semantics on subsequent polls.
 	if attemptedCount == 0 {
+		temporalSlotsBlind.WithLabelValues(s.podNamespace, s.metadata.TaskQueue).Set(0)
 		return 0, nil
 	}
 
@@ -353,10 +375,12 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 			s.logger.Info("all scrapes failed, using cached slots value",
 				"cachedValue", cached.value, "cacheAge", time.Since(cached.timestamp).String())
 			temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "all_pods_failed_cache_hit").Inc()
+			temporalSlotsBlind.WithLabelValues(s.podNamespace, s.metadata.TaskQueue).Set(0)
 			return cached.value, nil
 		}
 		s.logger.Info("all scrapes failed and cache expired, returning 0")
 		temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "all_pods_failed_cache_expired").Inc()
+		temporalSlotsBlind.WithLabelValues(s.podNamespace, s.metadata.TaskQueue).Set(1)
 		return 0, nil
 	}
 
@@ -364,6 +388,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 	s.slotsMu.Lock()
 	s.lastSlots = slotsCache{value: totalUsedSlots, timestamp: time.Now()}
 	s.slotsMu.Unlock()
+	temporalSlotsBlind.WithLabelValues(s.podNamespace, s.metadata.TaskQueue).Set(0)
 
 	return totalUsedSlots, nil
 }
