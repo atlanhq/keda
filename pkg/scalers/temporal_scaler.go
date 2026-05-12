@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	deploymentpb "go.temporal.io/api/deployment/v1"
-	enumspb "go.temporal.io/api/enums/v1"
-	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	sdk "go.temporal.io/sdk/client"
 	sdklog "go.temporal.io/sdk/log"
@@ -39,14 +37,6 @@ var (
 	validVisibilityQueryLiteral = regexp.MustCompile(`^[a-zA-Z0-9\-_./:]+$`)
 )
 
-// workerDeploymentVersionSeparator joins deployment name and build id to form the
-// TemporalWorkerDeploymentVersion search attribute value (e.g. "my-deploy:v1").
-// This matches the modern (v1.32+) Temporal server format written by
-// ExternalWorkerDeploymentVersionToString in temporal/common/worker_versioning.
-// The legacy v0.31 delimiter ('.') is not used here — visibility queries against
-// modern servers will not match values written with the old delimiter.
-const workerDeploymentVersionSeparator = ":"
-
 type temporalScaler struct {
 	metricType v2.MetricTargetType
 	metadata   *temporalMetadata
@@ -61,17 +51,18 @@ type temporalMetadata struct {
 	TargetQueueSize           int64    `keda:"name=targetQueueSize,           order=triggerMetadata, default=5"`
 	TaskQueue                 string   `keda:"name=taskQueue,                 order=triggerMetadata;resolvedEnv"`
 	QueueTypes                []string `keda:"name=queueTypes,                order=triggerMetadata, optional"`
-	BuildID                   string   `keda:"name=buildId,                   order=triggerMetadata;resolvedEnv, optional, deprecated=The 'buildId' setting is DEPRECATED and is removed in v2.21 because Temporal Server is dropping support for the Rules-Based Versioning APIs - Use 'workerDeploymentName' and 'workerDeploymentBuildId' instead"`
-	WorkerDeploymentName      string   `keda:"name=workerDeploymentName,      order=triggerMetadata;resolvedEnv, optional"`
-	WorkerDeploymentBuildID   string   `keda:"name=workerDeploymentBuildId,   order=triggerMetadata;resolvedEnv, optional"`
-	AllActive                 bool     `keda:"name=selectAllActive,           order=triggerMetadata, default=false, deprecated=The 'selectAllActive' setting is DEPRECATED and is removed in v2.21 because Temporal Server is dropping support for the Rules-Based Versioning APIs - Use 'workerDeploymentName' and 'workerDeploymentBuildId' instead"`
-	Unversioned               bool     `keda:"name=selectUnversioned,         order=triggerMetadata, default=false, deprecated=The 'selectUnversioned' setting is DEPRECATED and is removed in v2.21 because Temporal Server is dropping support for the Rules-Based Versioning APIs - Remove it if your workers are unversioned. Or use 'workerDeploymentName' and 'workerDeploymentBuildId' if you're migrating to Worker Deployment Versioning"`
-	// IncludeRunningWorkflowCount, when true, keeps the scaler active if there are running
-	// workflows on the task queue even after the backlog drains to zero. It only affects the
-	// activity decision, never the reported metric value. Defaults to false to preserve prior
-	// behavior. Activity-worker scalers can still use this by pointing WorkflowTaskQueueForCount
-	// at the workflow task queue whose in-flight workflows should keep the activity workers alive.
-	IncludeRunningWorkflowCount bool   `keda:"name=includeRunningWorkflowCount, order=triggerMetadata, default=false"`
+	// buildId, selectAllActive and selectUnversioned are rejected upstream since v2.21. The fork
+	// keeps accepting them: the temporal-worker-controller sets selectUnversioned on Current and
+	// Ramping versions, and getQueueSize forwards all three to DescribeTaskQueueEnhanced.
+	BuildID                 string `keda:"name=buildId,                   order=triggerMetadata;resolvedEnv, optional"`
+	WorkerDeploymentName    string `keda:"name=workerDeploymentName,      order=triggerMetadata;resolvedEnv, optional"`
+	WorkerDeploymentBuildID string `keda:"name=workerDeploymentBuildId,   order=triggerMetadata;resolvedEnv, optional"`
+	AllActive               bool   `keda:"name=selectAllActive,           order=triggerMetadata, default=false"`
+	Unversioned             bool   `keda:"name=selectUnversioned,         order=triggerMetadata, default=false"`
+	// IncludeRunningWorkflowCount adds the running workflow count on the task queue (or on
+	// WorkflowTaskQueueForCount) to the reported metric, so workers are not scaled away while
+	// workflows are still executing and the backlog is momentarily empty.
+	IncludeRunningWorkflowCount bool   `keda:"name=includeRunningWorkflowCount, order=triggerMetadata, default=true"`
 	WorkflowTaskQueueForCount   string `keda:"name=workflowTaskQueueForCount,   order=triggerMetadata;resolvedEnv, optional"`
 	APIKey                      string `keda:"name=apiKey,                    order=authParams;resolvedEnv, optional"`
 	MinConnectTimeout           int    `keda:"name=minConnectTimeout,         order=triggerMetadata, default=5"`
@@ -107,9 +98,6 @@ func (a *temporalMetadata) Validate() error {
 		return fmt.Errorf("workerDeploymentName and workerDeploymentBuildId must both be set")
 	}
 
-	if a.WorkflowTaskQueueForCount != "" && !a.IncludeRunningWorkflowCount {
-		return fmt.Errorf("workflowTaskQueueForCount has no effect unless includeRunningWorkflowCount is true")
-	}
 	if a.IncludeRunningWorkflowCount {
 		for _, name := range []string{a.TaskQueue, a.WorkflowTaskQueueForCount, a.WorkerDeploymentName, a.WorkerDeploymentBuildID} {
 			if name != "" && !validVisibilityQueryLiteral.MatchString(name) {
@@ -146,6 +134,7 @@ func NewTemporalScaler(ctx context.Context, config *scalersconfig.ScalerConfig) 
 		"taskQueue", meta.TaskQueue,
 		"targetQueueSize", meta.TargetQueueSize,
 		"activationTargetQueueSize", meta.ActivationTargetQueueSize,
+		"includeRunningWorkflowCount", meta.IncludeRunningWorkflowCount,
 		"authType", authType(meta),
 		"unsafeSsl", meta.UnsafeSsl,
 	}
@@ -154,6 +143,9 @@ func NewTemporalScaler(ctx context.Context, config *scalersconfig.ScalerConfig) 
 	}
 	if meta.WorkerDeploymentName != "" {
 		kv = append(kv, "workerDeploymentName", meta.WorkerDeploymentName, "workerDeploymentBuildId", meta.WorkerDeploymentBuildID)
+	}
+	if meta.BuildID != "" || meta.AllActive || meta.Unversioned {
+		kv = append(kv, "buildId", meta.BuildID, "selectAllActive", meta.AllActive, "selectUnversioned", meta.Unversioned)
 	}
 	if len(meta.QueueTypes) > 0 {
 		kv = append(kv, "queueTypes", meta.QueueTypes)
@@ -199,232 +191,98 @@ func (s *temporalScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpe
 }
 
 func (s *temporalScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
-	var (
-		backlogCount  int64
-		versionStatus enumspb.WorkerDeploymentVersionStatus
-		hasStatus     bool
-		err           error
-	)
-	switch {
-	case s.metadata.WorkerDeploymentName != "":
-		backlogCount, versionStatus, err = s.getDeploymentBacklogCountAndStatus(ctx)
-		hasStatus = true
-	default:
-		backlogCount, err = s.getUnversionedBacklogCount(ctx)
-	}
+	queueSize, err := s.getQueueSize(ctx)
 	if err != nil {
-		s.logger.Error(err, "failed to get Temporal backlog count",
+		s.logger.Error(err, "failed to get Temporal queue size",
 			"mode", scalerMode(s.metadata),
 			"namespace", s.metadata.Namespace,
 			"taskQueue", s.metadata.TaskQueue,
 			"grpcCode", status.Code(err).String())
-		return nil, false, fmt.Errorf("failed to get Temporal backlog count: %w", err)
+		return nil, false, fmt.Errorf("failed to get Temporal queue size: %w", err)
 	}
 
-	metric := GenerateMetricInMili(metricName, float64(backlogCount))
-	isActive := backlogCount > s.metadata.ActivationTargetQueueSize
-	if !isActive && s.metadata.IncludeRunningWorkflowCount {
-		isActive = s.isActiveWithoutBacklog(ctx, hasStatus, versionStatus)
-	}
+	metric := GenerateMetricInMili(metricName, float64(queueSize))
+	isActive := queueSize > s.metadata.ActivationTargetQueueSize
 
-	s.logger.V(1).Info("polled Temporal backlog",
+	s.logger.V(1).Info("polled Temporal queue size",
 		"mode", scalerMode(s.metadata),
 		"namespace", s.metadata.Namespace,
 		"taskQueue", s.metadata.TaskQueue,
 		"workerDeploymentName", s.metadata.WorkerDeploymentName,
 		"workerDeploymentBuildId", s.metadata.WorkerDeploymentBuildID,
-		"workerDeploymentVersionStatus", versionStatus.String(),
-		"backlogCount", backlogCount,
+		"queueSize", queueSize,
 		"activationThreshold", s.metadata.ActivationTargetQueueSize,
 		"isActive", isActive)
 
 	return []external_metrics.ExternalMetricValue{metric}, isActive, nil
 }
 
-// isActiveWithoutBacklog decides whether the scaler should remain active when the
-// backlog is at or below the activation threshold. It is only invoked when the user
-// has opted in via includeRunningWorkflowCount.
-//
-// For deployment-version scalers the Worker Deployment Version status short-circuits:
-//   - DRAINING versions are kept active because Temporal keeps replaying workflows
-//     pinned to that version until they complete, and the server checks completion
-//     periodically (roughly every 3 minutes); polling visibility here would just
-//     duplicate that signal at the risk of a false negative during eventual consistency.
-//   - CURRENT / RAMPING versions fall through to a visibility count; new work can
-//     land on these versions, so the running-count check is the only signal available.
-//   - DRAINED / INACTIVE / UNSPECIFIED versions are safe to scale down.
-//
-// For the unversioned mode we always fall through to the visibility count.
-//
-// Callers should be aware that this signal is approximate: it does not cover
-// activity-only workers, visibility indexing has no SLA (eventual consistency is
-// typically a few seconds but has no upper bound), CountWorkflow itself is
-// documented as approximate, and the Temporal frontend rate-limits all visibility
-// calls to roughly 10 RPS per namespace per instance.
-func (s *temporalScaler) isActiveWithoutBacklog(ctx context.Context, hasStatus bool, versionStatus enumspb.WorkerDeploymentVersionStatus) bool {
-	if hasStatus {
-		switch versionStatus {
-		case enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_DRAINING:
-			return true
-		case enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_CURRENT,
-			enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_RAMPING:
-			// fall through to the visibility count
-		default:
-			return false
+func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
+	var selection *sdk.TaskQueueVersionSelection
+	if s.metadata.AllActive || s.metadata.Unversioned || s.metadata.BuildID != "" {
+		selection = &sdk.TaskQueueVersionSelection{
+			AllActive:   s.metadata.AllActive,
+			Unversioned: s.metadata.Unversioned,
+			BuildIDs:    []string{s.metadata.BuildID},
 		}
+	}
+
+	queueType := getQueueTypes(s.metadata.QueueTypes)
+
+	resp, err := s.tcl.DescribeTaskQueueEnhanced(ctx, sdk.DescribeTaskQueueEnhancedOptions{
+		TaskQueue:      s.metadata.TaskQueue,
+		ReportStats:    true,
+		Versions:       selection,
+		TaskQueueTypes: queueType,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to get Temporal queue size: %w", err)
+	}
+
+	backlog := getCombinedBacklogCount(resp)
+
+	if !s.metadata.IncludeRunningWorkflowCount {
+		return backlog, nil
 	}
 
 	runningCount, err := s.getRunningWorkflowCount(ctx)
 	if err != nil {
-		s.logger.V(1).Info("failed to get running workflow count, treating as no-signal",
-			"mode", scalerMode(s.metadata),
-			"error", err)
-		return false
-	}
-	return runningCount > 0
-}
-
-// getUnversionedBacklogCount queries DescribeTaskQueue for each configured queue
-// type and returns the summed backlog count. This replaces DescribeTaskQueueEnhanced
-// for the unversioned path, which is deprecated and returns the default Build ID's
-// backlog when no Versions selector is provided (not the unversioned queue).
-func (s *temporalScaler) getUnversionedBacklogCount(ctx context.Context) (int64, error) {
-	var total int64
-	for _, qt := range getQueueTypes(s.metadata.QueueTypes) {
-		tqt := enumspb.TaskQueueType(qt)
-		resp, err := s.tcl.WorkflowService().DescribeTaskQueue(ctx, &workflowservice.DescribeTaskQueueRequest{
-			Namespace:     s.metadata.Namespace,
-			TaskQueue:     &taskqueuepb.TaskQueue{Name: s.metadata.TaskQueue, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
-			TaskQueueType: tqt,
-			ReportStats:   true,
-		})
-		if err != nil {
-			return 0, fmt.Errorf("failed to describe task queue %q (type %s): %w", s.metadata.TaskQueue, tqt, err)
-		}
-		if stats := resp.GetStats(); stats != nil {
-			total += stats.GetApproximateBacklogCount()
-		}
-	}
-	return total, nil
-}
-
-func (s *temporalScaler) getDeploymentBacklogCountAndStatus(ctx context.Context) (int64, enumspb.WorkerDeploymentVersionStatus, error) {
-	resp, err := s.tcl.WorkflowService().DescribeWorkerDeploymentVersion(ctx,
-		&workflowservice.DescribeWorkerDeploymentVersionRequest{
-			Namespace: s.metadata.Namespace,
-			DeploymentVersion: &deploymentpb.WorkerDeploymentVersion{
-				DeploymentName: s.metadata.WorkerDeploymentName,
-				BuildId:        s.metadata.WorkerDeploymentBuildID,
-			},
-			ReportTaskQueueStats: true,
-		},
-	)
-	if err != nil {
-		return 0, enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_UNSPECIFIED,
-			fmt.Errorf("failed to describe worker deployment version (deploymentName=%q, buildId=%q): %w",
-				s.metadata.WorkerDeploymentName, s.metadata.WorkerDeploymentBuildID, err)
+		s.logger.V(1).Info("failed to get running workflow count, using backlog only", "error", err)
+		return backlog, nil
 	}
 
-	backlog := sumDeploymentBacklog(resp.GetVersionTaskQueues(), s.metadata.TaskQueue, s.metadata.QueueTypes)
-	return backlog, resp.GetWorkerDeploymentVersionInfo().GetStatus(), nil
+	return backlog + runningCount, nil
 }
 
-// getRunningWorkflowCount queries the Temporal Visibility Count API for running workflow
-// executions owned by this scaler. It is only called when includeRunningWorkflowCount is
-// enabled and the backlog signal alone says "scale to zero" — its role is to block premature
-// scale-down when the queue is momentarily empty but workers are still busy.
-//
-// Scoping rules:
-//   - deployment-version mode restricts by TemporalWorkerDeploymentVersion so that a
-//     draining version's workflows do not keep a newer version alive, and vice versa.
-//   - the default (unversioned) mode restricts by "TemporalWorkerDeploymentVersion is null"
-//     so it never picks up workflows owned by versioned workers on the same task queue.
+// getRunningWorkflowCount returns the approximate number of running workflow executions
+// for the task queue (or workflowTaskQueueForCount if set). Used to avoid premature
+// scale-down when workers are fast and backlog is often zero.
 func (s *temporalScaler) getRunningWorkflowCount(ctx context.Context) (int64, error) {
-	query, err := s.runningWorkflowCountQuery()
-	if err != nil {
-		return 0, err
+	taskQueue := s.metadata.WorkflowTaskQueueForCount
+	if taskQueue == "" {
+		taskQueue = s.metadata.TaskQueue
 	}
-	resp, err := s.tcl.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{
+	// Escape single quotes in task queue name for visibility query
+	escaped := strings.ReplaceAll(taskQueue, "'", "''")
+	query := fmt.Sprintf("ExecutionStatus = 'Running' AND TaskQueue = '%s'", escaped)
+
+	req := &workflowservice.CountWorkflowExecutionsRequest{
 		Namespace: s.metadata.Namespace,
 		Query:     query,
-	})
+	}
+	resp, err := s.tcl.CountWorkflow(ctx, req)
 	if err != nil {
 		return 0, fmt.Errorf("count workflow: %w", err)
 	}
 	return resp.GetCount(), nil
 }
 
-// runningWorkflowCountQuery builds the visibility query used by getRunningWorkflowCount.
-// Values that reach this method must already have passed the Validate() literal check,
-// but we re-validate defensively in case a caller constructs a scaler outside the normal
-// factory path.
-func (s *temporalScaler) runningWorkflowCountQuery() (string, error) {
-	taskQueue := s.metadata.WorkflowTaskQueueForCount
-	if taskQueue == "" {
-		taskQueue = s.metadata.TaskQueue
-	}
-	if !validVisibilityQueryLiteral.MatchString(taskQueue) {
-		return "", fmt.Errorf("task queue name %q contains characters not allowed in visibility queries", taskQueue)
-	}
-
-	query := fmt.Sprintf("ExecutionStatus = 'Running' AND TaskQueue = '%s'", taskQueue)
-	switch {
-	case s.metadata.WorkerDeploymentName != "":
-		if !validVisibilityQueryLiteral.MatchString(s.metadata.WorkerDeploymentName) ||
-			!validVisibilityQueryLiteral.MatchString(s.metadata.WorkerDeploymentBuildID) {
-			return "", fmt.Errorf("workerDeploymentName/workerDeploymentBuildId contain characters not allowed in visibility queries")
-		}
-		version := s.metadata.WorkerDeploymentName + workerDeploymentVersionSeparator + s.metadata.WorkerDeploymentBuildID
-		query = fmt.Sprintf("%s AND TemporalWorkerDeploymentVersion = '%s'", query, version)
-	default:
-		query += " AND TemporalWorkerDeploymentVersion is null"
-	}
-	return query, nil
-}
-
-// sumDeploymentBacklog sums ApproximateBacklogCount across the provided task
-// queues, optionally filtered by taskQueueName and allowedQueueTypes. An empty
-// taskQueueName means no name filter; an empty allowedQueueTypes means no type filter.
-func sumDeploymentBacklog(tqs []*workflowservice.DescribeWorkerDeploymentVersionResponse_VersionTaskQueue, taskQueueName string, allowedQueueTypes []string) int64 {
-	allowedTypes := queueTypeSet(allowedQueueTypes) // nil == allow all
-
-	var totalBacklog int64
-	for _, tq := range tqs {
-		if allowedTypes != nil && !allowedTypes[tq.GetType()] {
-			continue
-		}
-		if taskQueueName != "" && tq.GetName() != taskQueueName {
-			continue
-		}
-		if stats := tq.GetStats(); stats != nil {
-			totalBacklog += stats.GetApproximateBacklogCount()
-		}
-	}
-	return totalBacklog
-}
-
-func queueTypeSet(queueTypes []string) map[enumspb.TaskQueueType]bool {
-	if len(queueTypes) == 0 {
-		return nil
-	}
-	set := make(map[enumspb.TaskQueueType]bool, len(queueTypes))
-	for _, t := range queueTypes {
-		switch t {
-		case "workflow":
-			set[enumspb.TASK_QUEUE_TYPE_WORKFLOW] = true
-		case "activity":
-			set[enumspb.TASK_QUEUE_TYPE_ACTIVITY] = true
-		case "nexus":
-			set[enumspb.TASK_QUEUE_TYPE_NEXUS] = true
-		}
-	}
-	return set
-}
-
 func scalerMode(m *temporalMetadata) string {
 	switch {
 	case m.WorkerDeploymentName != "":
 		return "deployment-version"
+	case m.BuildID != "" || m.AllActive || m.Unversioned:
+		return "build-id"
 	default:
 		return "unversioned"
 	}
@@ -460,6 +318,19 @@ func getQueueTypes(queueTypes []string) []sdk.TaskQueueType {
 		return temporalDefaultQueueTypes
 	}
 	return taskQueueTypes
+}
+
+func getCombinedBacklogCount(description sdk.TaskQueueDescription) int64 {
+	var count int64
+
+	for _, versionInfo := range description.VersionsInfo {
+		for _, typeInfo := range versionInfo.TypesInfo {
+			if typeInfo.Stats != nil {
+				count += typeInfo.Stats.ApproximateBacklogCount
+			}
+		}
+	}
+	return count
 }
 
 func getTemporalClient(ctx context.Context, meta *temporalMetadata, log logr.Logger) (sdk.Client, error) {

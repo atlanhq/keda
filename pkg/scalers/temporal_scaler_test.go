@@ -15,9 +15,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	enumspb "go.temporal.io/api/enums/v1"
-	taskqueuepb "go.temporal.io/api/taskqueue/v1"
-	"go.temporal.io/api/workflowservice/v1"
 
 	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
@@ -60,26 +57,34 @@ var testTemporalMetadata = []parseTemporalMetadataTestData{
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy"}, true},
 	// workerDeploymentBuildId without workerDeploymentName
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentBuildId": "v1"}, true},
-	// buildId is rejected during parsing, so the combination never reaches Validate()
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy", "workerDeploymentBuildId": "v1", "buildId": "v1"}, true},
-	// selectAllActive is rejected during parsing, so the combination never reaches Validate()
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy", "workerDeploymentBuildId": "v1", "selectAllActive": "true"}, true},
+	// the fork still accepts buildId alongside a deployment version
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy", "workerDeploymentBuildId": "v1", "buildId": "v1"}, false},
+	// the fork still accepts selectAllActive alongside a deployment version
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy", "workerDeploymentBuildId": "v1", "selectAllActive": "true"}, false},
 	// valid deployment config
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy", "workerDeploymentBuildId": "v1"}, false},
-	// legacy buildId is rejected as of v2.21
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "buildId": "v1"}, true},
-	// workflowTaskQueueForCount without includeRunningWorkflowCount
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workflowTaskQueueForCount": "wf-queue"}, true},
+	// legacy buildId is still accepted by the fork
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "buildId": "v1"}, false},
+	// workflowTaskQueueForCount alone is valid: includeRunningWorkflowCount defaults to true
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workflowTaskQueueForCount": "wf-queue"}, false},
 	// includeRunningWorkflowCount alone is valid
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "includeRunningWorkflowCount": "true"}, false},
 	// includeRunningWorkflowCount + workflowTaskQueueForCount is valid
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "includeRunningWorkflowCount": "true", "workflowTaskQueueForCount": "wf-queue"}, false},
 	// includeRunningWorkflowCount rejects unsafe characters in taskQueue
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": "bad queue' OR '1'='1", "namespace": temporalNamespace, "includeRunningWorkflowCount": "true"}, true},
-	// selectAllActive is rejected as of v2.21
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "selectAllActive": "true"}, true},
-	// selectUnversioned is rejected as of v2.21
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "selectUnversioned": "true"}, true},
+	// the fork still accepts selectAllActive
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "selectAllActive": "true"}, false},
+	// the fork still accepts selectUnversioned
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "selectUnversioned": "true"}, false},
+	// temporal-worker-controller Current/Ramping version shape
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "app-ns/app-worker-twd", "workerDeploymentBuildId": "0.4.1", "selectUnversioned": "true"}, false},
+	// unsafe characters are rejected by default, since includeRunningWorkflowCount defaults to true
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": "bad queue' OR '1'='1", "namespace": temporalNamespace}, true},
+	// unsafe characters never reach a visibility query when includeRunningWorkflowCount is off
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": "bad queue' OR '1'='1", "namespace": temporalNamespace, "includeRunningWorkflowCount": "false"}, false},
+	// includeRunningWorkflowCount off with workflowTaskQueueForCount set is accepted (ignored)
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "includeRunningWorkflowCount": "false", "workflowTaskQueueForCount": "wf-queue"}, false},
 }
 
 var temporalMetricIdentifiers = []temporalMetricIdentifier{
@@ -141,13 +146,14 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"namespace": "default",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			wantErr: true,
 		},
@@ -158,13 +164,14 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueue": "testxx",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			wantErr: false,
 		},
@@ -177,13 +184,14 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"activationTargetQueueSize": "12",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 12,
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   12,
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			wantErr: false,
 		},
@@ -195,14 +203,15 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueue": "testxx",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				APIKey:                    "test01",
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				APIKey:                      "test01",
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			authParams: map[string]string{
 				"apiKey": "test01",
@@ -218,14 +227,15 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"queueTypes": "workflow,activity",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				QueueTypes:                []string{"workflow", "activity"},
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				QueueTypes:                  []string{"workflow", "activity"},
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			wantErr: false,
 		},
@@ -242,14 +252,15 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueueFromEnv": "taskQueue",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				APIKey:                    "test01",
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				APIKey:                      "test01",
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			authParams: map[string]string{
 				"apiKey": "test01",
@@ -265,14 +276,15 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey":    "test-api-key",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				APIKey:                    "test-api-key",
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				APIKey:                      "test-api-key",
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			authParams: map[string]string{
 				"apiKey": "test-api-key",
@@ -291,14 +303,15 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey": "test-api-key",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				APIKey:                    "test-api-key",
-				MinConnectTimeout:         5,
-				EnableTLS:                 false,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				APIKey:                      "test-api-key",
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   false,
 			},
 			wantErr: false,
 		},
@@ -311,14 +324,15 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"tlsServerName": "my-namespace.tmpr.cloud",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
-				TLSServerName:             "my-namespace.tmpr.cloud",
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
+				TLSServerName:               "my-namespace.tmpr.cloud",
 			},
 			wantErr: false,
 		},
@@ -334,15 +348,16 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey": "test01",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				APIKey:                    "test01",
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
-				TLSServerName:             "my-namespace.tmpr.cloud",
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				APIKey:                      "test01",
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
+				TLSServerName:               "my-namespace.tmpr.cloud",
 			},
 			wantErr: false,
 		},
@@ -361,18 +376,60 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"ca":          "ca-data",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				Cert:                      "cert-data",
-				Key:                       "key-data",
-				KeyPassword:               "password",
-				CA:                        "ca-data",
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
-				TLSServerName:             "my-namespace.tmpr.cloud",
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				Cert:                        "cert-data",
+				Key:                         "key-data",
+				KeyPassword:                 "password",
+				CA:                          "ca-data",
+				IncludeRunningWorkflowCount: true,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
+				TLSServerName:               "my-namespace.tmpr.cloud",
+			},
+			wantErr: false,
+		},
+		{
+			name: "includeRunningWorkflowCount disabled",
+			metadata: map[string]string{
+				"endpoint":                    "test:7233",
+				"namespace":                   "default",
+				"taskQueue":                   "testxx",
+				"includeRunningWorkflowCount": "false",
+			},
+			wantMeta: &temporalMetadata{
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				IncludeRunningWorkflowCount: false,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
+			},
+			wantErr: false,
+		},
+		{
+			name: "workflowTaskQueueForCount set",
+			metadata: map[string]string{
+				"endpoint":                  "test:7233",
+				"namespace":                 "default",
+				"taskQueue":                 "activity-queue",
+				"workflowTaskQueueForCount": "workflow-queue",
+			},
+			wantMeta: &temporalMetadata{
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "activity-queue",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				IncludeRunningWorkflowCount: true,
+				WorkflowTaskQueueForCount:   "workflow-queue",
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			wantErr: false,
 		},
@@ -413,83 +470,6 @@ func TestTemporalDefaultQueueTypes(t *testing.T) {
 	assert.Len(t, getQueueTypes(metadata.QueueTypes), 1, "only one type should be there")
 }
 
-func makeVersionTaskQueue(name string, qt enumspb.TaskQueueType, backlog int64) *workflowservice.DescribeWorkerDeploymentVersionResponse_VersionTaskQueue {
-	return &workflowservice.DescribeWorkerDeploymentVersionResponse_VersionTaskQueue{
-		Name:  name,
-		Type:  qt,
-		Stats: &taskqueuepb.TaskQueueStats{ApproximateBacklogCount: backlog},
-	}
-}
-
-func TestSumDeploymentBacklog(t *testing.T) {
-	all := []*workflowservice.DescribeWorkerDeploymentVersionResponse_VersionTaskQueue{
-		makeVersionTaskQueue("queue-a", enumspb.TASK_QUEUE_TYPE_WORKFLOW, 10),
-		makeVersionTaskQueue("queue-a", enumspb.TASK_QUEUE_TYPE_ACTIVITY, 20),
-		makeVersionTaskQueue("queue-a", enumspb.TASK_QUEUE_TYPE_NEXUS, 5),
-		makeVersionTaskQueue("queue-b", enumspb.TASK_QUEUE_TYPE_WORKFLOW, 100),
-		{Name: "queue-a", Type: enumspb.TASK_QUEUE_TYPE_WORKFLOW, Stats: nil},
-	}
-
-	cases := []struct {
-		name          string
-		taskQueues    []*workflowservice.DescribeWorkerDeploymentVersionResponse_VersionTaskQueue
-		taskQueueName string
-		queueTypes    []string
-		want          int64
-	}{
-		{
-			name:       "no filters sums everything",
-			taskQueues: all,
-			want:       135,
-		},
-		{
-			name:          "filter by task queue name",
-			taskQueues:    all,
-			taskQueueName: "queue-a",
-			want:          35,
-		},
-		{
-			name:       "filter by queue type workflow",
-			taskQueues: all,
-			queueTypes: []string{"workflow"},
-			want:       110,
-		},
-		{
-			name:          "filter by name and type",
-			taskQueues:    all,
-			taskQueueName: "queue-a",
-			queueTypes:    []string{"activity"},
-			want:          20,
-		},
-		{
-			name:          "filter matches nothing",
-			taskQueues:    all,
-			taskQueueName: "nonexistent",
-			want:          0,
-		},
-		{
-			name:       "nil stats entry skipped",
-			taskQueues: all,
-			queueTypes: []string{"workflow"},
-			// queue-a workflow=10, queue-a workflow with nil stats=skipped, queue-b workflow=100
-			want: 110,
-		},
-		{
-			name:       "multiple type filter",
-			taskQueues: all,
-			queueTypes: []string{"workflow", "activity"},
-			want:       130,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := sumDeploymentBacklog(tc.taskQueues, tc.taskQueueName, tc.queueTypes)
-			assert.Equal(t, tc.want, got)
-		})
-	}
-}
-
 func TestScalerMode(t *testing.T) {
 	cases := []struct {
 		name string
@@ -498,80 +478,14 @@ func TestScalerMode(t *testing.T) {
 	}{
 		{"no versioning fields", temporalMetadata{}, "unversioned"},
 		{"workerDeploymentName set", temporalMetadata{WorkerDeploymentName: "d"}, "deployment-version"},
+		{"workerDeploymentName with selectUnversioned", temporalMetadata{WorkerDeploymentName: "d", Unversioned: true}, "deployment-version"},
+		{"buildId set", temporalMetadata{BuildID: "v1"}, "build-id"},
+		{"selectAllActive set", temporalMetadata{AllActive: true}, "build-id"},
+		{"selectUnversioned set", temporalMetadata{Unversioned: true}, "build-id"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, scalerMode(&tc.meta))
-		})
-	}
-}
-
-func TestRunningWorkflowCountQuery(t *testing.T) {
-	cases := []struct {
-		name    string
-		meta    temporalMetadata
-		want    string
-		wantErr bool
-	}{
-		{
-			name: "unversioned scopes with is null",
-			meta: temporalMetadata{TaskQueue: "orders"},
-			want: "ExecutionStatus = 'Running' AND TaskQueue = 'orders' AND TemporalWorkerDeploymentVersion is null",
-		},
-		{
-			name: "deployment version scopes by TemporalWorkerDeploymentVersion using the v1.32+ colon delimiter",
-			meta: temporalMetadata{TaskQueue: "orders", WorkerDeploymentName: "orders-svc", WorkerDeploymentBuildID: "v1"},
-			want: "ExecutionStatus = 'Running' AND TaskQueue = 'orders' AND TemporalWorkerDeploymentVersion = 'orders-svc:v1'",
-		},
-		{
-			name: "workflowTaskQueueForCount overrides taskQueue",
-			meta: temporalMetadata{TaskQueue: "activities", WorkflowTaskQueueForCount: "workflows"},
-			want: "ExecutionStatus = 'Running' AND TaskQueue = 'workflows' AND TemporalWorkerDeploymentVersion is null",
-		},
-		{
-			name:    "unsafe task queue is rejected",
-			meta:    temporalMetadata{TaskQueue: "bad' OR '1"},
-			wantErr: true,
-		},
-		{
-			name:    "unsafe deployment name is rejected",
-			meta:    temporalMetadata{TaskQueue: "orders", WorkerDeploymentName: "bad name", WorkerDeploymentBuildID: "v1"},
-			wantErr: true,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &temporalScaler{metadata: &tc.meta}
-			got, err := s.runningWorkflowCountQuery()
-			if tc.wantErr {
-				assert.Error(t, err)
-				return
-			}
-			assert.NoError(t, err)
-			assert.Equal(t, tc.want, got)
-		})
-	}
-}
-
-func TestIsActiveWithoutBacklogVersionStatus(t *testing.T) {
-	cases := []struct {
-		name   string
-		status enumspb.WorkerDeploymentVersionStatus
-		want   bool
-	}{
-		{"draining stays active without hitting visibility", enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_DRAINING, true},
-		{"drained scales down", enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_DRAINED, false},
-		{"inactive scales down", enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_INACTIVE, false},
-		{"unspecified scales down", enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_UNSPECIFIED, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &temporalScaler{
-				metadata: &temporalMetadata{TaskQueue: "orders", WorkerDeploymentName: "orders-svc", WorkerDeploymentBuildID: "v1"},
-				logger:   logger,
-			}
-			got := s.isActiveWithoutBacklog(context.Background(), true, tc.status)
-			assert.Equal(t, tc.want, got)
 		})
 	}
 }
