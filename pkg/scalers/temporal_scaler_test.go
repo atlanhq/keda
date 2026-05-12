@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -645,6 +646,131 @@ temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="
 	slots, err = s.getUsedWorkerSlots(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), slots)
+}
+
+// blindGaugeValue returns the current value of the temporalSlotsBlind gauge for
+// the given (namespace, task_queue) pair. Helper for the blind-state tests.
+func blindGaugeValue(namespace, taskQueue string) float64 {
+	return testutil.ToFloat64(temporalSlotsBlind.WithLabelValues(namespace, taskQueue))
+}
+
+func TestGetUsedWorkerSlotsBlindGauge(t *testing.T) {
+	metricsBody := `# HELP temporal_worker_task_slots_used Current number of used slots per task type
+# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{namespace="default",task_queue="blind-q",worker_type="ActivityWorker"} 7
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, metricsBody)
+	}))
+
+	ip, port := testServerPort(t, srv)
+	ns := "blind-ns"
+	tq := "blind-q"
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	pod := newFakeWorkerPod("worker-0", ns, ip)
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pod).Build()
+
+	s := &temporalScaler{
+		metadata:     &temporalMetadata{TaskQueue: tq, WorkerMetricsPort: port},
+		httpClient:   srv.Client(),
+		kubeClient:   kubeClient,
+		logger:       logr.Discard(),
+		podNamespace: ns,
+	}
+
+	// Seed gauge=1 so we can verify it gets cleared on each non-blind path.
+	temporalSlotsBlind.WithLabelValues(ns, tq).Set(1)
+
+	// 1. Successful scrape clears the gauge.
+	slots, err := s.getUsedWorkerSlots(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(7), slots)
+	assert.Equal(t, float64(0), blindGaugeValue(ns, tq), "gauge must clear on successful scrape")
+
+	// 2. Cache-hit fallback (server down, still within TTL) must keep gauge at 0.
+	srv.Close()
+	temporalSlotsBlind.WithLabelValues(ns, tq).Set(1) // seed again
+	slots, err = s.getUsedWorkerSlots(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(7), slots, "should serve cached value")
+	assert.Equal(t, float64(0), blindGaugeValue(ns, tq), "gauge must clear on cache-hit fallback")
+
+	// 3. Cache expired AND all scrapes failed → gauge flips to 1.
+	s.slotsMu.Lock()
+	s.lastSlots.timestamp = time.Now().Add(-slotsCacheTTL - time.Second)
+	s.slotsMu.Unlock()
+	slots, err = s.getUsedWorkerSlots(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), slots)
+	assert.Equal(t, float64(1), blindGaugeValue(ns, tq), "gauge must be 1 when cache expired and all pods fail")
+}
+
+func TestGetUsedWorkerSlotsBlindGaugeNoPods(t *testing.T) {
+	ns := "no-pods-ns"
+	tq := "no-pods-q"
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	s := &temporalScaler{
+		metadata:     &temporalMetadata{TaskQueue: tq, WorkerMetricsPort: 9464},
+		httpClient:   &http.Client{},
+		kubeClient:   kubeClient,
+		logger:       logr.Discard(),
+		podNamespace: ns,
+	}
+
+	// Seed gauge=1 to verify the "no pods" path actively clears it
+	// (replicas drained to zero must not leave a stale blind=1).
+	temporalSlotsBlind.WithLabelValues(ns, tq).Set(1)
+
+	slots, err := s.getUsedWorkerSlots(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), slots)
+	assert.Equal(t, float64(0), blindGaugeValue(ns, tq), "gauge must clear when there are no worker pods")
+}
+
+func TestGetUsedWorkerSlotsBlindGaugeNoReadyPods(t *testing.T) {
+	ns := "not-ready-ns"
+	tq := "not-ready-q"
+
+	// Pod exists but is not Ready — getUsedWorkerSlots skips it and returns 0.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "worker-0",
+			Namespace: ns,
+			Labels:    map[string]string{"app.kubernetes.io/component": "worker"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.0.0.1",
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pod).Build()
+
+	s := &temporalScaler{
+		metadata:     &temporalMetadata{TaskQueue: tq, WorkerMetricsPort: 9464},
+		httpClient:   &http.Client{},
+		kubeClient:   kubeClient,
+		logger:       logr.Discard(),
+		podNamespace: ns,
+	}
+
+	temporalSlotsBlind.WithLabelValues(ns, tq).Set(1) // seed
+
+	slots, err := s.getUsedWorkerSlots(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), slots)
+	assert.Equal(t, float64(0), blindGaugeValue(ns, tq), "gauge must clear when no pods are ready (transient startup state)")
 }
 
 func TestGetUsedWorkerSlotsTimeout(t *testing.T) {
