@@ -7879,7 +7879,6 @@
                     "name": "buildId",
                     "type": "string",
                     "optional": true,
-                    "deprecated": "The 'buildId' setting is DEPRECATED and is removed in v2.21 because Temporal Server is dropping support for the Rules-Based Versioning APIs - Use 'workerDeploymentName' and 'workerDeploymentBuildId' instead",
                     "metadataVariableReadable": true,
                     "envVariableReadable": true
                 },
@@ -7901,20 +7900,18 @@
                     "name": "selectAllActive",
                     "type": "string",
                     "default": "false",
-                    "deprecated": "The 'selectAllActive' setting is DEPRECATED and is removed in v2.21 because Temporal Server is dropping support for the Rules-Based Versioning APIs - Use 'workerDeploymentName' and 'workerDeploymentBuildId' instead",
                     "metadataVariableReadable": true
                 },
                 {
                     "name": "selectUnversioned",
                     "type": "string",
                     "default": "false",
-                    "deprecated": "The 'selectUnversioned' setting is DEPRECATED and is removed in v2.21 because Temporal Server is dropping support for the Rules-Based Versioning APIs - Remove it if your workers are unversioned. Or use 'workerDeploymentName' and 'workerDeploymentBuildId' if you're migrating to Worker Deployment Versioning",
                     "metadataVariableReadable": true
                 },
                 {
                     "name": "includeRunningWorkflowCount",
                     "type": "string",
-                    "default": "false",
+                    "default": "true",
                     "metadataVariableReadable": true
                 },
                 {
@@ -7923,6 +7920,12 @@
                     "optional": true,
                     "metadataVariableReadable": true,
                     "envVariableReadable": true
+                },
+                {
+                    "name": "workerMetricsPort",
+                    "type": "string",
+                    "default": "9464",
+                    "metadataVariableReadable": true
                 },
                 {
                     "name": "apiKey",
