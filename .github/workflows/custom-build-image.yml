@@ -3,7 +3,7 @@ name: Build Custom KEDA Image
 on:
   push:
     branches:
-    - 2.18.3-main
+    - 2.19.0-main
 
 jobs:
   build:
@@ -30,4 +30,4 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ghcr.io/atlanhq/keda:2.18.3-main-${{ github.sha }} 
+          tags: ghcr.io/atlanhq/keda:2.19.0-main-${{ github.sha }}
