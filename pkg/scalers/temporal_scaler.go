@@ -274,6 +274,34 @@ func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable bool) 
 	return metric
 }
 
+// buildRunningCountQuery composes the visibility query used to count
+// running workflows. Pulled out as a pure function so the query-string logic
+// (including build-ID scoping) is independently unit-testable.
+//
+// When buildID is non-empty, the query is additionally filtered to executions
+// whose BuildIds search attribute matches "versioned:<buildID>". This makes
+// per-version ScaledObjects (e.g. those created per worker-deployment-version
+// by a TWD controller) accurate — without it, every version's HPA would count
+// the same task-queue-wide running pool and over-provision proportionally to
+// the number of active versions.
+//
+// When buildID is empty, the query reduces to a task-queue-wide count, which
+// is the unversioned / aggregate-scaling configuration.
+func buildRunningCountQuery(taskQueue, buildID string) string {
+	escapedTQ := strings.ReplaceAll(taskQueue, "'", "''")
+	query := fmt.Sprintf("ExecutionStatus = 'Running' AND TaskQueue = '%s'", escapedTQ)
+	if buildID != "" {
+		// Temporal's BuildIds search attribute is multi-valued. For pinned and
+		// auto-upgrade workflows currently executing on a given build, the
+		// "versioned:<buildId>" form is the assignment marker. Matching this
+		// prefix scopes the count to workflows actively running on the build,
+		// not workflows that merely touched it historically.
+		escapedBID := strings.ReplaceAll(buildID, "'", "''")
+		query = fmt.Sprintf("%s AND BuildIds = 'versioned:%s'", query, escapedBID)
+	}
+	return query
+}
+
 // getRunningWorkflowCount returns the approximate number of running workflow executions
 // for the task queue (or workflowTaskQueueForCount if set). Used to avoid premature
 // scale-down when workers are fast and backlog is often zero.
@@ -282,9 +310,7 @@ func (s *temporalScaler) getRunningWorkflowCount(ctx context.Context) (int64, er
 	if taskQueue == "" {
 		taskQueue = s.metadata.TaskQueue
 	}
-	// Escape single quotes in task queue name for visibility query
-	escaped := strings.ReplaceAll(taskQueue, "'", "''")
-	query := fmt.Sprintf("ExecutionStatus = 'Running' AND TaskQueue = '%s'", escaped)
+	query := buildRunningCountQuery(taskQueue, s.metadata.BuildID)
 
 	req := &workflowservice.CountWorkflowExecutionsRequest{
 		Namespace: s.metadata.Namespace,
