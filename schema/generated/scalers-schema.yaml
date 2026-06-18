@@ -5330,6 +5330,10 @@ scalers:
           type: string
           default: "9464"
           metadataVariableReadable: true
+        - name: gateSlotsOnRunningWorkflow
+          type: string
+          default: "true"
+          metadataVariableReadable: true
         - name: apiKey
           type: string
           optional: true

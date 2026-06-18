@@ -117,6 +117,7 @@ type temporalMetadata struct {
 	IncludeRunningWorkflowCount bool   `keda:"name=includeRunningWorkflowCount, order=triggerMetadata, default=true"`
 	WorkflowTaskQueueForCount   string `keda:"name=workflowTaskQueueForCount,   order=triggerMetadata;resolvedEnv, optional"`
 	WorkerMetricsPort           int    `keda:"name=workerMetricsPort,           order=triggerMetadata, default=9464"`
+	GateSlotsOnRunningWorkflow  bool   `keda:"name=gateSlotsOnRunningWorkflow,  order=triggerMetadata, default=true"`
 	APIKey                      string `keda:"name=apiKey,                    order=authParams;resolvedEnv, optional"`
 	MinConnectTimeout           int    `keda:"name=minConnectTimeout,         order=triggerMetadata, default=5"`
 	EnableTLS                   bool   `keda:"name=enableTLS,                 order=triggerMetadata, default=true"`
@@ -316,17 +317,36 @@ func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
 		s.logger.Info("failed to get worker slots metric, excluding from metric", "error", slotsErr)
 	}
 
-	return composeMetric(backlog, runningCount, usedSlots, slotsErr == nil), nil
+	return composeMetric(backlog, runningCount, usedSlots, slotsErr == nil, s.metadata.GateSlotsOnRunningWorkflow), nil
 }
 
-// composeMetric returns the composite scaling metric. Slots are gated on
-// runningCount > 0 to avoid the SDK ghost-flicker false positive: when no
-// workflow is running, non-empty poll responses lacking activity_type still
-// mark the slot used (see sdk-core pollers/mod.rs:162-170), keeping cooldown
-// reset forever and blocking scale-to-zero.
-func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable bool) int64 {
+// composeMetric returns the composite scaling metric: backlog + runningWorkflow
+// count + used worker slots, with the slots term conditionally gated.
+//
+// gateSlotsOnRunningWorkflow (default true) is the combined-pool behaviour: a
+// worker shares a task queue with the workflows that schedule its activities,
+// so a running workflow on the queue is a reliable signal that any reported
+// used-slots are real. Gating on runningCount > 0 suppresses the SDK
+// ghost-flicker false positive — when no workflow is running, non-empty poll
+// responses lacking activity_type still mark a slot used (see sdk-core
+// pollers/mod.rs:162-170), which would keep cooldown reset forever and block
+// scale-to-zero.
+//
+// gateSlotsOnRunningWorkflow=false is for a DEDICATED activity pool: it polls
+// an activity-only task queue, so no workflow ever runs on it and runningCount
+// is structurally 0 — the gate above would discard the used-slots signal
+// entirely and let KEDA scale the pool to zero while a long activity is still
+// executing on it (deleting the busy pod). With the gate off, used-slots
+// (already scoped to this pool's ActivityWorker + task queue) drives the
+// metric directly: non-zero exactly while a heavy activity runs, and 0 the
+// moment it finishes — so the pool stays warm under load and still scales to
+// zero when idle, even while the parent workflow keeps running on another
+// queue. Trade-off: a genuinely idle pool exhibiting ghost-flicker can stay up
+// one extra cooldown window; that over-provisions rather than killing a busy
+// pod, and is the conservative direction.
+func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable, gateSlotsOnRunningWorkflow bool) int64 {
 	metric := backlog + runningCount
-	if slotsAvailable && runningCount > 0 {
+	if slotsAvailable && (!gateSlotsOnRunningWorkflow || runningCount > 0) {
 		metric += usedSlots
 	}
 	return metric

@@ -155,6 +155,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"namespace": "default",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "",
@@ -174,6 +175,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueue": "testxx",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -195,6 +197,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"activationTargetQueueSize": "12",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -215,6 +218,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueue": "testxx",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -240,6 +244,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"queueTypes": "workflow,activity",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -266,6 +271,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueueFromEnv": "taskQueue",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -291,6 +297,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey":    "test-api-key",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -319,6 +326,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey": "test-api-key",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -341,6 +349,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"tlsServerName": "my-namespace.tmpr.cloud",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -366,6 +375,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey": "test01",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -395,6 +405,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"ca":          "ca-data",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -421,6 +432,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"includeRunningWorkflowCount": "false",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -442,6 +454,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"workflowTaskQueueForCount": "workflow-queue",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "activity-queue",
@@ -829,22 +842,35 @@ func TestComposeMetric(t *testing.T) {
 		runningCount   int64
 		usedSlots      int64
 		slotsAvailable bool
+		gateOnWorkflow bool
 		want           int64
 	}{
-		{name: "idle", backlog: 0, runningCount: 0, usedSlots: 0, slotsAvailable: true, want: 0},
-		{name: "ghost flicker — slots without workflow ignored", backlog: 0, runningCount: 0, usedSlots: 1, slotsAvailable: true, want: 0},
-		{name: "ghost flicker (multi)", backlog: 0, runningCount: 0, usedSlots: 5, slotsAvailable: true, want: 0},
-		{name: "active workflow with many activities", backlog: 0, runningCount: 1, usedSlots: 50, slotsAvailable: true, want: 51},
-		{name: "active workflow + backlog + slots", backlog: 100, runningCount: 2, usedSlots: 8, slotsAvailable: true, want: 110},
-		{name: "backlog only", backlog: 25, runningCount: 0, usedSlots: 0, slotsAvailable: true, want: 25},
-		{name: "backlog with ghost flicker", backlog: 7, runningCount: 0, usedSlots: 1, slotsAvailable: true, want: 7},
-		{name: "slots scrape failed, workflow running", backlog: 0, runningCount: 3, usedSlots: 99, slotsAvailable: false, want: 3},
-		{name: "slots scrape failed, no workflow", backlog: 4, runningCount: 0, usedSlots: 99, slotsAvailable: false, want: 4},
-		{name: "slots scrape failed with backlog and workflow", backlog: 10, runningCount: 2, usedSlots: 99, slotsAvailable: false, want: 12},
+		// Gated (default, combined-pool) behaviour — slots count only when a
+		// workflow is running on the queue, suppressing ghost-flicker.
+		{name: "idle", backlog: 0, runningCount: 0, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: true, want: 0},
+		{name: "ghost flicker — slots without workflow ignored", backlog: 0, runningCount: 0, usedSlots: 1, slotsAvailable: true, gateOnWorkflow: true, want: 0},
+		{name: "ghost flicker (multi)", backlog: 0, runningCount: 0, usedSlots: 5, slotsAvailable: true, gateOnWorkflow: true, want: 0},
+		{name: "active workflow with many activities", backlog: 0, runningCount: 1, usedSlots: 50, slotsAvailable: true, gateOnWorkflow: true, want: 51},
+		{name: "active workflow + backlog + slots", backlog: 100, runningCount: 2, usedSlots: 8, slotsAvailable: true, gateOnWorkflow: true, want: 110},
+		{name: "backlog only", backlog: 25, runningCount: 0, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: true, want: 25},
+		{name: "backlog with ghost flicker", backlog: 7, runningCount: 0, usedSlots: 1, slotsAvailable: true, gateOnWorkflow: true, want: 7},
+		{name: "slots scrape failed, workflow running", backlog: 0, runningCount: 3, usedSlots: 99, slotsAvailable: false, gateOnWorkflow: true, want: 3},
+		{name: "slots scrape failed, no workflow", backlog: 4, runningCount: 0, usedSlots: 99, slotsAvailable: false, gateOnWorkflow: true, want: 4},
+		{name: "slots scrape failed with backlog and workflow", backlog: 10, runningCount: 2, usedSlots: 99, slotsAvailable: false, gateOnWorkflow: true, want: 12},
+
+		// Ungated (dedicated activity-pool) behaviour — slots count on their
+		// own, since the parent workflow runs on a different queue
+		// (runningCount is structurally 0 here).
+		{name: "dedicated pool: started activity keeps pool warm (the hang bug)", backlog: 0, runningCount: 0, usedSlots: 1, slotsAvailable: true, gateOnWorkflow: false, want: 1},
+		{name: "dedicated pool: multiple activities executing", backlog: 0, runningCount: 0, usedSlots: 4, slotsAvailable: true, gateOnWorkflow: false, want: 4},
+		{name: "dedicated pool: idle scales to zero even while a workflow runs elsewhere", backlog: 0, runningCount: 0, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: false, want: 0},
+		{name: "dedicated pool: queued activities count via backlog", backlog: 6, runningCount: 0, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: false, want: 6},
+		{name: "dedicated pool: backlog + executing activities", backlog: 3, runningCount: 0, usedSlots: 2, slotsAvailable: true, gateOnWorkflow: false, want: 5},
+		{name: "dedicated pool: slots scrape failed falls back to backlog", backlog: 9, runningCount: 0, usedSlots: 99, slotsAvailable: false, gateOnWorkflow: false, want: 9},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := composeMetric(tc.backlog, tc.runningCount, tc.usedSlots, tc.slotsAvailable)
+			got := composeMetric(tc.backlog, tc.runningCount, tc.usedSlots, tc.slotsAvailable, tc.gateOnWorkflow)
 			assert.Equal(t, tc.want, got)
 		})
 	}
