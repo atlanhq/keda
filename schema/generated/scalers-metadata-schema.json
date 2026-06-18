@@ -4992,6 +4992,25 @@
                     "metadataVariableReadable": true
                 },
                 {
+                    "name": "includeRunningWorkflowCount",
+                    "type": "string",
+                    "default": "true",
+                    "metadataVariableReadable": true
+                },
+                {
+                    "name": "workflowTaskQueueForCount",
+                    "type": "string",
+                    "optional": true,
+                    "metadataVariableReadable": true,
+                    "envVariableReadable": true
+                },
+                {
+                    "name": "workerMetricsPort",
+                    "type": "string",
+                    "default": "9464",
+                    "metadataVariableReadable": true
+                },
+                {
                     "name": "apiKey",
                     "type": "string",
                     "optional": true,

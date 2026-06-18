@@ -834,3 +834,49 @@ func TestComposeMetric(t *testing.T) {
 	}
 }
 
+// TestBuildRunningCountQuery covers the visibility-query construction for
+// CountWorkflowExecutions, including the build-ID scoping for per-version
+// ScaledObjects.
+//
+// The behavior is: when buildID is non-empty, the query is automatically
+// scoped to "versioned:<buildID>" via the BuildIds search attribute. When
+// empty, the query is task-queue-wide (unversioned / aggregate scaling).
+func TestBuildRunningCountQuery(t *testing.T) {
+	tests := []struct {
+		name      string
+		taskQueue string
+		buildID   string
+		want      string
+	}{
+		{
+			name:      "no buildID — task-queue-wide query",
+			taskQueue: "my-task-queue",
+			buildID:   "",
+			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'my-task-queue'",
+		},
+		{
+			name:      "buildID set — scoped to that build",
+			taskQueue: "my-task-queue",
+			buildID:   "main-abc123",
+			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'my-task-queue' AND BuildIds = 'versioned:main-abc123'",
+		},
+		{
+			name:      "single quote in task queue is escaped",
+			taskQueue: "we'rd-queue",
+			buildID:   "",
+			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'we''rd-queue'",
+		},
+		{
+			name:      "single quote in buildID is escaped",
+			taskQueue: "tq",
+			buildID:   "ver'1",
+			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'tq' AND BuildIds = 'versioned:ver''1'",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildRunningCountQuery(tc.taskQueue, tc.buildID)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
