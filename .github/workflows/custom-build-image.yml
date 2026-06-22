@@ -4,6 +4,7 @@ on:
   push:
     branches:
     - 2.19.0-main
+    - sanil/keda-worker-deployment-rename
 
 jobs:
   build:
