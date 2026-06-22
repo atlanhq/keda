@@ -445,6 +445,14 @@ func authType(m *temporalMetadata) string {
 // scale-down when workers are actively executing tasks but the task queue backlog
 // is empty.
 //
+// When the scaler is configured for a specific worker version (workerDeploymentBuildId
+// or the legacy buildId), the pod listing is filtered by the upstream
+// `temporal.io/build-id` label so that a per-version ScaledObject only sums slots
+// from its own pods. Without this filter, multiple per-version SOs sharing a
+// namespace would each see every version's pods and double-count the slots term,
+// keeping all versions warm whenever any one of them is busy. When neither buildID
+// field is set (unversioned worker), no build-id filter is applied.
+//
 // On transient failures (all pod scrapes fail), it returns the last known good
 // value if within the cache TTL. A total timeout budget bounds the scrape loop
 // so that slow/unreachable pods don't block the KEDA polling cycle.
@@ -455,6 +463,9 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 
 	podList := &corev1.PodList{}
 	labelSelector := client.MatchingLabels{"app.kubernetes.io/component": "worker"}
+	if buildID := s.workerBuildID(); buildID != "" {
+		labelSelector["temporal.io/build-id"] = buildID
+	}
 	if err := s.kubeClient.List(ctx, podList, client.InNamespace(s.podNamespace), labelSelector); err != nil {
 		return 0, fmt.Errorf("failed to list worker pods in namespace %s: %w", s.podNamespace, err)
 	}
@@ -526,6 +537,18 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 	s.slotsMu.Unlock()
 
 	return totalUsedSlots, nil
+}
+
+// workerBuildID returns the build ID used to scope the pod listing for slot
+// scraping. Prefers the new workerDeploymentBuildId field (worker-deployment
+// versioning model), falling back to the legacy buildId (worker-versioning-rules
+// model). Returns "" for unversioned workers, in which case no build-id filter
+// is applied.
+func (s *temporalScaler) workerBuildID() string {
+	if s.metadata.WorkerDeploymentBuildID != "" {
+		return s.metadata.WorkerDeploymentBuildID
+	}
+	return s.metadata.BuildID
 }
 
 // scrapeWorkerSlots fetches Prometheus metrics from a single worker pod and returns
