@@ -879,36 +879,38 @@ func TestComposeMetric(t *testing.T) {
 // TestBuildRunningCountQuery covers the three modes of visibility-query
 // construction for CountWorkflowExecutions:
 //
-//  1. workerDeployment + buildID set → TemporalWorkerDeploymentVersion query
-//     (worker-deployment-versioning model, RECOMMENDED).
+//  1. workerDeploymentName + workerDeploymentBuildID set →
+//     TemporalWorkerDeploymentVersion query (worker-deployment-versioning
+//     model, RECOMMENDED). Field names match upstream KEDA v2.20.1.
 //  2. buildID only → legacy BuildIds = 'versioned:<buildID>' query
 //     (older worker-versioning-rules model).
 //  3. Neither → task-queue-wide.
 func TestBuildRunningCountQuery(t *testing.T) {
 	tests := []struct {
-		name             string
-		taskQueue        string
-		workerDeployment string
-		buildID          string
-		want             string
+		name                    string
+		taskQueue               string
+		workerDeploymentName    string
+		workerDeploymentBuildID string
+		buildID                 string
+		want                    string
 	}{
 		{
-			name:      "no buildID — task-queue-wide query",
+			name:      "no version fields — task-queue-wide query",
 			taskQueue: "my-task-queue",
 			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'my-task-queue'",
 		},
 		{
-			name:      "buildID set, no workerDeployment — legacy worker-versioning-rules path",
+			name:      "buildID set, no workerDeploymentName — legacy worker-versioning-rules path",
 			taskQueue: "my-task-queue",
 			buildID:   "main-abc123",
 			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'my-task-queue' AND BuildIds = 'versioned:main-abc123'",
 		},
 		{
-			name:             "workerDeployment + buildID — worker-deployment-versioning path",
-			taskQueue:        "atlan-athena-production",
-			workerDeployment: "athena-app/athena-worker-twd",
-			buildID:          "main-3d1a552",
-			want:             "ExecutionStatus = 'Running' AND TaskQueue = 'atlan-athena-production' AND TemporalWorkerDeploymentVersion = 'athena-app/athena-worker-twd:main-3d1a552'",
+			name:                    "workerDeploymentName + workerDeploymentBuildID — worker-deployment-versioning path",
+			taskQueue:               "atlan-athena-production",
+			workerDeploymentName:    "athena-app/athena-worker-twd",
+			workerDeploymentBuildID: "main-3d1a552",
+			want:                    "ExecutionStatus = 'Running' AND TaskQueue = 'atlan-athena-production' AND TemporalWorkerDeploymentVersion = 'athena-app/athena-worker-twd:main-3d1a552'",
 		},
 		{
 			name:      "single quote in task queue is escaped",
@@ -922,22 +924,28 @@ func TestBuildRunningCountQuery(t *testing.T) {
 			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'tq' AND BuildIds = 'versioned:ver''1'",
 		},
 		{
-			name:             "single quote in deployment + buildID escaped (worker-deployment-versioning)",
-			taskQueue:        "tq",
-			workerDeployment: "ns/d'ep",
-			buildID:          "v'1",
-			want:             "ExecutionStatus = 'Running' AND TaskQueue = 'tq' AND TemporalWorkerDeploymentVersion = 'ns/d''ep:v''1'",
+			name:                    "single quote in deployment + buildID escaped (worker-deployment-versioning)",
+			taskQueue:               "tq",
+			workerDeploymentName:    "ns/d'ep",
+			workerDeploymentBuildID: "v'1",
+			want:                    "ExecutionStatus = 'Running' AND TaskQueue = 'tq' AND TemporalWorkerDeploymentVersion = 'ns/d''ep:v''1'",
 		},
 		{
-			name:             "workerDeployment without buildID — falls through to no-version (treat both required)",
-			taskQueue:        "tq",
-			workerDeployment: "ns/dep",
-			want:             "ExecutionStatus = 'Running' AND TaskQueue = 'tq'",
+			name:                 "workerDeploymentName without workerDeploymentBuildID — falls through to no-version (treat both required)",
+			taskQueue:            "tq",
+			workerDeploymentName: "ns/dep",
+			want:                 "ExecutionStatus = 'Running' AND TaskQueue = 'tq'",
+		},
+		{
+			name:                    "workerDeploymentBuildID without workerDeploymentName — falls through to no-version (treat both required)",
+			taskQueue:               "tq",
+			workerDeploymentBuildID: "main-3d1a552",
+			want:                    "ExecutionStatus = 'Running' AND TaskQueue = 'tq'",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildRunningCountQuery(tc.taskQueue, tc.workerDeployment, tc.buildID)
+			got := buildRunningCountQuery(tc.taskQueue, tc.workerDeploymentName, tc.workerDeploymentBuildID, tc.buildID)
 			assert.Equal(t, tc.want, got)
 		})
 	}
