@@ -96,7 +96,8 @@ type temporalMetadata struct {
 	TaskQueue                   string   `keda:"name=taskQueue,                 order=triggerMetadata;resolvedEnv"`
 	QueueTypes                  []string `keda:"name=queueTypes,                order=triggerMetadata, optional"`
 	BuildID                     string   `keda:"name=buildId,                   order=triggerMetadata;resolvedEnv, optional"`
-	WorkerDeployment            string   `keda:"name=workerDeployment,          order=triggerMetadata;resolvedEnv, optional"`
+	WorkerDeploymentName        string   `keda:"name=workerDeploymentName,      order=triggerMetadata;resolvedEnv, optional"`
+	WorkerDeploymentBuildID     string   `keda:"name=workerDeploymentBuildId,   order=triggerMetadata;resolvedEnv, optional"`
 	AllActive                   bool     `keda:"name=selectAllActive,           order=triggerMetadata, default=false"`
 	Unversioned                 bool     `keda:"name=selectUnversioned,         order=triggerMetadata, default=false"`
 	IncludeRunningWorkflowCount bool     `keda:"name=includeRunningWorkflowCount, order=triggerMetadata, default=true"`
@@ -283,32 +284,34 @@ func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable, gateS
 //
 // Three modes, in priority order:
 //
-//   1. workerDeployment + buildID set (RECOMMENDED, for Temporal's worker-
-//      deployment-versioning model): use the canonical, single-valued
+//   1. workerDeploymentName + workerDeploymentBuildID set (RECOMMENDED, for
+//      Temporal's worker-deployment-versioning model): use the canonical,
+//      single-valued
 //      `TemporalWorkerDeploymentVersion = '<deployment-name>:<buildId>'`
 //      search attribute. Set automatically by Temporal as the current routing
 //      assignment regardless of versioning behavior (Pinned/AutoUpgrade).
-//      Empirically verified against Temporal v1.x via direct visibility
-//      queries on workflows pinned to specific worker-deployment versions.
+//      Field names match upstream KEDA v2.20.1's metadata schema so this
+//      branch can switch to upstream without callers re-emitting metadata.
 //
-//   2. buildID set, workerDeployment empty (LEGACY, for older worker-versioning-
-//      rules model): falls back to `BuildIds = 'versioned:<buildId>'`. Doesn't
-//      match workflows pinned via worker-deployment versioning (the assignment
-//      marker for those is `pinned:<dep>:<buildId>`, not `versioned:<buildId>`).
-//      Kept for backward compatibility with deployments still on the older
-//      versioning model.
+//   2. buildID set, workerDeploymentName empty (LEGACY, for older
+//      worker-versioning-rules model): falls back to
+//      `BuildIds = 'versioned:<buildId>'`. Doesn't match workflows pinned
+//      via worker-deployment versioning (the assignment marker for those is
+//      `pinned:<dep>:<buildId>`, not `versioned:<buildId>`). Kept for
+//      backward compatibility with deployments still on the older versioning
+//      model.
 //
 //   3. Neither set: task-queue-wide count, no version scoping.
-func buildRunningCountQuery(taskQueue, workerDeployment, buildID string) string {
+func buildRunningCountQuery(taskQueue, workerDeploymentName, workerDeploymentBuildID, buildID string) string {
 	escapedTQ := strings.ReplaceAll(taskQueue, "'", "''")
 	query := fmt.Sprintf("ExecutionStatus = 'Running' AND TaskQueue = '%s'", escapedTQ)
 	switch {
-	case workerDeployment != "" && buildID != "":
+	case workerDeploymentName != "" && workerDeploymentBuildID != "":
 		// Canonical worker-deployment-versioning query. Uses the single-valued
 		// TemporalWorkerDeploymentVersion attribute set automatically by
 		// Temporal — uniform across Pinned + AutoUpgrade behaviors.
-		escapedDep := strings.ReplaceAll(workerDeployment, "'", "''")
-		escapedBID := strings.ReplaceAll(buildID, "'", "''")
+		escapedDep := strings.ReplaceAll(workerDeploymentName, "'", "''")
+		escapedBID := strings.ReplaceAll(workerDeploymentBuildID, "'", "''")
 		query = fmt.Sprintf("%s AND TemporalWorkerDeploymentVersion = '%s:%s'",
 			query, escapedDep, escapedBID)
 	case buildID != "":
@@ -327,7 +330,7 @@ func (s *temporalScaler) getRunningWorkflowCount(ctx context.Context) (int64, er
 	if taskQueue == "" {
 		taskQueue = s.metadata.TaskQueue
 	}
-	query := buildRunningCountQuery(taskQueue, s.metadata.WorkerDeployment, s.metadata.BuildID)
+	query := buildRunningCountQuery(taskQueue, s.metadata.WorkerDeploymentName, s.metadata.WorkerDeploymentBuildID, s.metadata.BuildID)
 
 	req := &workflowservice.CountWorkflowExecutionsRequest{
 		Namespace: s.metadata.Namespace,
@@ -346,6 +349,14 @@ func (s *temporalScaler) getRunningWorkflowCount(ctx context.Context) (int64, er
 // scale-down when workers are actively executing tasks but the task queue backlog
 // is empty.
 //
+// When the scaler is configured for a specific worker version (workerDeploymentBuildId
+// or the legacy buildId), the pod listing is filtered by the upstream
+// `temporal.io/build-id` label so that a per-version ScaledObject only sums slots
+// from its own pods. Without this filter, multiple per-version SOs sharing a
+// namespace would each see every version's pods and double-count the slots term,
+// keeping all versions warm whenever any one of them is busy. When neither buildID
+// field is set (unversioned worker), no build-id filter is applied.
+//
 // On transient failures (all pod scrapes fail), it returns the last known good
 // value if within the cache TTL. A total timeout budget bounds the scrape loop
 // so that slow/unreachable pods don't block the KEDA polling cycle.
@@ -356,6 +367,9 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 
 	podList := &corev1.PodList{}
 	labelSelector := client.MatchingLabels{"app.kubernetes.io/component": "worker"}
+	if buildID := s.workerBuildID(); buildID != "" {
+		labelSelector["temporal.io/build-id"] = buildID
+	}
 	if err := s.kubeClient.List(ctx, podList, client.InNamespace(s.podNamespace), labelSelector); err != nil {
 		return 0, fmt.Errorf("failed to list worker pods in namespace %s: %w", s.podNamespace, err)
 	}
@@ -427,6 +441,18 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 	s.slotsMu.Unlock()
 
 	return totalUsedSlots, nil
+}
+
+// workerBuildID returns the build ID used to scope the pod listing for slot
+// scraping. Prefers the new workerDeploymentBuildId field (worker-deployment
+// versioning model), falling back to the legacy buildId (worker-versioning-rules
+// model). Returns "" for unversioned workers, in which case no build-id filter
+// is applied.
+func (s *temporalScaler) workerBuildID() string {
+	if s.metadata.WorkerDeploymentBuildID != "" {
+		return s.metadata.WorkerDeploymentBuildID
+	}
+	return s.metadata.BuildID
 }
 
 // scrapeWorkerSlots fetches Prometheus metrics from a single worker pod and returns

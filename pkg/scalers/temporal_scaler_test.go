@@ -582,11 +582,21 @@ func testServerPort(t *testing.T, srv *httptest.Server) (string, int) {
 
 // newFakeWorkerPod creates a running pod with the worker label and given IP.
 func newFakeWorkerPod(name, namespace, ip string) *corev1.Pod {
+	return newFakeWorkerPodWithBuildID(name, namespace, ip, "")
+}
+
+// newFakeWorkerPodWithBuildID creates a running worker pod and optionally
+// applies the upstream `temporal.io/build-id` label.
+func newFakeWorkerPodWithBuildID(name, namespace, ip, buildID string) *corev1.Pod {
+	labels := map[string]string{"app.kubernetes.io/component": "worker"}
+	if buildID != "" {
+		labels["temporal.io/build-id"] = buildID
+	}
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
-			Labels:    map[string]string{"app.kubernetes.io/component": "worker"},
+			Labels:    labels,
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
@@ -645,6 +655,84 @@ temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="
 	slots, err = s.getUsedWorkerSlots(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), slots)
+}
+
+// TestGetUsedWorkerSlotsBuildIDFilter locks down that a per-version ScaledObject
+// only sums slots from its own version's pods. Without the filter, two SOs
+// sharing a namespace would each see every version's pods and double-count the
+// slots term — the multi-version "5 workers for 1 workflow" over-count.
+func TestGetUsedWorkerSlotsBuildIDFilter(t *testing.T) {
+	// Each pod's metrics endpoint reports 7 used activity slots so the
+	// per-pod contribution is identical and the only thing that varies
+	// across cases is which pods the listing returns.
+	metricsBody := `# HELP temporal_worker_task_slots_used Current number of used slots per task type
+# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="ActivityWorker"} 7
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, metricsBody)
+	}))
+	defer srv.Close()
+	ip, port := testServerPort(t, srv)
+	ns := "test-ns"
+
+	cases := []struct {
+		name                    string
+		buildID                 string
+		workerDeploymentBuildID string
+		want                    int64
+	}{
+		{
+			name:    "legacy buildId filters out other versions' pods",
+			buildID: "v1",
+			want:    14, // 2 v1 pods * 7 slots
+		},
+		{
+			name:                    "workerDeploymentBuildId filters out other versions' pods",
+			workerDeploymentBuildID: "v1",
+			want:                    14,
+		},
+		{
+			name:                    "workerDeploymentBuildId takes precedence over legacy buildId",
+			buildID:                 "v2",
+			workerDeploymentBuildID: "v1",
+			want:                    14,
+		},
+		{
+			name: "unversioned scaler (no buildID) sums all worker pods",
+			want: 35, // 5 worker pods * 7 slots (2 v1 + 2 v2 + 1 unlabelled)
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			pods := []runtime.Object{
+				newFakeWorkerPodWithBuildID("v1-a", ns, ip, "v1"),
+				newFakeWorkerPodWithBuildID("v1-b", ns, ip, "v1"),
+				newFakeWorkerPodWithBuildID("v2-a", ns, ip, "v2"),
+				newFakeWorkerPodWithBuildID("v2-b", ns, ip, "v2"),
+				newFakeWorkerPod("unlabelled", ns, ip),
+			}
+			kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pods...).Build()
+			s := &temporalScaler{
+				metadata: &temporalMetadata{
+					TaskQueue:               "q",
+					WorkerMetricsPort:       port,
+					BuildID:                 tc.buildID,
+					WorkerDeploymentBuildID: tc.workerDeploymentBuildID,
+				},
+				httpClient:   srv.Client(),
+				kubeClient:   kubeClient,
+				logger:       logr.Discard(),
+				podNamespace: ns,
+			}
+			slots, err := s.getUsedWorkerSlots(context.Background())
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, slots)
+		})
+	}
 }
 
 func TestGetUsedWorkerSlotsTimeout(t *testing.T) {
@@ -724,36 +812,38 @@ func TestComposeMetric(t *testing.T) {
 // TestBuildRunningCountQuery covers the three modes of visibility-query
 // construction for CountWorkflowExecutions:
 //
-//  1. workerDeployment + buildID set → TemporalWorkerDeploymentVersion query
-//     (worker-deployment-versioning model, RECOMMENDED).
+//  1. workerDeploymentName + workerDeploymentBuildID set →
+//     TemporalWorkerDeploymentVersion query (worker-deployment-versioning
+//     model, RECOMMENDED). Field names match upstream KEDA v2.20.1.
 //  2. buildID only → legacy BuildIds = 'versioned:<buildID>' query
 //     (older worker-versioning-rules model).
 //  3. Neither → task-queue-wide.
 func TestBuildRunningCountQuery(t *testing.T) {
 	tests := []struct {
-		name             string
-		taskQueue        string
-		workerDeployment string
-		buildID          string
-		want             string
+		name                    string
+		taskQueue               string
+		workerDeploymentName    string
+		workerDeploymentBuildID string
+		buildID                 string
+		want                    string
 	}{
 		{
-			name:      "no buildID — task-queue-wide query",
+			name:      "no version fields — task-queue-wide query",
 			taskQueue: "my-task-queue",
 			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'my-task-queue'",
 		},
 		{
-			name:      "buildID set, no workerDeployment — legacy worker-versioning-rules path",
+			name:      "buildID set, no workerDeploymentName — legacy worker-versioning-rules path",
 			taskQueue: "my-task-queue",
 			buildID:   "main-abc123",
 			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'my-task-queue' AND BuildIds = 'versioned:main-abc123'",
 		},
 		{
-			name:             "workerDeployment + buildID — worker-deployment-versioning path",
-			taskQueue:        "atlan-athena-production",
-			workerDeployment: "athena-app/athena-worker-twd",
-			buildID:          "main-3d1a552",
-			want:             "ExecutionStatus = 'Running' AND TaskQueue = 'atlan-athena-production' AND TemporalWorkerDeploymentVersion = 'athena-app/athena-worker-twd:main-3d1a552'",
+			name:                    "workerDeploymentName + workerDeploymentBuildID — worker-deployment-versioning path",
+			taskQueue:               "atlan-athena-production",
+			workerDeploymentName:    "athena-app/athena-worker-twd",
+			workerDeploymentBuildID: "main-3d1a552",
+			want:                    "ExecutionStatus = 'Running' AND TaskQueue = 'atlan-athena-production' AND TemporalWorkerDeploymentVersion = 'athena-app/athena-worker-twd:main-3d1a552'",
 		},
 		{
 			name:      "single quote in task queue is escaped",
@@ -767,22 +857,28 @@ func TestBuildRunningCountQuery(t *testing.T) {
 			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'tq' AND BuildIds = 'versioned:ver''1'",
 		},
 		{
-			name:             "single quote in deployment + buildID escaped (worker-deployment-versioning)",
-			taskQueue:        "tq",
-			workerDeployment: "ns/d'ep",
-			buildID:          "v'1",
-			want:             "ExecutionStatus = 'Running' AND TaskQueue = 'tq' AND TemporalWorkerDeploymentVersion = 'ns/d''ep:v''1'",
+			name:                    "single quote in deployment + buildID escaped (worker-deployment-versioning)",
+			taskQueue:               "tq",
+			workerDeploymentName:    "ns/d'ep",
+			workerDeploymentBuildID: "v'1",
+			want:                    "ExecutionStatus = 'Running' AND TaskQueue = 'tq' AND TemporalWorkerDeploymentVersion = 'ns/d''ep:v''1'",
 		},
 		{
-			name:             "workerDeployment without buildID — falls through to no-version (treat both required)",
-			taskQueue:        "tq",
-			workerDeployment: "ns/dep",
-			want:             "ExecutionStatus = 'Running' AND TaskQueue = 'tq'",
+			name:                 "workerDeploymentName without workerDeploymentBuildID — falls through to no-version (treat both required)",
+			taskQueue:            "tq",
+			workerDeploymentName: "ns/dep",
+			want:                 "ExecutionStatus = 'Running' AND TaskQueue = 'tq'",
+		},
+		{
+			name:                    "workerDeploymentBuildID without workerDeploymentName — falls through to no-version (treat both required)",
+			taskQueue:               "tq",
+			workerDeploymentBuildID: "main-3d1a552",
+			want:                    "ExecutionStatus = 'Running' AND TaskQueue = 'tq'",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildRunningCountQuery(tc.taskQueue, tc.workerDeployment, tc.buildID)
+			got := buildRunningCountQuery(tc.taskQueue, tc.workerDeploymentName, tc.workerDeploymentBuildID, tc.buildID)
 			assert.Equal(t, tc.want, got)
 		})
 	}
