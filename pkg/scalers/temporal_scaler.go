@@ -295,24 +295,24 @@ func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable, gateS
 //
 // Three modes, in priority order:
 //
-//   1. workerDeploymentName + workerDeploymentBuildID set (RECOMMENDED, for
-//      Temporal's worker-deployment-versioning model): use the canonical,
-//      single-valued
-//      `TemporalWorkerDeploymentVersion = '<deployment-name>:<buildId>'`
-//      search attribute. Set automatically by Temporal as the current routing
-//      assignment regardless of versioning behavior (Pinned/AutoUpgrade).
-//      Field names match upstream KEDA v2.20.1's metadata schema so this
-//      branch can switch to upstream without callers re-emitting metadata.
+//  1. workerDeploymentName + workerDeploymentBuildID set (RECOMMENDED, for
+//     Temporal's worker-deployment-versioning model): use the canonical,
+//     single-valued
+//     `TemporalWorkerDeploymentVersion = '<deployment-name>:<buildId>'`
+//     search attribute. Set automatically by Temporal as the current routing
+//     assignment regardless of versioning behavior (Pinned/AutoUpgrade).
+//     Field names match upstream KEDA v2.20.1's metadata schema so this
+//     branch can switch to upstream without callers re-emitting metadata.
 //
-//   2. buildID set, workerDeploymentName empty (LEGACY, for older
-//      worker-versioning-rules model): falls back to
-//      `BuildIds = 'versioned:<buildId>'`. Doesn't match workflows pinned
-//      via worker-deployment versioning (the assignment marker for those is
-//      `pinned:<dep>:<buildId>`, not `versioned:<buildId>`). Kept for
-//      backward compatibility with deployments still on the older versioning
-//      model.
+//  2. buildID set, workerDeploymentName empty (LEGACY, for older
+//     worker-versioning-rules model): falls back to
+//     `BuildIds = 'versioned:<buildId>'`. Doesn't match workflows pinned
+//     via worker-deployment versioning (the assignment marker for those is
+//     `pinned:<dep>:<buildId>`, not `versioned:<buildId>`). Kept for
+//     backward compatibility with deployments still on the older versioning
+//     model.
 //
-//   3. Neither set: task-queue-wide count, no version scoping.
+//  3. Neither set: task-queue-wide count, no version scoping.
 func buildRunningCountQuery(taskQueue, workerDeploymentName, workerDeploymentBuildID, buildID string) string {
 	escapedTQ := strings.ReplaceAll(taskQueue, "'", "''")
 	query := fmt.Sprintf("ExecutionStatus = 'Running' AND TaskQueue = '%s'", escapedTQ)
