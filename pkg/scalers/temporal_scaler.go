@@ -104,6 +104,7 @@ type temporalMetadata struct {
 	WorkflowTaskQueueForCount   string   `keda:"name=workflowTaskQueueForCount,   order=triggerMetadata;resolvedEnv, optional"`
 	WorkerMetricsPort           int      `keda:"name=workerMetricsPort,           order=triggerMetadata, default=9464"`
 	GateSlotsOnRunningWorkflow  bool     `keda:"name=gateSlotsOnRunningWorkflow,  order=triggerMetadata, default=true"`
+	ActivitySlotsPerWorker      int      `keda:"name=activitySlotsPerWorker,      order=triggerMetadata, default=0"`
 	APIKey                      string   `keda:"name=apiKey,                    order=authParams;resolvedEnv, optional"`
 	MinConnectTimeout           int      `keda:"name=minConnectTimeout,         order=triggerMetadata, default=5"`
 
@@ -135,6 +136,10 @@ func (a *temporalMetadata) Validate() error {
 
 	if a.WorkerMetricsPort < 1 || a.WorkerMetricsPort > 65535 {
 		return fmt.Errorf("workerMetricsPort must be between 1 and 65535")
+	}
+
+	if a.ActivitySlotsPerWorker < 0 {
+		return fmt.Errorf("activitySlotsPerWorker must be a positive number")
 	}
 
 	return nil
@@ -270,6 +275,12 @@ func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
 // queue. Trade-off: a genuinely idle pool exhibiting ghost-flicker can stay up
 // one extra cooldown window; that over-provisions rather than killing a busy
 // pod, and is the conservative direction.
+//
+// That residual ghost-flicker is what activitySlotsPerWorker eliminates: when
+// set, usedSlots arrives here already phantom-discounted (derived from
+// available, see effectiveUsedSlots), so a gate=false dedicated pool reports 0
+// when idle and actually scales to zero, while still going non-zero the instant
+// a real activity consumes a slot.
 func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable, gateSlotsOnRunningWorkflow bool) int64 {
 	metric := backlog + runningCount
 	if slotsAvailable && (!gateSlotsOnRunningWorkflow || runningCount > 0) {
@@ -478,30 +489,88 @@ func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, podIP string) (i
 
 	limitedBody := io.LimitReader(resp.Body, maxMetricsResponseBytes)
 	activityOnly := map[string]bool{"ActivityWorker": true}
-	return parseUsedSlots(limitedBody, s.metadata.TaskQueue, activityOnly)
+	used, available, availablePresent, err := parseSlots(limitedBody, s.metadata.TaskQueue, activityOnly)
+	if err != nil {
+		return 0, err
+	}
+	return s.effectiveUsedSlots(used, available, availablePresent), nil
 }
 
-// parseUsedSlots parses Prometheus text format and extracts the sum of
-// temporal_worker_task_slots_used for the given worker types matching the task queue.
-func parseUsedSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) (int64, error) {
+// parseSlots parses Prometheus text format and returns the summed
+// temporal_worker_task_slots_used and temporal_worker_task_slots_available for
+// the worker types matching the task queue. availablePresent reports whether
+// the available gauge was actually exported for a matching series (older SDKs
+// may not emit it), so callers can fall back to raw used-slots when it is
+// missing.
+func parseSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) (used int64, available int64, availablePresent bool, err error) {
 	var parser expfmt.TextParser
 	families, err := parser.TextToMetricFamilies(r)
 	if err != nil {
-		return 0, fmt.Errorf("parse prometheus metrics: %w", err)
+		return 0, 0, false, fmt.Errorf("parse prometheus metrics: %w", err)
 	}
 
-	family, ok := families["temporal_worker_task_slots_used"]
-	if !ok {
-		return 0, nil
-	}
+	used, _ = sumSlotFamily(families["temporal_worker_task_slots_used"], taskQueue, workerTypes)
+	available, availablePresent = sumSlotFamily(families["temporal_worker_task_slots_available"], taskQueue, workerTypes)
+	return used, available, availablePresent, nil
+}
 
-	var total int64
+// sumSlotFamily sums the gauge values of a slot metric family across the metrics
+// whose worker_type and task_queue match. found reports whether at least one
+// matching series existed (distinguishing "absent" from "present and zero").
+func sumSlotFamily(family *dto.MetricFamily, taskQueue string, workerTypes map[string]bool) (sum int64, found bool) {
+	if family == nil {
+		return 0, false
+	}
 	for _, m := range family.GetMetric() {
 		if matchesWorkerSlot(m, taskQueue, workerTypes) {
-			total += int64(m.GetGauge().GetValue())
+			sum += int64(m.GetGauge().GetValue())
+			found = true
 		}
 	}
-	return total, nil
+	return sum, found
+}
+
+// parseUsedSlots returns only the summed used-slots gauge. Retained as a thin
+// wrapper over parseSlots for callers/tests that only need the raw used value.
+func parseUsedSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) (int64, error) {
+	used, _, _, err := parseSlots(r, taskQueue, workerTypes)
+	return used, err
+}
+
+// effectiveUsedSlots converts a pod's raw slot gauges into the number of slots
+// actually occupied by a running activity.
+//
+// The temporalio SDK has a slot-accounting bug: certain non-empty long-poll
+// responses that carry no activity mark a slot "used" without consuming real
+// capacity (see sdk-core pollers/mod.rs and the worker slot supplier). The pod
+// then reports used>0 while available stays at its configured maximum, i.e.
+// used+available > max — an "impossible if real" phantom slot. Summing raw
+// `used` makes KEDA read an idle pool as busy and never scale it to zero,
+// pinning a dedicated on-demand pool at one pod per tenant 24/7.
+//
+// `available` is NOT corrupted by the bug: a genuinely running activity
+// decrements it, the phantom does not. So when the per-worker activity-slot
+// limit is known (activitySlotsPerWorker, set to the worker's
+// maxConcurrentActivities), the honest occupancy is max(0, limit - available):
+//
+//	real activity  -> available < limit -> > 0  (pod kept warm)
+//	phantom / idle -> available == limit -> 0   (pool free to drain)
+//
+// When the limit is unset (0) or the available gauge is absent, it falls back
+// to raw `used` so existing ScaledObjects are unaffected.
+func (s *temporalScaler) effectiveUsedSlots(used, available int64, availablePresent bool) int64 {
+	limit := int64(s.metadata.ActivitySlotsPerWorker)
+	if limit <= 0 || !availablePresent {
+		return used
+	}
+	realUsed := limit - available
+	if realUsed < 0 {
+		realUsed = 0
+	}
+	if realUsed > limit {
+		realUsed = limit
+	}
+	return realUsed
 }
 
 // matchesWorkerSlot returns true if the metric's worker_type is in the allowed set
