@@ -113,6 +113,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"namespace": "default",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "",
@@ -133,6 +134,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueue": "testxx",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -155,6 +157,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"activationTargetQueueSize": "12",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -176,6 +179,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueue": "testxx",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -202,6 +206,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"queueTypes": "workflow,activity",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -229,6 +234,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueueFromEnv": "taskQueue",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -255,6 +261,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey":    "test-api-key",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -281,6 +288,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"tlsServerName": "my-namespace.tmpr.cloud",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -307,6 +315,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey": "test01",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -337,6 +346,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"ca":          "ca-data",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -364,6 +374,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"includeRunningWorkflowCount": "false",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -386,6 +397,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"workflowTaskQueueForCount": "workflow-queue",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "activity-queue",
