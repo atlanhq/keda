@@ -3535,6 +3535,10 @@ scalers:
           type: string
           default: "true"
           metadataVariableReadable: true
+        - name: activitySlotsPerWorker
+          type: string
+          default: "0"
+          metadataVariableReadable: true
         - name: apiKey
           type: string
           optional: true

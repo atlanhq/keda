@@ -113,6 +113,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"namespace": "default",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "",
@@ -133,6 +134,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueue": "testxx",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -155,6 +157,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"activationTargetQueueSize": "12",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -176,6 +179,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueue": "testxx",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -202,6 +206,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"queueTypes": "workflow,activity",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -229,6 +234,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueueFromEnv": "taskQueue",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -255,6 +261,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey":    "test-api-key",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -281,6 +288,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"tlsServerName": "my-namespace.tmpr.cloud",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -307,6 +315,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey": "test01",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -337,6 +346,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"ca":          "ca-data",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -364,6 +374,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"includeRunningWorkflowCount": "false",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "testxx",
@@ -386,6 +397,7 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"workflowTaskQueueForCount": "workflow-queue",
 			},
 			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
 				Endpoint:                    "test:7233",
 				Namespace:                   "default",
 				TaskQueue:                   "activity-queue",
@@ -563,6 +575,138 @@ temporal_worker_task_slots_used{namespace="default",task_queue="atlan-redshift-p
 				return
 			}
 			assert.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestParseSlots(t *testing.T) {
+	activityOnly := map[string]bool{"ActivityWorker": true}
+
+	cases := []struct {
+		name              string
+		input             string
+		taskQueue         string
+		wantUsed          int64
+		wantAvailable     int64
+		wantAvailableSeen bool
+	}{
+		{
+			name:      "real activity: used+available == max",
+			taskQueue: "atlan-publish-metastore",
+			input: `# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{task_queue="atlan-publish-metastore",worker_type="ActivityWorker"} 1
+# TYPE temporal_worker_task_slots_available gauge
+temporal_worker_task_slots_available{task_queue="atlan-publish-metastore",worker_type="ActivityWorker"} 5
+`,
+			wantUsed:          1,
+			wantAvailable:     5,
+			wantAvailableSeen: true,
+		},
+		{
+			name:      "phantom: used=1 while available still at max",
+			taskQueue: "atlan-publish-metastore",
+			input: `# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{task_queue="atlan-publish-metastore",worker_type="ActivityWorker"} 1
+# TYPE temporal_worker_task_slots_available gauge
+temporal_worker_task_slots_available{task_queue="atlan-publish-metastore",worker_type="ActivityWorker"} 6
+`,
+			wantUsed:          1,
+			wantAvailable:     6,
+			wantAvailableSeen: true,
+		},
+		{
+			name:      "available filtered to ActivityWorker + task queue",
+			taskQueue: "q",
+			input: `# TYPE temporal_worker_task_slots_available gauge
+temporal_worker_task_slots_available{task_queue="q",worker_type="ActivityWorker"} 4
+temporal_worker_task_slots_available{task_queue="q",worker_type="WorkflowWorker"} 100
+temporal_worker_task_slots_available{task_queue="other",worker_type="ActivityWorker"} 9
+`,
+			wantUsed:          0,
+			wantAvailable:     4,
+			wantAvailableSeen: true,
+		},
+		{
+			name:      "available gauge absent (older SDK)",
+			taskQueue: "q",
+			input: `# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{task_queue="q",worker_type="ActivityWorker"} 2
+`,
+			wantUsed:          2,
+			wantAvailable:     0,
+			wantAvailableSeen: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			used, available, availableSeen, err := parseSlots(strings.NewReader(tc.input), tc.taskQueue, activityOnly)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.wantUsed, used, "used")
+			assert.Equal(t, tc.wantAvailable, available, "available")
+			assert.Equal(t, tc.wantAvailableSeen, availableSeen, "availablePresent")
+		})
+	}
+}
+
+func TestEffectiveUsedSlots(t *testing.T) {
+	cases := []struct {
+		name             string
+		slotsPerWorker   int
+		used             int64
+		available        int64
+		availablePresent bool
+		want             int64
+	}{
+		{
+			name:           "limit unset falls back to raw used",
+			slotsPerWorker: 0,
+			used:           1, available: 6, availablePresent: true,
+			want: 1,
+		},
+		{
+			name:           "available absent falls back to raw used",
+			slotsPerWorker: 6,
+			used:           1, available: 0, availablePresent: false,
+			want: 1,
+		},
+		{
+			name:           "phantom discounted to zero (available at max)",
+			slotsPerWorker: 6,
+			used:           1, available: 6, availablePresent: true,
+			want: 0,
+		},
+		{
+			name:           "real single activity counted",
+			slotsPerWorker: 6,
+			used:           1, available: 5, availablePresent: true,
+			want: 1,
+		},
+		{
+			name:           "real multiple activities counted",
+			slotsPerWorker: 6,
+			used:           4, available: 2, availablePresent: true,
+			want: 4,
+		},
+		{
+			name:           "idle pod reports zero",
+			slotsPerWorker: 6,
+			used:           0, available: 6, availablePresent: true,
+			want: 0,
+		},
+		{
+			name:           "available above limit clamps to zero",
+			slotsPerWorker: 6,
+			used:           0, available: 7, availablePresent: true,
+			want: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &temporalScaler{metadata: &temporalMetadata{ActivitySlotsPerWorker: tc.slotsPerWorker}}
+			got := s.effectiveUsedSlots(tc.used, tc.available, tc.availablePresent)
 			assert.Equal(t, tc.want, got)
 		})
 	}
