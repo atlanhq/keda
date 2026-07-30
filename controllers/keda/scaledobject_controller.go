@@ -644,7 +644,7 @@ func (r *ScaledObjectReconciler) updatePromMetrics(scaledObject *kedav1alpha1.Sc
 	scaledObjectPromMetricsMap[namespacedName] = metricsData
 }
 
-func (r *ScaledObjectReconciler) updatePromMetricsOnDelete(namespacedName string) {
+func (r *ScaledObjectReconciler) updatePromMetricsOnDelete(scaledObject *kedav1alpha1.ScaledObject, namespacedName string) {
 	scaledObjectPromMetricsLock.Lock()
 	defer scaledObjectPromMetricsLock.Unlock()
 
@@ -654,6 +654,9 @@ func (r *ScaledObjectReconciler) updatePromMetricsOnDelete(namespacedName string
 			metricscollector.DecrementTriggerTotal(triggerType)
 		}
 	}
+
+	metricscollector.DeleteScalerMetrics(scaledObject.Namespace, scaledObject.Name, true)
+	metricscollector.DeleteScaledObjectMetrics(scaledObject.Namespace, scaledObject.Name)
 
 	delete(scaledObjectPromMetricsMap, namespacedName)
 }

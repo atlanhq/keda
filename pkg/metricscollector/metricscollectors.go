@@ -42,6 +42,9 @@ type MetricsCollector interface {
 
 	DeleteScalerMetrics(namespace string, scaledResource string, isScaledObject bool)
 
+	// DeleteScaledObjectMetrics removes the ScaledObject-level metrics for a deleted ScaledObject
+	DeleteScaledObjectMetrics(namespace string, scaledObject string)
+
 	// RecordScalerLatency create a measurement of the latency to external metric
 	RecordScalerLatency(namespace string, scaledResource string, scaler string, triggerIndex int, metric string, isScaledObject bool, value time.Duration)
 
@@ -108,6 +111,13 @@ func RecordScalerMetric(namespace string, scaledObject string, scaler string, tr
 func DeleteScalerMetrics(namespace string, scaledObject string, isScaledObject bool) {
 	for _, element := range collectors {
 		element.DeleteScalerMetrics(namespace, scaledObject, isScaledObject)
+	}
+}
+
+// DeleteScaledObjectMetrics removes the ScaledObject-level metrics for a deleted ScaledObject
+func DeleteScaledObjectMetrics(namespace string, scaledObject string) {
+	for _, element := range collectors {
+		element.DeleteScaledObjectMetrics(namespace, scaledObject)
 	}
 }
 

@@ -196,6 +196,15 @@ func (p *PromMetrics) DeleteScalerMetrics(namespace string, scaledResource strin
 	scalerMetricsLatency.DeletePartialMatch(prometheus.Labels{"namespace": namespace, "scaledObject": scaledResource, "type": getResourceType(isScaledObject)})
 }
 
+// DeleteScaledObjectMetrics deletes the ScaledObject-level metrics so that we don't keep reporting
+// series for a ScaledObject that no longer exists. These are labelled by ScaledObject name only, so
+// without this they accumulate for the lifetime of the process.
+func (p *PromMetrics) DeleteScaledObjectMetrics(namespace string, scaledObject string) {
+	scaledObjectErrors.DeletePartialMatch(prometheus.Labels{"namespace": namespace, "scaledObject": scaledObject})
+	scaledObjectPaused.DeletePartialMatch(prometheus.Labels{"namespace": namespace, "scaledObject": scaledObject})
+	internalLoopLatency.DeletePartialMatch(prometheus.Labels{"namespace": namespace, "type": getResourceType(true), "resource": scaledObject})
+}
+
 // RecordScalerLatency create a measurement of the latency to external metric
 func (p *PromMetrics) RecordScalerLatency(namespace string, scaledResource string, scaler string, triggerIndex int, metric string, isScaledObject bool, value time.Duration) {
 	scalerMetricsLatency.With(getLabels(namespace, scaledResource, scaler, triggerIndex, metric, isScaledObject)).Set(value.Seconds())
