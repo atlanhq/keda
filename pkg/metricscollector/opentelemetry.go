@@ -262,6 +262,10 @@ func (o *OtelMetrics) DeleteScalerMetrics(string, string, bool) {
 	// noop for OTel
 }
 
+func (o *OtelMetrics) DeleteScaledObjectMetrics(string, string) {
+	// noop for OTel
+}
+
 func ScalerMetricsLatencyCallback(_ context.Context, obsrv api.Float64Observer) error {
 	for _, v := range otelScalerMetricsLatencyVals {
 		obsrv.Observe(v.val, v.measurementOption)
