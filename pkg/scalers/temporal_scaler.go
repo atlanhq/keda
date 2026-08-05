@@ -206,7 +206,11 @@ func (s *temporalScaler) GetMetricsAndActivity(ctx context.Context, metricName s
 
 	metric := GenerateMetricInMili(metricName, float64(queueSize))
 
-	return []external_metrics.ExternalMetricValue{metric}, queueSize > s.metadata.ActivationTargetQueueSize, nil
+	// activationTargetQueueSize is the backlog at which the pool is meant to come up, so a
+	// composite metric that has reached it is already work the pool should be handling.
+	// Comparing inclusively keeps the knob's meaning the same as targetQueueSize's, which the
+	// HPA also treats as a value to reach rather than to exceed.
+	return []external_metrics.ExternalMetricValue{metric}, queueSize >= s.metadata.ActivationTargetQueueSize, nil
 }
 
 func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {

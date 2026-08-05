@@ -4,6 +4,7 @@ on:
   push:
     branches:
     - 2.19.0-main
+    - fix/activation-threshold-inclusive
 
 jobs:
   build:
