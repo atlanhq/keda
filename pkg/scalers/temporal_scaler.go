@@ -3,6 +3,7 @@ package scalers
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -43,6 +44,16 @@ const (
 	maxMetricsResponseBytes = 10 * 1024 * 1024 // 10 MB
 )
 
+// errWorkerSlotsUnknown means every worker pod scrape failed and no cached
+// slots value is available (cache expired, or never populated — the common
+// case for a just-scaled-up deployment). FND-716: this used to be swallowed
+// into a silent 0, indistinguishable from "genuinely idle", so KEDA's
+// scrape-vs-startup race on a fresh CURRENT build could scale it straight
+// back to zero with no poller ever registered. Callers must surface this as
+// a scaler error (not a degraded-but-valid metric) so KEDA's configured
+// fallback engages instead of trusting the 0.
+var errWorkerSlotsUnknown = errors.New("worker slots unknown: all pod scrapes failed and no cached value is available")
+
 var (
 	temporalDefauleQueueTypes = []sdk.TaskQueueType{
 		sdk.TaskQueueTypeActivity,
@@ -54,7 +65,7 @@ var (
 	//   pod_scrape_error              – a single pod's /metrics request failed
 	//   scrape_loop_timeout           – 12s budget exceeded, used partial results
 	//   all_pods_failed_cache_hit     – all pods failed; returned last cached value
-	//   all_pods_failed_cache_expired – all pods failed and cache expired; returned 0
+	//   all_pods_failed_cache_expired – all pods failed and cache expired; reported as a scaler error (FND-716)
 	temporalSlotsScrapeErrors = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "keda",
@@ -245,6 +256,14 @@ func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
 
 	usedSlots, slotsErr := s.getUsedWorkerSlots(ctx)
 	if slotsErr != nil {
+		if errors.Is(slotsErr, errWorkerSlotsUnknown) {
+			// FND-716: don't let a 0-value slots term stand in for "we don't
+			// actually know". Fail the whole metric fetch so KEDA counts a
+			// scaler error and its configured fallback (hold at
+			// currentReplicasIfHigher) engages instead of scaling to zero on
+			// an unknown read.
+			return 0, fmt.Errorf("failed to get Temporal queue size: %w", slotsErr)
+		}
 		s.logger.Info("failed to get worker slots metric, excluding from metric", "error", slotsErr)
 	}
 
@@ -441,9 +460,9 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 			temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "all_pods_failed_cache_hit").Inc()
 			return cached.value, nil
 		}
-		s.logger.Info("all scrapes failed and cache expired, returning 0")
+		s.logger.Info("all scrapes failed and cache expired, reporting scaler error")
 		temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "all_pods_failed_cache_expired").Inc()
-		return 0, nil
+		return 0, errWorkerSlotsUnknown
 	}
 
 	// Update cache with the fresh value.

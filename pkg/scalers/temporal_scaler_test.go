@@ -2,6 +2,7 @@ package scalers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -791,13 +792,46 @@ temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="
 	assert.NoError(t, err)
 	assert.Equal(t, int64(3), slots)
 
-	// Expire the cache manually, should return 0.
+	// Expire the cache manually. FND-716: this must now be a scaler error,
+	// not a silent 0 — a 0 here is indistinguishable from "genuinely idle"
+	// and let KEDA scale a fresh CURRENT build straight back to zero with no
+	// poller ever registered.
 	s.slotsMu.Lock()
 	s.lastSlots.timestamp = time.Now().Add(-slotsCacheTTL - time.Second)
 	s.slotsMu.Unlock()
 
 	slots, err = s.getUsedWorkerSlots(context.Background())
-	assert.NoError(t, err)
+	assert.True(t, errors.Is(err, errWorkerSlotsUnknown), "expected errWorkerSlotsUnknown, got %v", err)
+	assert.Equal(t, int64(0), slots)
+}
+
+// TestGetUsedWorkerSlotsScrapeFailureNoCache is the direct FND-716 repro: a
+// pod exists and is Ready (so it's attempted), but its metrics port refuses
+// the connection — the SDK hasn't bound it yet — and there is no prior cached
+// value (a just-scaled-up deployment's first-ever poll). This must come back
+// as errWorkerSlotsUnknown, not a silent (0, nil): a 0 here is
+// indistinguishable from "genuinely idle" and is what let KEDA scale a fresh
+// CURRENT build straight back to zero with no poller ever registered.
+func TestGetUsedWorkerSlotsScrapeFailureNoCache(t *testing.T) {
+	ns := "test-ns"
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	pod := newFakeWorkerPod("worker-0", ns, "127.0.0.1")
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pod).Build()
+
+	s := &temporalScaler{
+		metadata: &temporalMetadata{
+			TaskQueue:         "q",
+			WorkerMetricsPort: 1, // nothing listens here -> connection refused
+		},
+		httpClient:   http.DefaultClient,
+		kubeClient:   kubeClient,
+		logger:       logr.Discard(),
+		podNamespace: ns,
+	}
+
+	slots, err := s.getUsedWorkerSlots(context.Background())
+	assert.True(t, errors.Is(err, errWorkerSlotsUnknown), "expected errWorkerSlotsUnknown, got %v", err)
 	assert.Equal(t, int64(0), slots)
 }
 
@@ -906,9 +940,11 @@ func TestGetUsedWorkerSlotsTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	// Should return 0 (scrape timed out, no cache).
+	// Scrape timed out with no cache to fall back on — this is the same
+	// "we don't actually know" case as an expired cache (FND-716), so it must
+	// come back as errWorkerSlotsUnknown rather than a silent 0.
 	slots, err := s.getUsedWorkerSlots(ctx)
-	assert.NoError(t, err)
+	assert.True(t, errors.Is(err, errWorkerSlotsUnknown), "expected errWorkerSlotsUnknown, got %v", err)
 	assert.Equal(t, int64(0), slots)
 }
 
