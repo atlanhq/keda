@@ -41,6 +41,11 @@ const (
 	// maxMetricsResponseBytes limits the size of a single pod's /metrics response
 	// to prevent OOM from misconfigured or malicious pods.
 	maxMetricsResponseBytes = 10 * 1024 * 1024 // 10 MB
+	// workerDeploymentVersionSeparator joins a worker deployment name and a build
+	// ID into the version string Temporal uses to identify a Worker Deployment
+	// Version. Temporal bans this character in deployment names, so the string is
+	// unambiguous without escaping.
+	workerDeploymentVersionSeparator = ":"
 )
 
 var (
@@ -210,14 +215,7 @@ func (s *temporalScaler) GetMetricsAndActivity(ctx context.Context, metricName s
 }
 
 func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
-	var selection *sdk.TaskQueueVersionSelection
-	if s.metadata.AllActive || s.metadata.Unversioned || s.metadata.BuildID != "" {
-		selection = &sdk.TaskQueueVersionSelection{
-			AllActive:   s.metadata.AllActive,
-			Unversioned: s.metadata.Unversioned,
-			BuildIDs:    []string{s.metadata.BuildID},
-		}
-	}
+	selection := buildVersionSelection(s.metadata.AllActive, s.metadata.Unversioned, s.backlogVersionID())
 
 	queueType := getQueueTypes(s.metadata.QueueTypes)
 
@@ -464,6 +462,53 @@ func (s *temporalScaler) workerBuildID() string {
 		return s.metadata.WorkerDeploymentBuildID
 	}
 	return s.metadata.BuildID
+}
+
+// backlogVersionID returns the identifier that names this scaler's own bucket
+// in DescribeTaskQueueEnhanced.
+//
+// Worker Deployment Versioning needs the fully-qualified
+// "<deployment>:<buildId>" version string, not a bare build ID. Matching
+// resolves a requested build ID against its currently-loaded physical queues
+// first, then falls back to parsing the value as a version string. A bare build
+// ID matches neither once the version's queue has been unloaded, so it lands on
+// a legacy build-id-only physical queue. That queue has a different persistence
+// name than the deployment version's queue, so it is always empty, and because
+// it carries no deployment the server treats it as an unversioned describe --
+// which subtracts the Current version's share of the default-queue backlog
+// instead of merging it in. Temporal passes this same qualified string to
+// itself whenever it needs a version's task-queue stats.
+//
+// Distinct from workerBuildID(), which stays bare because that is the value the
+// temporal.io/build-id pod label carries.
+func (s *temporalScaler) backlogVersionID() string {
+	if s.metadata.WorkerDeploymentName != "" && s.metadata.WorkerDeploymentBuildID != "" {
+		return s.metadata.WorkerDeploymentName + workerDeploymentVersionSeparator + s.metadata.WorkerDeploymentBuildID
+	}
+	return s.metadata.BuildID
+}
+
+// buildVersionSelection composes the Temporal task-queue version selection used
+// to scope the backlog term. Pulled out as a pure function, matching
+// buildRunningCountQuery, so the selection logic is unit-testable without a
+// live Temporal client.
+//
+// Callers must pass backlogVersionID(). Passing metadata.BuildID directly is the
+// ARUN-1259 defect: TWC emits workerDeploymentBuildId and never the legacy
+// buildId, so the selection went out as BuildIDs: [""] -- the unversioned
+// bucket, which on Temporal 1.30 has the Current version's backlog subtracted
+// out of it. The backlog term is the only one of composeMetric's three that
+// needs neither a live pod nor a prior dispatch, so with it reading 0 a build
+// zeroed before it dispatched anything had no way back up.
+func buildVersionSelection(allActive, unversioned bool, versionID string) *sdk.TaskQueueVersionSelection {
+	if !allActive && !unversioned && versionID == "" {
+		return nil
+	}
+	return &sdk.TaskQueueVersionSelection{
+		AllActive:   allActive,
+		Unversioned: unversioned,
+		BuildIDs:    []string{versionID},
+	}
 }
 
 // scrapeWorkerSlots fetches Prometheus metrics from a single worker pod and returns
