@@ -6,6 +6,10 @@ on:
     - 2.19.0-main
     - '*/**'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/2.19.0-main' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
