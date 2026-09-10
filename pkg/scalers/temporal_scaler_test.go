@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	sdk "go.temporal.io/sdk/client"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1026,4 +1027,77 @@ func TestBuildRunningCountQuery(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// TestBuildVersionSelection is the ARUN-1259 repro: the Current/Ramping SO
+// case (allActive=true, unversioned=true) must scope BuildIDs to the real
+// build, not "" — an empty string here is what let a stranded build's
+// backlog query ask a bucket Temporal 1.30 never populates.
+func TestBuildVersionSelection(t *testing.T) {
+	tests := []struct {
+		name        string
+		allActive   bool
+		unversioned bool
+		buildID     string
+		want        *sdk.TaskQueueVersionSelection
+	}{
+		{
+			name: "no flags, no buildID — nil selection (unversioned SO)",
+			want: nil,
+		},
+		{
+			name:        "Current/Ramping SO shape: allActive+unversioned+real buildID",
+			allActive:   true,
+			unversioned: true,
+			buildID:     "main-bae9545",
+			want: &sdk.TaskQueueVersionSelection{
+				AllActive:   true,
+				Unversioned: true,
+				BuildIDs:    []string{"main-bae9545"},
+			},
+		},
+		{
+			name:    "buildID alone — non-Current/Ramping SO, used to fall through to nil before this fix",
+			buildID: "main-bae9545",
+			want: &sdk.TaskQueueVersionSelection{
+				BuildIDs: []string{"main-bae9545"},
+			},
+		},
+		{
+			name:        "flags set but empty buildID — the ARUN-1259 bug shape, still non-nil so the bug is visible",
+			allActive:   true,
+			unversioned: true,
+			buildID:     "",
+			want: &sdk.TaskQueueVersionSelection{
+				AllActive:   true,
+				Unversioned: true,
+				BuildIDs:    []string{""},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildVersionSelection(tc.allActive, tc.unversioned, tc.buildID)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestGetQueueSizeUsesWorkerBuildID locks down the actual ARUN-1259 fix at
+// the call site: getQueueSize must scope the backlog query on
+// workerBuildID() (which prefers workerDeploymentBuildId, the field TWC
+// actually emits), not the legacy BuildID field directly, which TWC never
+// sets and which was always "".
+func TestGetQueueSizeUsesWorkerBuildID(t *testing.T) {
+	s := &temporalScaler{
+		metadata: &temporalMetadata{
+			AllActive:               true,
+			Unversioned:             true,
+			WorkerDeploymentBuildID: "main-bae9545",
+			BuildID:                 "", // TWC never sets this — the bug
+		},
+	}
+	got := buildVersionSelection(s.metadata.AllActive, s.metadata.Unversioned, s.workerBuildID())
+	assert.Equal(t, []string{"main-bae9545"}, got.BuildIDs,
+		"backlog query must scope to the real build, not the always-empty legacy buildId field")
 }

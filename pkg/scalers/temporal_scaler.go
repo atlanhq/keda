@@ -210,14 +210,7 @@ func (s *temporalScaler) GetMetricsAndActivity(ctx context.Context, metricName s
 }
 
 func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
-	var selection *sdk.TaskQueueVersionSelection
-	if s.metadata.AllActive || s.metadata.Unversioned || s.metadata.BuildID != "" {
-		selection = &sdk.TaskQueueVersionSelection{
-			AllActive:   s.metadata.AllActive,
-			Unversioned: s.metadata.Unversioned,
-			BuildIDs:    []string{s.metadata.BuildID},
-		}
-	}
+	selection := buildVersionSelection(s.metadata.AllActive, s.metadata.Unversioned, s.workerBuildID())
 
 	queueType := getQueueTypes(s.metadata.QueueTypes)
 
@@ -464,6 +457,32 @@ func (s *temporalScaler) workerBuildID() string {
 		return s.metadata.WorkerDeploymentBuildID
 	}
 	return s.metadata.BuildID
+}
+
+// buildVersionSelection composes the Temporal task-queue version selection
+// used to scope the backlog term. Pulled out as a pure function, matching
+// buildRunningCountQuery, so the selection logic is independently
+// unit-testable without a live Temporal client.
+//
+// ARUN-1259: TWC emits workerDeploymentBuildId, never the legacy buildId.
+// getQueueSize used to gate and scope on metadata.BuildID directly, so every
+// build-scoped ScaledObject asked Temporal for BuildIDs: [""] -- a bucket
+// Temporal 1.30 never populates -- and the backlog term (the only one of the
+// three composeMetric terms that needs neither a live pod nor a prior
+// dispatch) silently contributed nothing. A build that died before
+// dispatching its first workflow task could then never wake from zero: the
+// other two terms (runningCount, usedSlots) both require exactly the poller
+// this term exists to bring up. Callers must pass workerBuildID(), which
+// already prefers the field TWC actually emits.
+func buildVersionSelection(allActive, unversioned bool, buildID string) *sdk.TaskQueueVersionSelection {
+	if !allActive && !unversioned && buildID == "" {
+		return nil
+	}
+	return &sdk.TaskQueueVersionSelection{
+		AllActive:   allActive,
+		Unversioned: unversioned,
+		BuildIDs:    []string{buildID},
+	}
 }
 
 // scrapeWorkerSlots fetches Prometheus metrics from a single worker pod and returns
