@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	sdk "go.temporal.io/sdk/client"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1026,4 +1027,118 @@ func TestBuildRunningCountQuery(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// TestBacklogVersionID is the ARUN-1259 regression: the backlog query must name
+// the version's own bucket with the fully-qualified "<deployment>:<buildId>"
+// string. A bare build ID resolves to a legacy build-id-only physical queue --
+// a different, always-empty queue that the server additionally treats as an
+// unversioned describe, subtracting the Current version's backlog share instead
+// of merging it.
+func TestBacklogVersionID(t *testing.T) {
+	tests := []struct {
+		name                    string
+		workerDeploymentName    string
+		workerDeploymentBuildID string
+		buildID                 string
+		want                    string
+	}{
+		{
+			name:                    "worker deployment versioning: fully-qualified version string",
+			workerDeploymentName:    "automation-engine",
+			workerDeploymentBuildID: "main-bae9545",
+			want:                    "automation-engine:main-bae9545",
+		},
+		{
+			name:                    "TWC shape: legacy buildId unset, still qualified",
+			workerDeploymentName:    "atlan-publish-app",
+			workerDeploymentBuildID: "main-7cf3c9f",
+			buildID:                 "",
+			want:                    "atlan-publish-app:main-7cf3c9f",
+		},
+		{
+			name:    "legacy worker-versioning-rules: bare buildId passes through",
+			buildID: "main-bae9545",
+			want:    "main-bae9545",
+		},
+		{
+			name:                    "deployment name missing: not a version string, fall back to legacy",
+			workerDeploymentBuildID: "main-bae9545",
+			want:                    "",
+		},
+		{
+			name: "unversioned worker: no scoping",
+			want: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &temporalScaler{metadata: &temporalMetadata{
+				WorkerDeploymentName:    tc.workerDeploymentName,
+				WorkerDeploymentBuildID: tc.workerDeploymentBuildID,
+				BuildID:                 tc.buildID,
+			}}
+			assert.Equal(t, tc.want, s.backlogVersionID())
+		})
+	}
+}
+
+// TestBuildVersionSelection covers the selection wrapper, including the
+// non-Current/Ramping shape that used to fall through to a nil selection
+// because the gate only consulted the always-empty legacy BuildID field.
+func TestBuildVersionSelection(t *testing.T) {
+	tests := []struct {
+		name        string
+		allActive   bool
+		unversioned bool
+		versionID   string
+		want        *sdk.TaskQueueVersionSelection
+	}{
+		{
+			name: "no flags, no version: nil selection",
+			want: nil,
+		},
+		{
+			name:        "Current/Ramping SO",
+			allActive:   true,
+			unversioned: true,
+			versionID:   "automation-engine:main-bae9545",
+			want: &sdk.TaskQueueVersionSelection{
+				AllActive:   true,
+				Unversioned: true,
+				BuildIDs:    []string{"automation-engine:main-bae9545"},
+			},
+		},
+		{
+			name:      "non-Current SO: version alone, previously nil",
+			versionID: "automation-engine:main-bae9545",
+			want: &sdk.TaskQueueVersionSelection{
+				BuildIDs: []string{"automation-engine:main-bae9545"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, buildVersionSelection(tc.allActive, tc.unversioned, tc.versionID))
+		})
+	}
+}
+
+// TestGetQueueSizeNamesTheVersionBucket locks down the call site against the
+// exact fleet configuration: TWC emits workerDeploymentName +
+// workerDeploymentBuildId and never buildId, so the wire request must carry the
+// qualified version string and never "" or a bare build ID.
+func TestGetQueueSizeNamesTheVersionBucket(t *testing.T) {
+	s := &temporalScaler{metadata: &temporalMetadata{
+		AllActive:               true,
+		Unversioned:             true,
+		WorkerDeploymentName:    "automation-engine",
+		WorkerDeploymentBuildID: "main-bae9545",
+		BuildID:                 "",
+	}}
+	got := buildVersionSelection(s.metadata.AllActive, s.metadata.Unversioned, s.backlogVersionID())
+	assert.Equal(t, []string{"automation-engine:main-bae9545"}, got.BuildIDs,
+		"backlog query must name the deployment version's bucket, not the unversioned bucket or a bare build ID")
+	assert.NotEqual(t, s.workerBuildID(), got.BuildIDs[0],
+		"workerBuildID() is the pod-label form and must not be used to scope the Temporal query")
 }
