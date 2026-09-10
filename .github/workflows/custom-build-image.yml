@@ -4,6 +4,11 @@ on:
   push:
     branches:
     - 2.19.0-main
+    - '*/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/2.19.0-main' }}
 
 jobs:
   build:
@@ -24,10 +29,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Derive branch tag
+        id: branch_tag
+        run: echo "value=$(printf '%s' "$GITHUB_REF_NAME" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ghcr.io/atlanhq/keda:2.19.0-main-${{ github.sha }}
+          tags: |
+            ghcr.io/atlanhq/keda:2.19.0-main-${{ github.sha }}
+            ghcr.io/atlanhq/keda:${{ steps.branch_tag.outputs.value }}-${{ github.sha }}
