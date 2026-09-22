@@ -3,6 +3,8 @@ package scalers
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -19,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
+	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
 var (
@@ -1141,4 +1144,56 @@ func TestGetQueueSizeNamesTheVersionBucket(t *testing.T) {
 		"backlog query must name the deployment version's bucket, not the unversioned bucket or a bare build ID")
 	assert.NotEqual(t, s.workerBuildID(), got.BuildIDs[0],
 		"workerBuildID() is the pod-label form and must not be used to scope the Temporal query")
+}
+
+// TestTemporalScalerCloseReleasesIdleHTTPConnections asserts that closing the scaler
+// also releases the connections its worker-metrics client keeps pooled. Keep-alives are
+// on and the transport has no idle timeout, so a connection left in the pool holds its
+// read and write goroutines alive and the transport can never be collected.
+func TestTemporalScalerCloseReleasesIdleHTTPConnections(t *testing.T) {
+	idle := make(chan struct{}, 1)
+	closed := make(chan struct{}, 1)
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateIdle:
+			select {
+			case idle <- struct{}{}:
+			default:
+			}
+		case http.StateClosed:
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	s := &temporalScaler{httpClient: kedautil.CreateHTTPClient(5*time.Second, false)}
+
+	resp, err := s.httpClient.Get(srv.URL)
+	assert.NoError(t, err)
+	_, err = io.Copy(io.Discard, resp.Body)
+	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
+
+	select {
+	case <-idle:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never saw the connection returned to the pool")
+	}
+	assert.Empty(t, closed, "connection should still be pooled before Close")
+
+	assert.NoError(t, s.Close(context.Background()))
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close left the pooled connection open")
+	}
 }
