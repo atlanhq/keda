@@ -183,6 +183,9 @@ func (s *temporalScaler) Close(_ context.Context) error {
 	if s.tcl != nil {
 		s.tcl.Close()
 	}
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
 	return nil
 }
 
