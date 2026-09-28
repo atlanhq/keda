@@ -1198,9 +1198,14 @@ func TestTemporalScalerCloseReleasesIdleHTTPConnections(t *testing.T) {
 	}
 }
 
+// taskQueueVersionInfo is the per-version entry DescribeTaskQueueEnhanced returns in
+// VersionsInfo. The SDK marks the type deprecated in favour of TaskQueueVersioningInfo, which
+// describes versioning rules rather than per-version stats, so it cannot build these fixtures.
+type taskQueueVersionInfo = sdk.TaskQueueVersionInfo //nolint:staticcheck // see above
+
 func TestGetCombinedBacklogCount(t *testing.T) {
-	bucket := func(types map[sdk.TaskQueueType]*sdk.TaskQueueStats) sdk.TaskQueueVersionInfo {
-		info := sdk.TaskQueueVersionInfo{TypesInfo: map[sdk.TaskQueueType]sdk.TaskQueueTypeInfo{}}
+	bucket := func(types map[sdk.TaskQueueType]*sdk.TaskQueueStats) taskQueueVersionInfo {
+		info := taskQueueVersionInfo{TypesInfo: map[sdk.TaskQueueType]sdk.TaskQueueTypeInfo{}}
 		for tqType, stats := range types {
 			info.TypesInfo[tqType] = sdk.TaskQueueTypeInfo{Stats: stats}
 		}
@@ -1209,12 +1214,12 @@ func TestGetCombinedBacklogCount(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		versions map[string]sdk.TaskQueueVersionInfo
+		versions map[string]taskQueueVersionInfo
 		want     int64
 	}{
 		{
 			name: "counted backlog passes through",
-			versions: map[string]sdk.TaskQueueVersionInfo{
+			versions: map[string]taskQueueVersionInfo{
 				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
 					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 3, ApproximateBacklogAge: 10 * time.Second},
 				}),
@@ -1223,7 +1228,7 @@ func TestGetCombinedBacklogCount(t *testing.T) {
 		},
 		{
 			name: "aged backlog with a lost count reads as one task",
-			versions: map[string]sdk.TaskQueueVersionInfo{
+			versions: map[string]taskQueueVersionInfo{
 				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
 					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 36 * time.Second},
 				}),
@@ -1232,7 +1237,7 @@ func TestGetCombinedBacklogCount(t *testing.T) {
 		},
 		{
 			name: "empty bucket stays zero",
-			versions: map[string]sdk.TaskQueueVersionInfo{
+			versions: map[string]taskQueueVersionInfo{
 				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
 					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 0},
 					sdk.TaskQueueTypeActivity: {},
@@ -1242,7 +1247,7 @@ func TestGetCombinedBacklogCount(t *testing.T) {
 		},
 		{
 			name: "floor applies per bucket, alongside counted buckets",
-			versions: map[string]sdk.TaskQueueVersionInfo{
+			versions: map[string]taskQueueVersionInfo{
 				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
 					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 9 * time.Hour},
 					sdk.TaskQueueTypeActivity: {ApproximateBacklogCount: 2, ApproximateBacklogAge: time.Minute},
@@ -1255,7 +1260,7 @@ func TestGetCombinedBacklogCount(t *testing.T) {
 		},
 		{
 			name: "missing stats are skipped",
-			versions: map[string]sdk.TaskQueueVersionInfo{
+			versions: map[string]taskQueueVersionInfo{
 				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
 					sdk.TaskQueueTypeWorkflow: nil,
 				}),
@@ -1286,7 +1291,7 @@ func (c *describeOnlyClient) DescribeTaskQueueEnhanced(context.Context, sdk.Desc
 func TestGetMetricsAndActivityLostBacklogCount(t *testing.T) {
 	version := "anomalo-app/anomalo-worker-twd:0.4.1"
 	describe := func(stats *sdk.TaskQueueStats) sdk.TaskQueueDescription {
-		return sdk.TaskQueueDescription{VersionsInfo: map[string]sdk.TaskQueueVersionInfo{
+		return sdk.TaskQueueDescription{VersionsInfo: map[string]taskQueueVersionInfo{
 			version: {TypesInfo: map[sdk.TaskQueueType]sdk.TaskQueueTypeInfo{
 				sdk.TaskQueueTypeWorkflow: {Stats: stats},
 			}},
