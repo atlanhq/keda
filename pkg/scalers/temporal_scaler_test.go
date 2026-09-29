@@ -1197,3 +1197,149 @@ func TestTemporalScalerCloseReleasesIdleHTTPConnections(t *testing.T) {
 		t.Fatal("Close left the pooled connection open")
 	}
 }
+
+// taskQueueVersionInfo is the per-version entry DescribeTaskQueueEnhanced returns in
+// VersionsInfo. The SDK marks the type deprecated in favour of TaskQueueVersioningInfo, which
+// describes versioning rules rather than per-version stats, so it cannot build these fixtures.
+type taskQueueVersionInfo = sdk.TaskQueueVersionInfo //nolint:staticcheck // see above
+
+func TestGetCombinedBacklogCount(t *testing.T) {
+	bucket := func(types map[sdk.TaskQueueType]*sdk.TaskQueueStats) taskQueueVersionInfo {
+		info := taskQueueVersionInfo{TypesInfo: map[sdk.TaskQueueType]sdk.TaskQueueTypeInfo{}}
+		for tqType, stats := range types {
+			info.TypesInfo[tqType] = sdk.TaskQueueTypeInfo{Stats: stats}
+		}
+		return info
+	}
+
+	tests := []struct {
+		name     string
+		versions map[string]taskQueueVersionInfo
+		want     int64
+	}{
+		{
+			name: "counted backlog passes through",
+			versions: map[string]taskQueueVersionInfo{
+				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 3, ApproximateBacklogAge: 10 * time.Second},
+				}),
+			},
+			want: 3,
+		},
+		{
+			name: "aged backlog with a lost count reads as one task",
+			versions: map[string]taskQueueVersionInfo{
+				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 36 * time.Second},
+				}),
+			},
+			want: 1,
+		},
+		{
+			name: "empty bucket stays zero",
+			versions: map[string]taskQueueVersionInfo{
+				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 0},
+					sdk.TaskQueueTypeActivity: {},
+				}),
+			},
+			want: 0,
+		},
+		{
+			name: "floor applies per bucket, alongside counted buckets",
+			versions: map[string]taskQueueVersionInfo{
+				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 9 * time.Hour},
+					sdk.TaskQueueTypeActivity: {ApproximateBacklogCount: 2, ApproximateBacklogAge: time.Minute},
+				}),
+				"": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 5 * time.Minute},
+				}),
+			},
+			want: 4,
+		},
+		{
+			name: "missing stats are skipped",
+			versions: map[string]taskQueueVersionInfo{
+				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: nil,
+				}),
+			},
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getCombinedBacklogCount(sdk.TaskQueueDescription{VersionsInfo: tt.versions})
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// describeOnlyClient serves DescribeTaskQueueEnhanced from a fixed response. Any
+// other sdk.Client method panics through the nil embedded interface.
+type describeOnlyClient struct {
+	sdk.Client
+	resp sdk.TaskQueueDescription
+}
+
+func (c *describeOnlyClient) DescribeTaskQueueEnhanced(context.Context, sdk.DescribeTaskQueueEnhancedOptions) (sdk.TaskQueueDescription, error) {
+	return c.resp, nil
+}
+
+func TestGetMetricsAndActivityLostBacklogCount(t *testing.T) {
+	version := "anomalo-app/anomalo-worker-twd:0.4.1"
+	describe := func(stats *sdk.TaskQueueStats) sdk.TaskQueueDescription {
+		return sdk.TaskQueueDescription{VersionsInfo: map[string]taskQueueVersionInfo{
+			version: {TypesInfo: map[sdk.TaskQueueType]sdk.TaskQueueTypeInfo{
+				sdk.TaskQueueTypeWorkflow: {Stats: stats},
+			}},
+		}}
+	}
+
+	tests := []struct {
+		name       string
+		stats      *sdk.TaskQueueStats
+		wantActive bool
+		wantValue  int64
+	}{
+		{
+			name:       "task waiting with a lost count wakes a scaled-to-zero pool",
+			stats:      &sdk.TaskQueueStats{ApproximateBacklogCount: 0, ApproximateBacklogAge: 36 * time.Second},
+			wantActive: true,
+			wantValue:  1,
+		},
+		{
+			name:       "empty queue stays inactive",
+			stats:      &sdk.TaskQueueStats{ApproximateBacklogCount: 0, ApproximateBacklogAge: 0},
+			wantActive: false,
+			wantValue:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &temporalScaler{
+				metadata: &temporalMetadata{
+					TaskQueue:                 "atlan-anomalo-production",
+					QueueTypes:                []string{"workflow"},
+					WorkerDeploymentName:      "anomalo-app/anomalo-worker-twd",
+					WorkerDeploymentBuildID:   "0.4.1",
+					AllActive:                 true,
+					Unversioned:               true,
+					TargetQueueSize:           100,
+					ActivationTargetQueueSize: 0,
+				},
+				tcl:    &describeOnlyClient{resp: describe(tt.stats)},
+				logger: logr.Discard(),
+			}
+
+			metrics, active, err := s.GetMetricsAndActivity(context.Background(), "s0-temporal-atlan-anomalo-production")
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantActive, active)
+			assert.Len(t, metrics, 1)
+			assert.Equal(t, tt.wantValue, metrics[0].Value.Value())
+		})
+	}
+}

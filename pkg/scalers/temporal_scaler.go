@@ -675,11 +675,38 @@ func getCombinedBacklogCount(description sdk.TaskQueueDescription) int64 {
 	for _, versionInfo := range description.VersionsInfo {
 		for _, typeInfo := range versionInfo.TypesInfo {
 			if typeInfo.Stats != nil {
-				count += typeInfo.Stats.ApproximateBacklogCount
+				count += bucketBacklogCount(typeInfo.Stats)
 			}
 		}
 	}
 	return count
+}
+
+// bucketBacklogCount returns one bucket's backlog, counting a backlog that has an
+// age but no count as a single task.
+//
+// Matching reports the two numbers from different sources. The age is measured
+// from the tasks it has loaded, so an age above zero means a task is waiting. The
+// count is a counter that SQL persistence saves only on the periodic ack-level
+// update, not when a task is written. When a partition changes owner before that
+// save, the new owner loads the old count and still loads the task, and nothing
+// recounts it until the task is dispatched. Trusting the count alone then reads
+// an empty queue forever, and with minReplicaCount 0 no poller ever comes to
+// dispatch the task.
+//
+// The floor cannot activate on a queue with nothing waiting, because a bucket
+// with no loaded task reports an age of zero, and when matching subtracts the
+// Current version's share out of the unversioned bucket it clears the age of a
+// result that reaches zero.
+//
+// It does not cover a version ramp. Matching splits the default queue's stats by
+// ramp percentage from the count, so a lost count gives both shares a count and
+// an age of zero, and the waiting task is invisible in every bucket.
+func bucketBacklogCount(stats *sdk.TaskQueueStats) int64 {
+	if stats.ApproximateBacklogCount == 0 && stats.ApproximateBacklogAge > 0 {
+		return 1
+	}
+	return stats.ApproximateBacklogCount
 }
 
 func getTemporalClient(ctx context.Context, meta *temporalMetadata, log logr.Logger) (sdk.Client, error) {
