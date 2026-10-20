@@ -910,10 +910,11 @@ func TestGetUsedWorkerSlotsTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	// Should return 0 (scrape timed out, no cache).
-	slots, _, err := s.getUsedWorkerSlots(ctx)
+	// Should return 0 (scrape timed out, no cache), and say it missed a pod.
+	slots, complete, err := s.getUsedWorkerSlots(ctx)
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), slots)
+	assert.False(t, complete)
 }
 
 func TestComposeMetric(t *testing.T) {
@@ -1051,6 +1052,38 @@ temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="
 		assert.False(t, complete)
 	})
 
+	t.Run("a running pod that is not Ready", func(t *testing.T) {
+		notReady := newFakeWorkerPod("b", ns, ip)
+		notReady.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+		s := newScaler(newFakeWorkerPod("a", ns, ip), notReady)
+		used, complete, err := s.getUsedWorkerSlots(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, int64(1), used)
+		assert.False(t, complete)
+	})
+
+	t.Run("a shutting-down pod refuses the scrape", func(t *testing.T) {
+		stopping := newFakeWorkerPod("b", ns, downIP)
+		stopping.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		stopping.Finalizers = []string{"test"}
+		s := newScaler(newFakeWorkerPod("a", ns, ip), stopping)
+		used, complete, err := s.getUsedWorkerSlots(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, int64(1), used)
+		assert.True(t, complete, "a pod being removed must not lift the running-workflow cap")
+	})
+
+	t.Run("a shutting-down pod that is no longer Ready", func(t *testing.T) {
+		stopping := newFakeWorkerPod("b", ns, ip)
+		stopping.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		stopping.Finalizers = []string{"test"}
+		stopping.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+		s := newScaler(newFakeWorkerPod("a", ns, ip), stopping)
+		_, complete, err := s.getUsedWorkerSlots(context.Background())
+		assert.NoError(t, err)
+		assert.True(t, complete)
+	})
+
 	t.Run("all pods fail and the cache answers", func(t *testing.T) {
 		s := newScaler(newFakeWorkerPod("b", ns, downIP))
 		s.lastSlots = slotsCache{value: 4, timestamp: time.Now()}
@@ -1067,6 +1100,71 @@ temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="
 		assert.Equal(t, int64(0), used)
 		assert.False(t, complete)
 	})
+}
+
+// TestRunningWorkflowCap covers the wiring between the slot scrape and the
+// cap: no cap unless the field is set and the scrape counted every worker
+// that may be busy.
+func TestRunningWorkflowCap(t *testing.T) {
+	tests := []struct {
+		name       string
+		warm       int
+		target     int64
+		complete   bool
+		wantCapped int64
+	}{
+		{name: "field unset", warm: 0, target: 1, complete: true, wantCapped: 0},
+		{name: "one warm worker", warm: 1, target: 1, complete: true, wantCapped: 1},
+		{name: "cap is in metric units", warm: 2, target: 5, complete: true, wantCapped: 10},
+		{name: "incomplete scrape counts every workflow", warm: 1, target: 1, complete: false, wantCapped: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			meta := &temporalMetadata{RunningWorkflowWarmWorkers: tc.warm, TargetQueueSize: tc.target}
+			assert.Equal(t, tc.wantCapped, runningWorkflowCap(meta, tc.complete))
+		})
+	}
+}
+
+// TestScrapeWorkerSlotsLocalActivities: with the running-workflow cap a worker
+// busy with local activities must still count as busy; without the cap the
+// scrape is unchanged and counts activity slots only.
+func TestScrapeWorkerSlotsLocalActivities(t *testing.T) {
+	metricsBody := `# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{task_queue="q",worker_type="ActivityWorker"} 1
+temporal_worker_task_slots_used{task_queue="q",worker_type="LocalActivityWorker"} 2
+temporal_worker_task_slots_used{task_queue="q",worker_type="WorkflowWorker"} 1
+# TYPE temporal_worker_task_slots_available gauge
+temporal_worker_task_slots_available{task_queue="q",worker_type="ActivityWorker"} 5
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, metricsBody)
+	}))
+	defer srv.Close()
+	ip, port := testServerPort(t, srv)
+
+	for _, tc := range []struct {
+		name string
+		warm int
+		want int64
+	}{
+		{name: "uncapped counts activity slots only", warm: 0, want: 0},
+		{name: "capped adds local-activity slots", warm: 1, want: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &temporalScaler{
+				metadata: &temporalMetadata{
+					TaskQueue: "q", WorkerMetricsPort: port,
+					ActivitySlotsPerWorker: 5, RunningWorkflowWarmWorkers: tc.warm,
+				},
+				httpClient: srv.Client(),
+				logger:     logr.Discard(),
+			}
+			got, err := s.scrapeWorkerSlots(context.Background(), ip)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, got, "activity used 1 with 5 of 5 available is a phantom slot")
+		})
+	}
 }
 
 func TestParseTemporalMetadataRunningWorkflowWarmWorkers(t *testing.T) {

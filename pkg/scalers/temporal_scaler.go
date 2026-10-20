@@ -254,17 +254,24 @@ func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
 		s.logger.Info("failed to get worker slots metric, excluding from metric", "error", slotsErr)
 	}
 
-	var runningCap int64
-	if s.metadata.RunningWorkflowWarmWorkers > 0 {
-		if slotsErr == nil && slotsComplete {
-			runningCap = int64(s.metadata.RunningWorkflowWarmWorkers) * s.metadata.TargetQueueSize
-		} else {
-			s.logger.V(1).Info("worker slots incomplete, counting every running workflow",
-				"runningCount", runningCount)
-		}
+	runningCap := runningWorkflowCap(s.metadata, slotsErr == nil && slotsComplete)
+	if s.metadata.RunningWorkflowWarmWorkers > 0 && runningCap == 0 {
+		s.logger.V(1).Info("worker slots incomplete, counting every running workflow",
+			"runningCount", runningCount)
 	}
 
 	return composeMetric(backlog, runningCount, usedSlots, slotsErr == nil, s.metadata.GateSlotsOnRunningWorkflow, runningCap), nil
+}
+
+// runningWorkflowCap is the most metric running workflows may contribute, or 0
+// for no cap. The cap applies only when the slot scrape counted every worker
+// that may be busy; otherwise every running workflow is counted, which is what
+// keeps a busy worker the scrape missed from being scaled away.
+func runningWorkflowCap(meta *temporalMetadata, slotsComplete bool) int64 {
+	if meta.RunningWorkflowWarmWorkers <= 0 || !slotsComplete {
+		return 0
+	}
+	return int64(meta.RunningWorkflowWarmWorkers) * meta.TargetQueueSize
 }
 
 // composeMetric returns the composite scaling metric: backlog + runningWorkflow
@@ -404,9 +411,10 @@ func (s *temporalScaler) getRunningWorkflowCount(ctx context.Context) (int64, er
 // value if within the cache TTL. A total timeout budget bounds the scrape loop
 // so that slow/unreachable pods don't block the KEDA polling cycle.
 //
-// complete reports whether every ready pod was scraped in this call. It is false
-// whenever a pod was skipped, the loop ran out of budget, or the value came from
-// the cache, because then the sum may leave out a busy worker.
+// complete reports whether every running pod that is not shutting down was
+// scraped in this call. It is false when such a pod was not Ready or its scrape
+// failed, when the loop ran out of budget, and when the value came from the
+// cache, because then the sum may leave out a busy worker.
 func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (used int64, complete bool, err error) {
 	if s.kubeClient == nil || s.httpClient == nil {
 		return 0, false, fmt.Errorf("kubernetes client or http client not configured")
@@ -431,10 +439,21 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (used int64, co
 
 	var totalUsedSlots int64
 	var scrapedCount, attemptedCount int
-	timedOut := false
+	// missed records a pod that may be running work but was not counted. A
+	// terminating pod never sets it: its activities are being failed over
+	// anyway, and its scrape is refused as it shuts down, which would otherwise
+	// lift the running-workflow cap in the middle of every scale-down.
+	missed := false
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || !isPodReady(pod) {
+		terminating := pod.DeletionTimestamp != nil
+		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
+			continue
+		}
+		if !isPodReady(pod) {
+			if !terminating {
+				missed = true
+			}
 			continue
 		}
 
@@ -443,7 +462,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (used int64, co
 			s.logger.Info("scrape loop timeout reached, using partial results",
 				"scraped", scrapedCount, "remaining", len(podList.Items)-i)
 			temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "scrape_loop_timeout").Inc()
-			timedOut = true
+			missed = true
 			break
 		}
 
@@ -453,6 +472,9 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (used int64, co
 			s.logger.Info("failed to scrape worker pod metrics, skipping",
 				"pod", pod.Name, "ip", pod.Status.PodIP, "error", err)
 			temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "pod_scrape_error").Inc()
+			if !terminating {
+				missed = true
+			}
 			continue
 		}
 		totalUsedSlots += slots
@@ -465,7 +487,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (used int64, co
 
 	// No ready pods to scrape (e.g. all pods still starting up) — return 0.
 	if attemptedCount == 0 {
-		return 0, !timedOut, nil
+		return 0, !missed, nil
 	}
 
 	// All attempted scrapes failed — fall back to cached value within TTL.
@@ -489,7 +511,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (used int64, co
 	s.lastSlots = slotsCache{value: totalUsedSlots, timestamp: time.Now()}
 	s.slotsMu.Unlock()
 
-	return totalUsedSlots, !timedOut && scrapedCount == attemptedCount, nil
+	return totalUsedSlots, !missed, nil
 }
 
 // workerBuildID returns the build ID used to scope the pod listing for slot
@@ -573,12 +595,24 @@ func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, podIP string) (i
 	}
 
 	limitedBody := io.LimitReader(resp.Body, maxMetricsResponseBytes)
-	activityOnly := map[string]bool{"ActivityWorker": true}
-	used, available, availablePresent, err := parseSlots(limitedBody, s.metadata.TaskQueue, activityOnly)
+	var parser expfmt.TextParser
+	families, err := parser.TextToMetricFamilies(limitedBody)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("parse prometheus metrics: %w", err)
 	}
-	return s.effectiveUsedSlots(used, available, availablePresent), nil
+	activityOnly := map[string]bool{"ActivityWorker": true}
+	used, _ := sumSlotFamily(families["temporal_worker_task_slots_used"], s.metadata.TaskQueue, activityOnly)
+	available, availablePresent := sumSlotFamily(families["temporal_worker_task_slots_available"], s.metadata.TaskQueue, activityOnly)
+	slots := s.effectiveUsedSlots(used, available, availablePresent)
+	if s.metadata.RunningWorkflowWarmWorkers > 0 {
+		// With the running-workflow cap, used slots are what keeps a busy worker
+		// counted, so a worker busy with local activities must show up too. Local
+		// activities run in-process and are never polled, so their used gauge
+		// carries no phantom slot and is taken as is.
+		localUsed, _ := sumSlotFamily(families["temporal_worker_task_slots_used"], s.metadata.TaskQueue, map[string]bool{"LocalActivityWorker": true})
+		slots += localUsed
+	}
+	return slots, nil
 }
 
 // parseSlots parses Prometheus text format and returns the summed
