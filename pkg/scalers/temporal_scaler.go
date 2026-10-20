@@ -110,6 +110,7 @@ type temporalMetadata struct {
 	WorkerMetricsPort           int      `keda:"name=workerMetricsPort,           order=triggerMetadata, default=9464"`
 	GateSlotsOnRunningWorkflow  bool     `keda:"name=gateSlotsOnRunningWorkflow,  order=triggerMetadata, default=true"`
 	ActivitySlotsPerWorker      int      `keda:"name=activitySlotsPerWorker,      order=triggerMetadata, default=0"`
+	RunningWorkflowWarmWorkers  int      `keda:"name=runningWorkflowWarmWorkers,  order=triggerMetadata, default=0"`
 	APIKey                      string   `keda:"name=apiKey,                    order=authParams;resolvedEnv, optional"`
 	MinConnectTimeout           int      `keda:"name=minConnectTimeout,         order=triggerMetadata, default=5"`
 
@@ -145,6 +146,10 @@ func (a *temporalMetadata) Validate() error {
 
 	if a.ActivitySlotsPerWorker < 0 {
 		return fmt.Errorf("activitySlotsPerWorker must be a positive number")
+	}
+
+	if a.RunningWorkflowWarmWorkers < 0 {
+		return fmt.Errorf("runningWorkflowWarmWorkers must be a positive number")
 	}
 
 	return nil
@@ -244,12 +249,22 @@ func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
 		}
 	}
 
-	usedSlots, slotsErr := s.getUsedWorkerSlots(ctx)
+	usedSlots, slotsComplete, slotsErr := s.getUsedWorkerSlots(ctx)
 	if slotsErr != nil {
 		s.logger.Info("failed to get worker slots metric, excluding from metric", "error", slotsErr)
 	}
 
-	return composeMetric(backlog, runningCount, usedSlots, slotsErr == nil, s.metadata.GateSlotsOnRunningWorkflow), nil
+	var runningCap int64
+	if s.metadata.RunningWorkflowWarmWorkers > 0 {
+		if slotsErr == nil && slotsComplete {
+			runningCap = int64(s.metadata.RunningWorkflowWarmWorkers) * s.metadata.TargetQueueSize
+		} else {
+			s.logger.V(1).Info("worker slots incomplete, counting every running workflow",
+				"runningCount", runningCount)
+		}
+	}
+
+	return composeMetric(backlog, runningCount, usedSlots, slotsErr == nil, s.metadata.GateSlotsOnRunningWorkflow, runningCap), nil
 }
 
 // composeMetric returns the composite scaling metric: backlog + runningWorkflow
@@ -282,12 +297,28 @@ func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
 // available, see effectiveUsedSlots), so a gate=false dedicated pool reports 0
 // when idle and actually scales to zero, while still going non-zero the instant
 // a real activity consumes a slot.
-func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable, gateSlotsOnRunningWorkflow bool) int64 {
-	metric := backlog + runningCount
+//
+// runningCap > 0 (runningWorkflowWarmWorkers) changes what a running workflow
+// is worth. Uncapped, every running workflow adds a full unit, so a worker
+// whose workflows mostly wait (on timers, or on activities served by another
+// pool) holds one idle pod per workflow, and a workflow whose activity runs
+// here counts twice: once as running, once as a used slot. Capped, running
+// workflows together keep at most runningCap of metric (that many warm
+// workers, keeping the sticky cache and avoiding a cold start for the next
+// workflow task), and that floor overlaps with used slots instead of adding to
+// them. Backlog and used slots still scale beyond it, so a busy worker is
+// always counted. The caller passes 0 whenever the slot scrape missed a pod,
+// because then used slots may undercount busy workers and only the full
+// running count protects them.
+func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable, gateSlotsOnRunningWorkflow bool, runningCap int64) int64 {
+	var slots int64
 	if slotsAvailable && (!gateSlotsOnRunningWorkflow || runningCount > 0) {
-		metric += usedSlots
+		slots = usedSlots
 	}
-	return metric
+	if runningCap <= 0 {
+		return backlog + runningCount + slots
+	}
+	return backlog + max(min(runningCount, runningCap), slots)
 }
 
 // buildRunningCountQuery composes the visibility query used to count
@@ -372,9 +403,13 @@ func (s *temporalScaler) getRunningWorkflowCount(ctx context.Context) (int64, er
 // On transient failures (all pod scrapes fail), it returns the last known good
 // value if within the cache TTL. A total timeout budget bounds the scrape loop
 // so that slow/unreachable pods don't block the KEDA polling cycle.
-func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) {
+//
+// complete reports whether every ready pod was scraped in this call. It is false
+// whenever a pod was skipped, the loop ran out of budget, or the value came from
+// the cache, because then the sum may leave out a busy worker.
+func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (used int64, complete bool, err error) {
 	if s.kubeClient == nil || s.httpClient == nil {
-		return 0, fmt.Errorf("kubernetes client or http client not configured")
+		return 0, false, fmt.Errorf("kubernetes client or http client not configured")
 	}
 
 	podList := &corev1.PodList{}
@@ -383,11 +418,11 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 		labelSelector["temporal.io/build-id"] = buildID
 	}
 	if err := s.kubeClient.List(ctx, podList, client.InNamespace(s.podNamespace), labelSelector); err != nil {
-		return 0, fmt.Errorf("failed to list worker pods in namespace %s: %w", s.podNamespace, err)
+		return 0, false, fmt.Errorf("failed to list worker pods in namespace %s: %w", s.podNamespace, err)
 	}
 
 	if len(podList.Items) == 0 {
-		return 0, nil
+		return 0, true, nil
 	}
 
 	// Apply a timeout budget for the entire scrape loop.
@@ -396,6 +431,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 
 	var totalUsedSlots int64
 	var scrapedCount, attemptedCount int
+	timedOut := false
 	for i := range podList.Items {
 		pod := &podList.Items[i]
 		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || !isPodReady(pod) {
@@ -407,6 +443,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 			s.logger.Info("scrape loop timeout reached, using partial results",
 				"scraped", scrapedCount, "remaining", len(podList.Items)-i)
 			temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "scrape_loop_timeout").Inc()
+			timedOut = true
 			break
 		}
 
@@ -428,7 +465,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 
 	// No ready pods to scrape (e.g. all pods still starting up) — return 0.
 	if attemptedCount == 0 {
-		return 0, nil
+		return 0, !timedOut, nil
 	}
 
 	// All attempted scrapes failed — fall back to cached value within TTL.
@@ -440,11 +477,11 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 			s.logger.Info("all scrapes failed, using cached slots value",
 				"cachedValue", cached.value, "cacheAge", time.Since(cached.timestamp).String())
 			temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "all_pods_failed_cache_hit").Inc()
-			return cached.value, nil
+			return cached.value, false, nil
 		}
 		s.logger.Info("all scrapes failed and cache expired, returning 0")
 		temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "all_pods_failed_cache_expired").Inc()
-		return 0, nil
+		return 0, false, nil
 	}
 
 	// Update cache with the fresh value.
@@ -452,7 +489,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 	s.lastSlots = slotsCache{value: totalUsedSlots, timestamp: time.Now()}
 	s.slotsMu.Unlock()
 
-	return totalUsedSlots, nil
+	return totalUsedSlots, !timedOut && scrapedCount == attemptedCount, nil
 }
 
 // workerBuildID returns the build ID used to scope the pod listing for slot

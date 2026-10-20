@@ -3539,6 +3539,10 @@ scalers:
           type: string
           default: "0"
           metadataVariableReadable: true
+        - name: runningWorkflowWarmWorkers
+          type: string
+          default: "0"
+          metadataVariableReadable: true
         - name: apiKey
           type: string
           optional: true

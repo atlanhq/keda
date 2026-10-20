@@ -782,7 +782,7 @@ temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="
 	}
 
 	// First call: server is up, should scrape successfully and cache.
-	slots, err := s.getUsedWorkerSlots(context.Background())
+	slots, _, err := s.getUsedWorkerSlots(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, int64(3), slots)
 	assert.Equal(t, int64(3), s.lastSlots.value)
@@ -791,7 +791,7 @@ temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="
 	srv.Close()
 
 	// Second call: scrape fails, should fall back to cached value.
-	slots, err = s.getUsedWorkerSlots(context.Background())
+	slots, _, err = s.getUsedWorkerSlots(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, int64(3), slots)
 
@@ -800,7 +800,7 @@ temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="
 	s.lastSlots.timestamp = time.Now().Add(-slotsCacheTTL - time.Second)
 	s.slotsMu.Unlock()
 
-	slots, err = s.getUsedWorkerSlots(context.Background())
+	slots, _, err = s.getUsedWorkerSlots(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), slots)
 }
@@ -876,7 +876,7 @@ temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="
 				logger:       logr.Discard(),
 				podNamespace: ns,
 			}
-			slots, err := s.getUsedWorkerSlots(context.Background())
+			slots, _, err := s.getUsedWorkerSlots(context.Background())
 			assert.NoError(t, err)
 			assert.Equal(t, tc.want, slots)
 		})
@@ -911,7 +911,7 @@ func TestGetUsedWorkerSlotsTimeout(t *testing.T) {
 	defer cancel()
 
 	// Should return 0 (scrape timed out, no cache).
-	slots, err := s.getUsedWorkerSlots(ctx)
+	slots, _, err := s.getUsedWorkerSlots(ctx)
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), slots)
 }
@@ -951,10 +951,144 @@ func TestComposeMetric(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := composeMetric(tc.backlog, tc.runningCount, tc.usedSlots, tc.slotsAvailable, tc.gateOnWorkflow)
+			got := composeMetric(tc.backlog, tc.runningCount, tc.usedSlots, tc.slotsAvailable, tc.gateOnWorkflow, 0)
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// TestComposeMetricRunningCap covers runningWorkflowWarmWorkers: running
+// workflows keep at most runningCap of metric warm, and that floor overlaps
+// with used slots instead of adding to them, while backlog and used slots
+// still scale beyond it. Cases use targetQueueSize 1 and one warm worker
+// (runningCap 1) unless stated.
+func TestComposeMetricRunningCap(t *testing.T) {
+	tests := []struct {
+		name           string
+		backlog        int64
+		runningCount   int64
+		usedSlots      int64
+		slotsAvailable bool
+		gateOnWorkflow bool
+		runningCap     int64
+		want           int64
+	}{
+		{name: "no workflow running scales to zero", runningCount: 0, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: true, runningCap: 1, want: 0},
+		{name: "ghost flicker without a workflow is still ignored", runningCount: 0, usedSlots: 1, slotsAvailable: true, gateOnWorkflow: true, runningCap: 1, want: 0},
+		{name: "several waiting workflows keep one warm worker", runningCount: 5, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: true, runningCap: 1, want: 1},
+		{name: "workflow running its activity here counts once", runningCount: 1, usedSlots: 1, slotsAvailable: true, gateOnWorkflow: true, runningCap: 1, want: 1},
+		{name: "busy workers above the floor are all counted", runningCount: 5, usedSlots: 3, slotsAvailable: true, gateOnWorkflow: true, runningCap: 1, want: 3},
+		{name: "backlog adds on top of the floor", backlog: 2, runningCount: 5, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: true, runningCap: 1, want: 3},
+		{name: "backlog adds on top of busy workers", backlog: 2, runningCount: 5, usedSlots: 3, slotsAvailable: true, gateOnWorkflow: true, runningCap: 1, want: 5},
+		{name: "fewer workflows than the cap count as they are", runningCount: 1, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: true, runningCap: 2, want: 1},
+		{name: "two warm workers", runningCount: 5, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: true, runningCap: 2, want: 2},
+		{name: "cap is in metric units (targetQueueSize 5, one warm worker)", runningCount: 12, usedSlots: 4, slotsAvailable: true, gateOnWorkflow: true, runningCap: 5, want: 5},
+		{name: "slots unavailable keeps the floor", runningCount: 5, usedSlots: 99, slotsAvailable: false, gateOnWorkflow: true, runningCap: 1, want: 1},
+		{name: "ungated slots still count without a workflow", runningCount: 0, usedSlots: 2, slotsAvailable: true, gateOnWorkflow: false, runningCap: 1, want: 2},
+		{name: "zero cap keeps the uncapped sum", runningCount: 5, usedSlots: 3, slotsAvailable: true, gateOnWorkflow: true, runningCap: 0, want: 8},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := composeMetric(tc.backlog, tc.runningCount, tc.usedSlots, tc.slotsAvailable, tc.gateOnWorkflow, tc.runningCap)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestGetUsedWorkerSlotsComplete locks down the completeness flag the running
+// cap depends on: it must be false whenever a ready pod was not scraped, so a
+// busy worker the scrape missed is still protected by the full running count.
+func TestGetUsedWorkerSlotsComplete(t *testing.T) {
+	metricsBody := `# HELP temporal_worker_task_slots_used Current number of used slots per task type
+# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="ActivityWorker"} 1
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, metricsBody)
+	}))
+	defer srv.Close()
+	ip, port := testServerPort(t, srv)
+
+	// httptest listens on IPv4 loopback only, so the same port on the IPv6
+	// loopback refuses the connection: a pod whose scrape fails.
+	downIP := "::1"
+
+	ns := "test-ns"
+	newScaler := func(pods ...runtime.Object) *temporalScaler {
+		scheme := runtime.NewScheme()
+		_ = corev1.AddToScheme(scheme)
+		kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pods...).Build()
+		return &temporalScaler{
+			metadata:     &temporalMetadata{TaskQueue: "q", WorkerMetricsPort: port},
+			httpClient:   srv.Client(),
+			kubeClient:   kubeClient,
+			logger:       logr.Discard(),
+			podNamespace: ns,
+		}
+	}
+
+	t.Run("every pod scraped", func(t *testing.T) {
+		s := newScaler(newFakeWorkerPod("a", ns, ip), newFakeWorkerPod("b", ns, ip))
+		used, complete, err := s.getUsedWorkerSlots(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, int64(2), used)
+		assert.True(t, complete)
+	})
+
+	t.Run("no worker pods", func(t *testing.T) {
+		s := newScaler()
+		used, complete, err := s.getUsedWorkerSlots(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, int64(0), used)
+		assert.True(t, complete)
+	})
+
+	t.Run("one pod fails", func(t *testing.T) {
+		s := newScaler(newFakeWorkerPod("a", ns, ip), newFakeWorkerPod("b", ns, downIP))
+		used, complete, err := s.getUsedWorkerSlots(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, int64(1), used)
+		assert.False(t, complete)
+	})
+
+	t.Run("all pods fail and the cache answers", func(t *testing.T) {
+		s := newScaler(newFakeWorkerPod("b", ns, downIP))
+		s.lastSlots = slotsCache{value: 4, timestamp: time.Now()}
+		used, complete, err := s.getUsedWorkerSlots(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, int64(4), used)
+		assert.False(t, complete)
+	})
+
+	t.Run("all pods fail and the cache expired", func(t *testing.T) {
+		s := newScaler(newFakeWorkerPod("b", ns, downIP))
+		used, complete, err := s.getUsedWorkerSlots(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, int64(0), used)
+		assert.False(t, complete)
+	})
+}
+
+func TestParseTemporalMetadataRunningWorkflowWarmWorkers(t *testing.T) {
+	base := map[string]string{"endpoint": "test:7233", "taskQueue": "q"}
+	with := func(v string) map[string]string {
+		m := map[string]string{"runningWorkflowWarmWorkers": v}
+		for k, val := range base {
+			m[k] = val
+		}
+		return m
+	}
+
+	meta, err := parseTemporalMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: base}, logger)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, meta.RunningWorkflowWarmWorkers, "unset must keep every running workflow counted")
+
+	meta, err = parseTemporalMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: with("1")}, logger)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, meta.RunningWorkflowWarmWorkers)
+
+	_, err = parseTemporalMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: with("-1")}, logger)
+	assert.Error(t, err)
 }
 
 // TestBuildRunningCountQuery covers the three modes of visibility-query
