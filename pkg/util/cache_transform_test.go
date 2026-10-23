@@ -139,6 +139,42 @@ func TestCacheObjectTransform_StripsPodFields(t *testing.T) {
 	assert.Nil(t, p.Status.ContainerStatuses)
 }
 
+// The Temporal scaler's worker-slot scrape lists worker pods from this cache
+// and dials each one at status.podIP. If the IP is stripped, every pod is
+// skipped, used slots read 0 and a busy dedicated pool can scale to zero.
+func TestCacheObjectTransform_KeepsWorkerSlotScrapeFields(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "worker-0",
+			Namespace: "app",
+			Labels: map[string]string{
+				"app.kubernetes.io/component": "worker",
+				"temporal.io/build-id":        "main-abc1234",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+			PodIP:  "10.0.0.7",
+			PodIPs: []corev1.PodIP{{IP: "10.0.0.7"}, {IP: "fd00::7"}},
+		},
+	}
+
+	result, err := CacheObjectTransform(pod)
+	require.NoError(t, err)
+	p := result.(*corev1.Pod)
+
+	assert.Equal(t, "worker", p.Labels["app.kubernetes.io/component"])
+	assert.Equal(t, "main-abc1234", p.Labels["temporal.io/build-id"])
+	assert.Equal(t, corev1.PodRunning, p.Status.Phase)
+	require.Len(t, p.Status.Conditions, 1)
+	assert.Equal(t, corev1.ConditionTrue, p.Status.Conditions[0].Status)
+	assert.Equal(t, "10.0.0.7", p.Status.PodIP)
+	assert.Equal(t, []corev1.PodIP{{IP: "10.0.0.7"}, {IP: "fd00::7"}}, p.Status.PodIPs)
+}
+
 func TestCacheObjectTransform_NilManagedFields(t *testing.T) {
 	obj := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
