@@ -645,7 +645,8 @@ func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, podIP string) (i
 // missing.
 func parseSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) (used int64, available int64, availablePresent bool, err error) {
 	// prometheus/common v0.66+ has no package-wide default name validation scheme; a zero
-	// TextParser rejects every name, so pin the UTF-8 scheme the old default used.
+	// TextParser panics on the first name it validates, so pin the UTF-8 scheme the old
+	// default used.
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	families, err := parser.TextToMetricFamilies(r)
 	if err != nil {
