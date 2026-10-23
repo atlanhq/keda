@@ -99,7 +99,7 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v1.20.99
 	github.com/prometheus/prometheus v1.99.0
-	github.com/rabbitmq/amqp091-go v1.10.0
+	github.com/rabbitmq/amqp091-go v1.16.0
 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9
 	github.com/redis/go-redis/v9 v9.17.3
 	github.com/robfig/cron/v3 v3.0.1
