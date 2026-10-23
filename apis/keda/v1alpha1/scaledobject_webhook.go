@@ -246,12 +246,13 @@ func verifyName(incomingSo *ScaledObject, action string, _ bool) (admission.Warn
 		metricscollector.RecordScaledObjectValidatingErrors(incomingSo.Namespace, action, "name-too-long")
 		return nil, err
 	}
+	// Atlan fork: warn, don't reject. temporal-worker-controller names ScaledObjects up to
+	// 63 chars, so keda-hpa-<name> often exceeds 63; the operator truncates that label value
+	// (controllers/keda/hpa.go) and an HPA object name may be up to 253 chars. Rejecting
+	// would freeze every such ScaledObject on its current spec.
 	hpaName := getHpaName(*incomingSo)
 	if len(hpaName) > maxK8sLabelValueLength {
-		err := fmt.Errorf("HPA name %q derived from scaledobject is %d characters long; must be no more than %d characters; set spec.advanced.horizontalPodAutoscalerConfig.name to a shorter name or shorten the scaledobject name", hpaName, len(hpaName), maxK8sLabelValueLength)
-		scaledobjectlog.WithValues("name", incomingSo.Name).Error(err, "validation error")
-		metricscollector.RecordScaledObjectValidatingErrors(incomingSo.Namespace, action, "hpa-name-too-long")
-		return nil, err
+		return admission.Warnings{fmt.Sprintf("HPA name %q derived from scaledobject is %d characters long; its app.kubernetes.io/name label is truncated to %d characters", hpaName, len(hpaName), maxK8sLabelValueLength)}, nil
 	}
 	return nil, nil
 }

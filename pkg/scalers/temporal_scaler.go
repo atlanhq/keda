@@ -4,14 +4,21 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"regexp"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
-	deploymentpb "go.temporal.io/api/deployment/v1"
-	enumspb "go.temporal.io/api/enums/v1"
-	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"go.temporal.io/api/workflowservice/v1"
 	sdk "go.temporal.io/sdk/client"
 	sdklog "go.temporal.io/sdk/log"
@@ -19,10 +26,29 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	v2 "k8s.io/api/autoscaling/v2"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/metrics/pkg/apis/external_metrics"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
+)
+
+const (
+	// scrapeLoopTimeout is the total time budget for scraping all worker pods.
+	scrapeLoopTimeout = 12 * time.Second
+	// slotsCacheTTL is how long a cached slots value remains valid after a
+	// successful scrape before falling back to 0 on persistent failure.
+	slotsCacheTTL = 180 * time.Second
+	// maxMetricsResponseBytes limits the size of a single pod's /metrics response
+	// to prevent OOM from misconfigured or malicious pods.
+	maxMetricsResponseBytes = 10 * 1024 * 1024 // 10 MB
+	// workerDeploymentVersionSeparator joins a worker deployment name and a build
+	// ID into the version string Temporal uses to identify a Worker Deployment
+	// Version. Temporal bans this character in deployment names, so the string is
+	// unambiguous without escaping.
+	workerDeploymentVersionSeparator = ":"
 )
 
 var (
@@ -37,21 +63,42 @@ var (
 	// hyphens, underscores, dots, forward slashes, and colons. Rejecting anything outside this
 	// set prevents query injection since the SDK offers no parameterized visibility queries.
 	validVisibilityQueryLiteral = regexp.MustCompile(`^[a-zA-Z0-9\-_./:]+$`)
+	// temporalSlotsScrapeErrors counts worker slot scrape failures by reason:
+	//   pod_scrape_error              – a single pod's /metrics request failed
+	//   scrape_loop_timeout           – 12s budget exceeded, used partial results
+	//   all_pods_failed_cache_hit     – all pods failed; returned last cached value
+	//   all_pods_failed_cache_expired – all pods failed and cache expired; returned 0
+	temporalSlotsScrapeErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "keda",
+			Subsystem: "temporal_scaler",
+			Name:      "worker_slots_scrape_errors_total",
+			Help: "Total number of temporal worker slot scrape failures. " +
+				"Use reason label to distinguish pod-level errors from full-scrape failures.",
+		},
+		[]string{"namespace", "task_queue", "reason"},
+	)
 )
 
-// workerDeploymentVersionSeparator joins deployment name and build id to form the
-// TemporalWorkerDeploymentVersion search attribute value (e.g. "my-deploy:v1").
-// This matches the modern (v1.32+) Temporal server format written by
-// ExternalWorkerDeploymentVersionToString in temporal/common/worker_versioning.
-// The legacy v0.31 delimiter ('.') is not used here — visibility queries against
-// modern servers will not match values written with the old delimiter.
-const workerDeploymentVersionSeparator = ":"
+func init() {
+	ctrlmetrics.Registry.MustRegister(temporalSlotsScrapeErrors)
+}
+
+type slotsCache struct {
+	value     int64
+	timestamp time.Time
+}
 
 type temporalScaler struct {
-	metricType v2.MetricTargetType
-	metadata   *temporalMetadata
-	tcl        sdk.Client
-	logger     logr.Logger
+	metricType   v2.MetricTargetType
+	metadata     *temporalMetadata
+	tcl          sdk.Client
+	kubeClient   client.Client
+	httpClient   *http.Client
+	logger       logr.Logger
+	podNamespace string
+	slotsMu      sync.Mutex
+	lastSlots    slotsCache
 }
 
 type temporalMetadata struct {
@@ -61,18 +108,22 @@ type temporalMetadata struct {
 	TargetQueueSize           int64    `keda:"name=targetQueueSize,           order=triggerMetadata, default=5"`
 	TaskQueue                 string   `keda:"name=taskQueue,                 order=triggerMetadata;resolvedEnv"`
 	QueueTypes                []string `keda:"name=queueTypes,                order=triggerMetadata, optional"`
-	BuildID                   string   `keda:"name=buildId,                   order=triggerMetadata;resolvedEnv, optional, deprecated=The 'buildId' setting is DEPRECATED and is removed in v2.21 because Temporal Server is dropping support for the Rules-Based Versioning APIs - Use 'workerDeploymentName' and 'workerDeploymentBuildId' instead"`
-	WorkerDeploymentName      string   `keda:"name=workerDeploymentName,      order=triggerMetadata;resolvedEnv, optional"`
-	WorkerDeploymentBuildID   string   `keda:"name=workerDeploymentBuildId,   order=triggerMetadata;resolvedEnv, optional"`
-	AllActive                 bool     `keda:"name=selectAllActive,           order=triggerMetadata, default=false, deprecated=The 'selectAllActive' setting is DEPRECATED and is removed in v2.21 because Temporal Server is dropping support for the Rules-Based Versioning APIs - Use 'workerDeploymentName' and 'workerDeploymentBuildId' instead"`
-	Unversioned               bool     `keda:"name=selectUnversioned,         order=triggerMetadata, default=false, deprecated=The 'selectUnversioned' setting is DEPRECATED and is removed in v2.21 because Temporal Server is dropping support for the Rules-Based Versioning APIs - Remove it if your workers are unversioned. Or use 'workerDeploymentName' and 'workerDeploymentBuildId' if you're migrating to Worker Deployment Versioning"`
-	// IncludeRunningWorkflowCount, when true, keeps the scaler active if there are running
-	// workflows on the task queue even after the backlog drains to zero. It only affects the
-	// activity decision, never the reported metric value. Defaults to false to preserve prior
-	// behavior. Activity-worker scalers can still use this by pointing WorkflowTaskQueueForCount
-	// at the workflow task queue whose in-flight workflows should keep the activity workers alive.
-	IncludeRunningWorkflowCount bool   `keda:"name=includeRunningWorkflowCount, order=triggerMetadata, default=false"`
+	// buildId, selectAllActive and selectUnversioned are rejected upstream since v2.21. The fork
+	// keeps accepting them: the temporal-worker-controller sets selectUnversioned on Current and
+	// Ramping versions, and getQueueSize forwards all three to DescribeTaskQueueEnhanced.
+	BuildID                 string `keda:"name=buildId,                   order=triggerMetadata;resolvedEnv, optional"`
+	WorkerDeploymentName    string `keda:"name=workerDeploymentName,      order=triggerMetadata;resolvedEnv, optional"`
+	WorkerDeploymentBuildID string `keda:"name=workerDeploymentBuildId,   order=triggerMetadata;resolvedEnv, optional"`
+	AllActive               bool   `keda:"name=selectAllActive,           order=triggerMetadata, default=false"`
+	Unversioned             bool   `keda:"name=selectUnversioned,         order=triggerMetadata, default=false"`
+	// IncludeRunningWorkflowCount adds the running workflow count on the task queue (or on
+	// WorkflowTaskQueueForCount) to the reported metric, so workers are not scaled away while
+	// workflows are still executing and the backlog is momentarily empty.
+	IncludeRunningWorkflowCount bool   `keda:"name=includeRunningWorkflowCount, order=triggerMetadata, default=true"`
 	WorkflowTaskQueueForCount   string `keda:"name=workflowTaskQueueForCount,   order=triggerMetadata;resolvedEnv, optional"`
+	WorkerMetricsPort           int    `keda:"name=workerMetricsPort,           order=triggerMetadata, default=9464"`
+	GateSlotsOnRunningWorkflow  bool   `keda:"name=gateSlotsOnRunningWorkflow,  order=triggerMetadata, default=true"`
+	ActivitySlotsPerWorker      int    `keda:"name=activitySlotsPerWorker,      order=triggerMetadata, default=0"`
 	APIKey                      string `keda:"name=apiKey,                    order=authParams;resolvedEnv, optional"`
 	MinConnectTimeout           int    `keda:"name=minConnectTimeout,         order=triggerMetadata, default=5"`
 	EnableTLS                   bool   `keda:"name=enableTLS,                 order=triggerMetadata, default=true"`
@@ -107,21 +158,26 @@ func (a *temporalMetadata) Validate() error {
 		return fmt.Errorf("workerDeploymentName and workerDeploymentBuildId must both be set")
 	}
 
-	if a.WorkflowTaskQueueForCount != "" && !a.IncludeRunningWorkflowCount {
-		return fmt.Errorf("workflowTaskQueueForCount has no effect unless includeRunningWorkflowCount is true")
-	}
 	if a.IncludeRunningWorkflowCount {
-		for _, name := range []string{a.TaskQueue, a.WorkflowTaskQueueForCount, a.WorkerDeploymentName, a.WorkerDeploymentBuildID} {
+		for _, name := range []string{a.TaskQueue, a.WorkflowTaskQueueForCount, a.WorkerDeploymentName, a.WorkerDeploymentBuildID, a.BuildID} {
 			if name != "" && !validVisibilityQueryLiteral.MatchString(name) {
 				return fmt.Errorf("value %q contains characters not allowed in Temporal visibility queries when includeRunningWorkflowCount is enabled", name)
 			}
 		}
 	}
 
+	if a.WorkerMetricsPort < 1 || a.WorkerMetricsPort > 65535 {
+		return fmt.Errorf("workerMetricsPort must be between 1 and 65535")
+	}
+
+	if a.ActivitySlotsPerWorker < 0 {
+		return fmt.Errorf("activitySlotsPerWorker must be a positive number")
+	}
+
 	return nil
 }
 
-func NewTemporalScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (Scaler, error) {
+func NewTemporalScaler(ctx context.Context, kubeClient client.Client, config *scalersconfig.ScalerConfig) (Scaler, error) {
 	logger := InitializeLogger(config, "temporal_scaler")
 
 	metricType, err := GetMetricTargetType(config)
@@ -146,6 +202,7 @@ func NewTemporalScaler(ctx context.Context, config *scalersconfig.ScalerConfig) 
 		"taskQueue", meta.TaskQueue,
 		"targetQueueSize", meta.TargetQueueSize,
 		"activationTargetQueueSize", meta.ActivationTargetQueueSize,
+		"includeRunningWorkflowCount", meta.IncludeRunningWorkflowCount,
 		"authType", authType(meta),
 		"unsafeSsl", meta.UnsafeSsl,
 	}
@@ -155,16 +212,22 @@ func NewTemporalScaler(ctx context.Context, config *scalersconfig.ScalerConfig) 
 	if meta.WorkerDeploymentName != "" {
 		kv = append(kv, "workerDeploymentName", meta.WorkerDeploymentName, "workerDeploymentBuildId", meta.WorkerDeploymentBuildID)
 	}
+	if meta.BuildID != "" || meta.AllActive || meta.Unversioned {
+		kv = append(kv, "buildId", meta.BuildID, "selectAllActive", meta.AllActive, "selectUnversioned", meta.Unversioned)
+	}
 	if len(meta.QueueTypes) > 0 {
 		kv = append(kv, "queueTypes", meta.QueueTypes)
 	}
 	logger.Info("Temporal scaler initialized", kv...)
 
 	return &temporalScaler{
-		metricType: metricType,
-		metadata:   meta,
-		tcl:        c,
-		logger:     logger,
+		metricType:   metricType,
+		metadata:     meta,
+		tcl:          c,
+		kubeClient:   kubeClient,
+		httpClient:   kedautil.CreateHTTPClient(config.GlobalHTTPTimeout, false),
+		logger:       logger,
+		podNamespace: config.ScalableObjectNamespace,
 	}, nil
 }
 
@@ -199,232 +262,176 @@ func (s *temporalScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpe
 }
 
 func (s *temporalScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
-	var (
-		backlogCount  int64
-		versionStatus enumspb.WorkerDeploymentVersionStatus
-		hasStatus     bool
-		err           error
-	)
-	switch {
-	case s.metadata.WorkerDeploymentName != "":
-		backlogCount, versionStatus, err = s.getDeploymentBacklogCountAndStatus(ctx)
-		hasStatus = true
-	default:
-		backlogCount, err = s.getUnversionedBacklogCount(ctx)
-	}
+	queueSize, err := s.getQueueSize(ctx)
 	if err != nil {
-		s.logger.Error(err, "failed to get Temporal backlog count",
+		s.logger.Error(err, "failed to get Temporal queue size",
 			"mode", scalerMode(s.metadata),
 			"namespace", s.metadata.Namespace,
 			"taskQueue", s.metadata.TaskQueue,
 			"grpcCode", status.Code(err).String())
-		return nil, false, fmt.Errorf("failed to get Temporal backlog count: %w", err)
+		return nil, false, fmt.Errorf("failed to get Temporal queue size: %w", err)
 	}
 
-	metric := GenerateMetricInMili(metricName, float64(backlogCount))
-	isActive := backlogCount > s.metadata.ActivationTargetQueueSize
-	if !isActive && s.metadata.IncludeRunningWorkflowCount {
-		isActive = s.isActiveWithoutBacklog(ctx, hasStatus, versionStatus)
-	}
+	metric := GenerateMetricInMili(metricName, float64(queueSize))
+	isActive := queueSize > s.metadata.ActivationTargetQueueSize
 
-	s.logger.V(1).Info("polled Temporal backlog",
+	s.logger.V(1).Info("polled Temporal queue size",
 		"mode", scalerMode(s.metadata),
 		"namespace", s.metadata.Namespace,
 		"taskQueue", s.metadata.TaskQueue,
 		"workerDeploymentName", s.metadata.WorkerDeploymentName,
 		"workerDeploymentBuildId", s.metadata.WorkerDeploymentBuildID,
-		"workerDeploymentVersionStatus", versionStatus.String(),
-		"backlogCount", backlogCount,
+		"queueSize", queueSize,
 		"activationThreshold", s.metadata.ActivationTargetQueueSize,
 		"isActive", isActive)
 
 	return []external_metrics.ExternalMetricValue{metric}, isActive, nil
 }
 
-// isActiveWithoutBacklog decides whether the scaler should remain active when the
-// backlog is at or below the activation threshold. It is only invoked when the user
-// has opted in via includeRunningWorkflowCount.
-//
-// For deployment-version scalers the Worker Deployment Version status short-circuits:
-//   - DRAINING versions are kept active because Temporal keeps replaying workflows
-//     pinned to that version until they complete, and the server checks completion
-//     periodically (roughly every 3 minutes); polling visibility here would just
-//     duplicate that signal at the risk of a false negative during eventual consistency.
-//   - CURRENT / RAMPING versions fall through to a visibility count; new work can
-//     land on these versions, so the running-count check is the only signal available.
-//   - DRAINED / INACTIVE / UNSPECIFIED versions are safe to scale down.
-//
-// For the unversioned mode we always fall through to the visibility count.
-//
-// Callers should be aware that this signal is approximate: it does not cover
-// activity-only workers, visibility indexing has no SLA (eventual consistency is
-// typically a few seconds but has no upper bound), CountWorkflow itself is
-// documented as approximate, and the Temporal frontend rate-limits all visibility
-// calls to roughly 10 RPS per namespace per instance.
-func (s *temporalScaler) isActiveWithoutBacklog(ctx context.Context, hasStatus bool, versionStatus enumspb.WorkerDeploymentVersionStatus) bool {
-	if hasStatus {
-		switch versionStatus {
-		case enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_DRAINING:
-			return true
-		case enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_CURRENT,
-			enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_RAMPING:
-			// fall through to the visibility count
-		default:
-			return false
-		}
-	}
+func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
+	selection := buildVersionSelection(s.metadata.AllActive, s.metadata.Unversioned, s.backlogVersionID())
 
-	runningCount, err := s.getRunningWorkflowCount(ctx)
+	queueType := getQueueTypes(s.metadata.QueueTypes)
+
+	resp, err := s.tcl.DescribeTaskQueueEnhanced(ctx, sdk.DescribeTaskQueueEnhancedOptions{
+		TaskQueue:      s.metadata.TaskQueue,
+		ReportStats:    true,
+		Versions:       selection,
+		TaskQueueTypes: queueType,
+	})
 	if err != nil {
-		s.logger.V(1).Info("failed to get running workflow count, treating as no-signal",
-			"mode", scalerMode(s.metadata),
-			"error", err)
-		return false
+		return 0, fmt.Errorf("failed to get Temporal queue size: %w", err)
 	}
-	return runningCount > 0
-}
 
-// getUnversionedBacklogCount queries DescribeTaskQueue for each configured queue
-// type and returns the summed backlog count. This replaces DescribeTaskQueueEnhanced
-// for the unversioned path, which is deprecated and returns the default Build ID's
-// backlog when no Versions selector is provided (not the unversioned queue).
-func (s *temporalScaler) getUnversionedBacklogCount(ctx context.Context) (int64, error) {
-	var total int64
-	for _, qt := range getQueueTypes(s.metadata.QueueTypes) {
-		tqt := enumspb.TaskQueueType(qt)
-		resp, err := s.tcl.WorkflowService().DescribeTaskQueue(ctx, &workflowservice.DescribeTaskQueueRequest{
-			Namespace:     s.metadata.Namespace,
-			TaskQueue:     &taskqueuepb.TaskQueue{Name: s.metadata.TaskQueue, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
-			TaskQueueType: tqt,
-			ReportStats:   true,
-		})
+	backlog := getCombinedBacklogCount(resp)
+
+	var runningCount int64
+	if s.metadata.IncludeRunningWorkflowCount {
+		var err error
+		runningCount, err = s.getRunningWorkflowCount(ctx)
 		if err != nil {
-			return 0, fmt.Errorf("failed to describe task queue %q (type %s): %w", s.metadata.TaskQueue, tqt, err)
-		}
-		if stats := resp.GetStats(); stats != nil {
-			total += stats.GetApproximateBacklogCount()
+			s.logger.V(1).Info("failed to get running workflow count, using backlog only", "error", err)
+			runningCount = 0
 		}
 	}
-	return total, nil
-}
 
-func (s *temporalScaler) getDeploymentBacklogCountAndStatus(ctx context.Context) (int64, enumspb.WorkerDeploymentVersionStatus, error) {
-	resp, err := s.tcl.WorkflowService().DescribeWorkerDeploymentVersion(ctx,
-		&workflowservice.DescribeWorkerDeploymentVersionRequest{
-			Namespace: s.metadata.Namespace,
-			DeploymentVersion: &deploymentpb.WorkerDeploymentVersion{
-				DeploymentName: s.metadata.WorkerDeploymentName,
-				BuildId:        s.metadata.WorkerDeploymentBuildID,
-			},
-			ReportTaskQueueStats: true,
-		},
-	)
-	if err != nil {
-		return 0, enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_UNSPECIFIED,
-			fmt.Errorf("failed to describe worker deployment version (deploymentName=%q, buildId=%q): %w",
-				s.metadata.WorkerDeploymentName, s.metadata.WorkerDeploymentBuildID, err)
+	usedSlots, slotsErr := s.getUsedWorkerSlots(ctx)
+	if slotsErr != nil {
+		s.logger.Info("failed to get worker slots metric, excluding from metric", "error", slotsErr)
 	}
 
-	backlog := sumDeploymentBacklog(resp.GetVersionTaskQueues(), s.metadata.TaskQueue, s.metadata.QueueTypes)
-	return backlog, resp.GetWorkerDeploymentVersionInfo().GetStatus(), nil
+	return composeMetric(backlog, runningCount, usedSlots, slotsErr == nil, s.metadata.GateSlotsOnRunningWorkflow), nil
 }
 
-// getRunningWorkflowCount queries the Temporal Visibility Count API for running workflow
-// executions owned by this scaler. It is only called when includeRunningWorkflowCount is
-// enabled and the backlog signal alone says "scale to zero" — its role is to block premature
-// scale-down when the queue is momentarily empty but workers are still busy.
+// composeMetric returns the composite scaling metric: backlog + runningWorkflow
+// count + used worker slots, with the slots term conditionally gated.
 //
-// Scoping rules:
-//   - deployment-version mode restricts by TemporalWorkerDeploymentVersion so that a
-//     draining version's workflows do not keep a newer version alive, and vice versa.
-//   - the default (unversioned) mode restricts by "TemporalWorkerDeploymentVersion is null"
-//     so it never picks up workflows owned by versioned workers on the same task queue.
-func (s *temporalScaler) getRunningWorkflowCount(ctx context.Context) (int64, error) {
-	query, err := s.runningWorkflowCountQuery()
-	if err != nil {
-		return 0, err
+// gateSlotsOnRunningWorkflow (default true) is the combined-pool behaviour: a
+// worker shares a task queue with the workflows that schedule its activities,
+// so a running workflow on the queue is a reliable signal that any reported
+// used-slots are real. Gating on runningCount > 0 suppresses the SDK
+// ghost-flicker false positive — when no workflow is running, non-empty poll
+// responses lacking activity_type still mark a slot used (see sdk-core
+// pollers/mod.rs:162-170), which would keep cooldown reset forever and block
+// scale-to-zero.
+//
+// gateSlotsOnRunningWorkflow=false is for a DEDICATED activity pool: it polls
+// an activity-only task queue, so no workflow ever runs on it and runningCount
+// is structurally 0 — the gate above would discard the used-slots signal
+// entirely and let KEDA scale the pool to zero while a long activity is still
+// executing on it (deleting the busy pod). With the gate off, used-slots
+// (already scoped to this pool's ActivityWorker + task queue) drives the
+// metric directly: non-zero exactly while a heavy activity runs, and 0 the
+// moment it finishes — so the pool stays warm under load and still scales to
+// zero when idle, even while the parent workflow keeps running on another
+// queue. Trade-off: a genuinely idle pool exhibiting ghost-flicker can stay up
+// one extra cooldown window; that over-provisions rather than killing a busy
+// pod, and is the conservative direction.
+//
+// That residual ghost-flicker is what activitySlotsPerWorker eliminates: when
+// set, usedSlots arrives here already phantom-discounted (derived from
+// available, see effectiveUsedSlots), so a gate=false dedicated pool reports 0
+// when idle and actually scales to zero, while still going non-zero the instant
+// a real activity consumes a slot.
+func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable, gateSlotsOnRunningWorkflow bool) int64 {
+	metric := backlog + runningCount
+	if slotsAvailable && (!gateSlotsOnRunningWorkflow || runningCount > 0) {
+		metric += usedSlots
 	}
-	resp, err := s.tcl.CountWorkflow(ctx, &workflowservice.CountWorkflowExecutionsRequest{
+	return metric
+}
+
+// buildRunningCountQuery composes the visibility query used to count
+// running workflows. Pulled out as a pure function so the query-string logic
+// is independently unit-testable.
+//
+// Three modes, in priority order:
+//
+//  1. workerDeploymentName + workerDeploymentBuildID set (RECOMMENDED, for
+//     Temporal's worker-deployment-versioning model): use the canonical,
+//     single-valued
+//     `TemporalWorkerDeploymentVersion = '<deployment-name>:<buildId>'`
+//     search attribute. Set automatically by Temporal as the current routing
+//     assignment regardless of versioning behavior (Pinned/AutoUpgrade).
+//     Field names match upstream KEDA v2.20.1's metadata schema so this
+//     branch can switch to upstream without callers re-emitting metadata.
+//
+//  2. buildID set, workerDeploymentName empty (LEGACY, for older
+//     worker-versioning-rules model): falls back to
+//     `BuildIds = 'versioned:<buildId>'`. Doesn't match workflows pinned
+//     via worker-deployment versioning (the assignment marker for those is
+//     `pinned:<dep>:<buildId>`, not `versioned:<buildId>`). Kept for
+//     backward compatibility with deployments still on the older versioning
+//     model.
+//
+//  3. Neither set: task-queue-wide count, no version scoping.
+func buildRunningCountQuery(taskQueue, workerDeploymentName, workerDeploymentBuildID, buildID string) string {
+	escapedTQ := strings.ReplaceAll(taskQueue, "'", "''")
+	query := fmt.Sprintf("ExecutionStatus = 'Running' AND TaskQueue = '%s'", escapedTQ)
+	switch {
+	case workerDeploymentName != "" && workerDeploymentBuildID != "":
+		// Canonical worker-deployment-versioning query. Uses the single-valued
+		// TemporalWorkerDeploymentVersion attribute set automatically by
+		// Temporal — uniform across Pinned + AutoUpgrade behaviors.
+		escapedDep := strings.ReplaceAll(workerDeploymentName, "'", "''")
+		escapedBID := strings.ReplaceAll(workerDeploymentBuildID, "'", "''")
+		query = fmt.Sprintf("%s AND TemporalWorkerDeploymentVersion = '%s:%s'",
+			query, escapedDep, escapedBID)
+	case buildID != "":
+		// Legacy worker-versioning-rules path.
+		escapedBID := strings.ReplaceAll(buildID, "'", "''")
+		query = fmt.Sprintf("%s AND BuildIds = 'versioned:%s'", query, escapedBID)
+	}
+	return query
+}
+
+// getRunningWorkflowCount returns the approximate number of running workflow executions
+// for the task queue (or workflowTaskQueueForCount if set). Used to avoid premature
+// scale-down when workers are fast and backlog is often zero.
+func (s *temporalScaler) getRunningWorkflowCount(ctx context.Context) (int64, error) {
+	taskQueue := s.metadata.WorkflowTaskQueueForCount
+	if taskQueue == "" {
+		taskQueue = s.metadata.TaskQueue
+	}
+	query := buildRunningCountQuery(taskQueue, s.metadata.WorkerDeploymentName, s.metadata.WorkerDeploymentBuildID, s.metadata.BuildID)
+
+	req := &workflowservice.CountWorkflowExecutionsRequest{
 		Namespace: s.metadata.Namespace,
 		Query:     query,
-	})
+	}
+	resp, err := s.tcl.CountWorkflow(ctx, req)
 	if err != nil {
 		return 0, fmt.Errorf("count workflow: %w", err)
 	}
 	return resp.GetCount(), nil
 }
 
-// runningWorkflowCountQuery builds the visibility query used by getRunningWorkflowCount.
-// Values that reach this method must already have passed the Validate() literal check,
-// but we re-validate defensively in case a caller constructs a scaler outside the normal
-// factory path.
-func (s *temporalScaler) runningWorkflowCountQuery() (string, error) {
-	taskQueue := s.metadata.WorkflowTaskQueueForCount
-	if taskQueue == "" {
-		taskQueue = s.metadata.TaskQueue
-	}
-	if !validVisibilityQueryLiteral.MatchString(taskQueue) {
-		return "", fmt.Errorf("task queue name %q contains characters not allowed in visibility queries", taskQueue)
-	}
-
-	query := fmt.Sprintf("ExecutionStatus = 'Running' AND TaskQueue = '%s'", taskQueue)
-	switch {
-	case s.metadata.WorkerDeploymentName != "":
-		if !validVisibilityQueryLiteral.MatchString(s.metadata.WorkerDeploymentName) ||
-			!validVisibilityQueryLiteral.MatchString(s.metadata.WorkerDeploymentBuildID) {
-			return "", fmt.Errorf("workerDeploymentName/workerDeploymentBuildId contain characters not allowed in visibility queries")
-		}
-		version := s.metadata.WorkerDeploymentName + workerDeploymentVersionSeparator + s.metadata.WorkerDeploymentBuildID
-		query = fmt.Sprintf("%s AND TemporalWorkerDeploymentVersion = '%s'", query, version)
-	default:
-		query += " AND TemporalWorkerDeploymentVersion is null"
-	}
-	return query, nil
-}
-
-// sumDeploymentBacklog sums ApproximateBacklogCount across the provided task
-// queues, optionally filtered by taskQueueName and allowedQueueTypes. An empty
-// taskQueueName means no name filter; an empty allowedQueueTypes means no type filter.
-func sumDeploymentBacklog(tqs []*workflowservice.DescribeWorkerDeploymentVersionResponse_VersionTaskQueue, taskQueueName string, allowedQueueTypes []string) int64 {
-	allowedTypes := queueTypeSet(allowedQueueTypes) // nil == allow all
-
-	var totalBacklog int64
-	for _, tq := range tqs {
-		if allowedTypes != nil && !allowedTypes[tq.GetType()] {
-			continue
-		}
-		if taskQueueName != "" && tq.GetName() != taskQueueName {
-			continue
-		}
-		if stats := tq.GetStats(); stats != nil {
-			totalBacklog += stats.GetApproximateBacklogCount()
-		}
-	}
-	return totalBacklog
-}
-
-func queueTypeSet(queueTypes []string) map[enumspb.TaskQueueType]bool {
-	if len(queueTypes) == 0 {
-		return nil
-	}
-	set := make(map[enumspb.TaskQueueType]bool, len(queueTypes))
-	for _, t := range queueTypes {
-		switch t {
-		case "workflow":
-			set[enumspb.TASK_QUEUE_TYPE_WORKFLOW] = true
-		case "activity":
-			set[enumspb.TASK_QUEUE_TYPE_ACTIVITY] = true
-		case "nexus":
-			set[enumspb.TASK_QUEUE_TYPE_NEXUS] = true
-		}
-	}
-	return set
-}
-
 func scalerMode(m *temporalMetadata) string {
 	switch {
 	case m.WorkerDeploymentName != "":
 		return "deployment-version"
+	case m.BuildID != "" || m.AllActive || m.Unversioned:
+		return "build-id"
 	default:
 		return "unversioned"
 	}
@@ -439,6 +446,302 @@ func authType(m *temporalMetadata) string {
 	default:
 		return "none"
 	}
+}
+
+// getUsedWorkerSlots discovers worker pods in the ScaledObject's namespace and
+// scrapes their Prometheus metrics endpoint to sum temporal_worker_task_slots_used
+// for worker types matching the configured queueTypes. This prevents premature
+// scale-down when workers are actively executing tasks but the task queue backlog
+// is empty.
+//
+// When the scaler is configured for a specific worker version (workerDeploymentBuildId
+// or the legacy buildId), the pod listing is filtered by the upstream
+// `temporal.io/build-id` label so that a per-version ScaledObject only sums slots
+// from its own pods. Without this filter, multiple per-version SOs sharing a
+// namespace would each see every version's pods and double-count the slots term,
+// keeping all versions warm whenever any one of them is busy. When neither buildID
+// field is set (unversioned worker), no build-id filter is applied.
+//
+// On transient failures (all pod scrapes fail), it returns the last known good
+// value if within the cache TTL. A total timeout budget bounds the scrape loop
+// so that slow/unreachable pods don't block the KEDA polling cycle.
+func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) {
+	if s.kubeClient == nil || s.httpClient == nil {
+		return 0, fmt.Errorf("kubernetes client or http client not configured")
+	}
+
+	podList := &corev1.PodList{}
+	labelSelector := client.MatchingLabels{"app.kubernetes.io/component": "worker"}
+	if buildID := s.workerBuildID(); buildID != "" {
+		labelSelector["temporal.io/build-id"] = buildID
+	}
+	if err := s.kubeClient.List(ctx, podList, client.InNamespace(s.podNamespace), labelSelector); err != nil {
+		return 0, fmt.Errorf("failed to list worker pods in namespace %s: %w", s.podNamespace, err)
+	}
+
+	if len(podList.Items) == 0 {
+		return 0, nil
+	}
+
+	// Apply a timeout budget for the entire scrape loop.
+	scrapeCtx, cancel := context.WithTimeout(ctx, scrapeLoopTimeout)
+	defer cancel()
+
+	var totalUsedSlots int64
+	var scrapedCount, attemptedCount int
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || !isPodReady(pod) {
+			continue
+		}
+
+		// Stop scraping if we've exceeded the timeout budget.
+		if scrapeCtx.Err() != nil {
+			s.logger.Info("scrape loop timeout reached, using partial results",
+				"scraped", scrapedCount, "remaining", len(podList.Items)-i)
+			temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "scrape_loop_timeout").Inc()
+			break
+		}
+
+		attemptedCount++
+		slots, err := s.scrapeWorkerSlots(scrapeCtx, pod.Status.PodIP)
+		if err != nil {
+			s.logger.Info("failed to scrape worker pod metrics, skipping",
+				"pod", pod.Name, "ip", pod.Status.PodIP, "error", err)
+			temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "pod_scrape_error").Inc()
+			continue
+		}
+		totalUsedSlots += slots
+		scrapedCount++
+	}
+
+	s.logger.V(1).Info("worker slots metric",
+		"namespace", s.podNamespace, "totalUsedSlots", totalUsedSlots,
+		"podCount", len(podList.Items), "scrapedCount", scrapedCount)
+
+	// No ready pods to scrape (e.g. all pods still starting up) — return 0.
+	if attemptedCount == 0 {
+		return 0, nil
+	}
+
+	// All attempted scrapes failed — fall back to cached value within TTL.
+	if scrapedCount == 0 {
+		s.slotsMu.Lock()
+		cached := s.lastSlots
+		s.slotsMu.Unlock()
+		if time.Since(cached.timestamp) <= slotsCacheTTL {
+			s.logger.Info("all scrapes failed, using cached slots value",
+				"cachedValue", cached.value, "cacheAge", time.Since(cached.timestamp).String())
+			temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "all_pods_failed_cache_hit").Inc()
+			return cached.value, nil
+		}
+		s.logger.Info("all scrapes failed and cache expired, returning 0")
+		temporalSlotsScrapeErrors.WithLabelValues(s.podNamespace, s.metadata.TaskQueue, "all_pods_failed_cache_expired").Inc()
+		return 0, nil
+	}
+
+	// Update cache with the fresh value.
+	s.slotsMu.Lock()
+	s.lastSlots = slotsCache{value: totalUsedSlots, timestamp: time.Now()}
+	s.slotsMu.Unlock()
+
+	return totalUsedSlots, nil
+}
+
+// workerBuildID returns the build ID used to scope the pod listing for slot
+// scraping. Prefers the new workerDeploymentBuildId field (worker-deployment
+// versioning model), falling back to the legacy buildId (worker-versioning-rules
+// model). Returns "" for unversioned workers, in which case no build-id filter
+// is applied.
+func (s *temporalScaler) workerBuildID() string {
+	if s.metadata.WorkerDeploymentBuildID != "" {
+		return s.metadata.WorkerDeploymentBuildID
+	}
+	return s.metadata.BuildID
+}
+
+// backlogVersionID returns the identifier that names this scaler's own bucket
+// in DescribeTaskQueueEnhanced.
+//
+// Worker Deployment Versioning needs the fully-qualified
+// "<deployment>:<buildId>" version string, not a bare build ID. Matching
+// resolves a requested build ID against its currently-loaded physical queues
+// first, then falls back to parsing the value as a version string. A bare build
+// ID matches neither once the version's queue has been unloaded, so it lands on
+// a legacy build-id-only physical queue. That queue has a different persistence
+// name than the deployment version's queue, so it is always empty, and because
+// it carries no deployment the server treats it as an unversioned describe --
+// which subtracts the Current version's share of the default-queue backlog
+// instead of merging it in. Temporal passes this same qualified string to
+// itself whenever it needs a version's task-queue stats.
+//
+// Distinct from workerBuildID(), which stays bare because that is the value the
+// temporal.io/build-id pod label carries.
+func (s *temporalScaler) backlogVersionID() string {
+	if s.metadata.WorkerDeploymentName != "" && s.metadata.WorkerDeploymentBuildID != "" {
+		return s.metadata.WorkerDeploymentName + workerDeploymentVersionSeparator + s.metadata.WorkerDeploymentBuildID
+	}
+	return s.metadata.BuildID
+}
+
+// buildVersionSelection composes the Temporal task-queue version selection used
+// to scope the backlog term. Pulled out as a pure function, matching
+// buildRunningCountQuery, so the selection logic is unit-testable without a
+// live Temporal client.
+//
+// Callers must pass backlogVersionID(). Passing metadata.BuildID directly is the
+// ARUN-1259 defect: TWC emits workerDeploymentBuildId and never the legacy
+// buildId, so the selection went out as BuildIDs: [""] -- the unversioned
+// bucket, which on Temporal 1.30 has the Current version's backlog subtracted
+// out of it. The backlog term is the only one of composeMetric's three that
+// needs neither a live pod nor a prior dispatch, so with it reading 0 a build
+// zeroed before it dispatched anything had no way back up.
+func buildVersionSelection(allActive, unversioned bool, versionID string) *sdk.TaskQueueVersionSelection {
+	if !allActive && !unversioned && versionID == "" {
+		return nil
+	}
+	return &sdk.TaskQueueVersionSelection{
+		AllActive:   allActive,
+		Unversioned: unversioned,
+		BuildIDs:    []string{versionID},
+	}
+}
+
+// scrapeWorkerSlots fetches Prometheus metrics from a single worker pod and returns
+// the sum of temporal_worker_task_slots_used for worker types matching the
+// configured queueTypes and task queue.
+func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, podIP string) (int64, error) {
+	hostPort := net.JoinHostPort(podIP, strconv.Itoa(s.metadata.WorkerMetricsPort))
+	url := fmt.Sprintf("http://%s/metrics", hostPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("scrape %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("scrape %s returned status %d", url, resp.StatusCode)
+	}
+
+	limitedBody := io.LimitReader(resp.Body, maxMetricsResponseBytes)
+	activityOnly := map[string]bool{"ActivityWorker": true}
+	used, available, availablePresent, err := parseSlots(limitedBody, s.metadata.TaskQueue, activityOnly)
+	if err != nil {
+		return 0, err
+	}
+	return s.effectiveUsedSlots(used, available, availablePresent), nil
+}
+
+// parseSlots parses Prometheus text format and returns the summed
+// temporal_worker_task_slots_used and temporal_worker_task_slots_available for
+// the worker types matching the task queue. availablePresent reports whether
+// the available gauge was actually exported for a matching series (older SDKs
+// may not emit it), so callers can fall back to raw used-slots when it is
+// missing.
+func parseSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) (used int64, available int64, availablePresent bool, err error) {
+	// prometheus/common v0.66+ has no package-wide default name validation scheme; a zero
+	// TextParser panics on the first name it validates, so pin the UTF-8 scheme the old
+	// default used.
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(r)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("parse prometheus metrics: %w", err)
+	}
+
+	used, _ = sumSlotFamily(families["temporal_worker_task_slots_used"], taskQueue, workerTypes)
+	available, availablePresent = sumSlotFamily(families["temporal_worker_task_slots_available"], taskQueue, workerTypes)
+	return used, available, availablePresent, nil
+}
+
+// sumSlotFamily sums the gauge values of a slot metric family across the metrics
+// whose worker_type and task_queue match. found reports whether at least one
+// matching series existed (distinguishing "absent" from "present and zero").
+func sumSlotFamily(family *dto.MetricFamily, taskQueue string, workerTypes map[string]bool) (sum int64, found bool) {
+	if family == nil {
+		return 0, false
+	}
+	for _, m := range family.GetMetric() {
+		if matchesWorkerSlot(m, taskQueue, workerTypes) {
+			sum += int64(m.GetGauge().GetValue())
+			found = true
+		}
+	}
+	return sum, found
+}
+
+// parseUsedSlots returns only the summed used-slots gauge. Retained as a thin
+// wrapper over parseSlots for callers/tests that only need the raw used value.
+func parseUsedSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) (int64, error) {
+	used, _, _, err := parseSlots(r, taskQueue, workerTypes)
+	return used, err
+}
+
+// effectiveUsedSlots converts a pod's raw slot gauges into the number of slots
+// actually occupied by a running activity.
+//
+// The temporalio SDK has a slot-accounting bug: certain non-empty long-poll
+// responses that carry no activity mark a slot "used" without consuming real
+// capacity (see sdk-core pollers/mod.rs and the worker slot supplier). The pod
+// then reports used>0 while available stays at its configured maximum, i.e.
+// used+available > max — an "impossible if real" phantom slot. Summing raw
+// `used` makes KEDA read an idle pool as busy and never scale it to zero,
+// pinning a dedicated on-demand pool at one pod per tenant 24/7.
+//
+// `available` is NOT corrupted by the bug: a genuinely running activity
+// decrements it, the phantom does not. So when the per-worker activity-slot
+// limit is known (activitySlotsPerWorker, set to the worker's
+// maxConcurrentActivities), the honest occupancy is max(0, limit - available):
+//
+//	real activity  -> available < limit -> > 0  (pod kept warm)
+//	phantom / idle -> available == limit -> 0   (pool free to drain)
+//
+// When the limit is unset (0) or the available gauge is absent, it falls back
+// to raw `used` so existing ScaledObjects are unaffected.
+func (s *temporalScaler) effectiveUsedSlots(used, available int64, availablePresent bool) int64 {
+	limit := int64(s.metadata.ActivitySlotsPerWorker)
+	if limit <= 0 || !availablePresent {
+		return used
+	}
+	realUsed := limit - available
+	if realUsed < 0 {
+		realUsed = 0
+	}
+	if realUsed > limit {
+		realUsed = limit
+	}
+	return realUsed
+}
+
+// matchesWorkerSlot returns true if the metric's worker_type is in the allowed set
+// and (if taskQueue is non-empty) task_queue matches the configured queue.
+func matchesWorkerSlot(m *dto.Metric, taskQueue string, workerTypes map[string]bool) bool {
+	var typeMatches bool
+	queueMatches := taskQueue == ""
+	for _, lp := range m.GetLabel() {
+		switch lp.GetName() {
+		case "worker_type":
+			typeMatches = workerTypes[lp.GetValue()]
+		case "task_queue":
+			if !queueMatches {
+				queueMatches = lp.GetValue() == taskQueue
+			}
+		}
+	}
+	return typeMatches && queueMatches
+}
+
+func isPodReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func getQueueTypes(queueTypes []string) []sdk.TaskQueueType {
@@ -460,6 +763,46 @@ func getQueueTypes(queueTypes []string) []sdk.TaskQueueType {
 		return temporalDefaultQueueTypes
 	}
 	return taskQueueTypes
+}
+
+func getCombinedBacklogCount(description sdk.TaskQueueDescription) int64 {
+	var count int64
+
+	for _, versionInfo := range description.VersionsInfo {
+		for _, typeInfo := range versionInfo.TypesInfo {
+			if typeInfo.Stats != nil {
+				count += bucketBacklogCount(typeInfo.Stats)
+			}
+		}
+	}
+	return count
+}
+
+// bucketBacklogCount returns one bucket's backlog, counting a backlog that has an
+// age but no count as a single task.
+//
+// Matching reports the two numbers from different sources. The age is measured
+// from the tasks it has loaded, so an age above zero means a task is waiting. The
+// count is a counter that SQL persistence saves only on the periodic ack-level
+// update, not when a task is written. When a partition changes owner before that
+// save, the new owner loads the old count and still loads the task, and nothing
+// recounts it until the task is dispatched. Trusting the count alone then reads
+// an empty queue forever, and with minReplicaCount 0 no poller ever comes to
+// dispatch the task.
+//
+// The floor cannot activate on a queue with nothing waiting, because a bucket
+// with no loaded task reports an age of zero, and when matching subtracts the
+// Current version's share out of the unversioned bucket it clears the age of a
+// result that reaches zero.
+//
+// It does not cover a version ramp. Matching splits the default queue's stats by
+// ramp percentage from the count, so a lost count gives both shares a count and
+// an age of zero, and the waiting task is invisible in every bucket.
+func bucketBacklogCount(stats *sdk.TaskQueueStats) int64 {
+	if stats.ApproximateBacklogCount == 0 && stats.ApproximateBacklogAge > 0 {
+		return 1
+	}
+	return stats.ApproximateBacklogCount
 }
 
 func getTemporalClient(ctx context.Context, meta *temporalMetadata, log logr.Logger) (sdk.Client, error) {

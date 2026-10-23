@@ -28,7 +28,7 @@ import (
 // For all objects: removes ManagedFields.
 // For Pods: preserves ObjectMeta (name, namespace, labels, etc.) but clears
 // annotations; replaces Spec with only NodeName; replaces Status with only
-// Phase and Conditions. Everything else (containers, volumes, env,
+// Phase, Conditions and PodIP(s). Everything else (containers, volumes, env,
 // containerStatuses, etc.) is cleared.
 func CacheObjectTransform(obj any) (any, error) {
 	if accessor, ok := obj.(metav1.Object); ok {
@@ -48,6 +48,7 @@ func CacheObjectTransform(obj any) (any, error) {
 //   - status.phase (workload scaler, fallback, scale_jobs)
 //   - status.conditions (fallback, scale_jobs)
 //   - spec.nodeName (workload scaler with groupByNode)
+//   - status.podIP/podIPs (Atlan: temporal worker-slot scrape)
 func stripPodFields(pod *corev1.Pod) {
 	pod.Annotations = nil
 
@@ -58,8 +59,12 @@ func stripPodFields(pod *corev1.Pod) {
 
 	phase := pod.Status.Phase
 	conditions := pod.Status.Conditions
+	podIP := pod.Status.PodIP
+	podIPs := pod.Status.PodIPs
 	pod.Status = corev1.PodStatus{
 		Phase:      phase,
 		Conditions: conditions,
+		PodIP:      podIP,
+		PodIPs:     podIPs,
 	}
 }
