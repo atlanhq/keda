@@ -130,11 +130,11 @@ func TestCacheObjectTransform_StripsPodFields(t *testing.T) {
 	assert.Nil(t, p.Spec.Volumes)
 	assert.Nil(t, p.Spec.Tolerations)
 
-	// Status: only Phase and Conditions preserved
+	// Status: only Phase, Conditions and PodIP preserved
 	assert.Equal(t, corev1.PodRunning, p.Status.Phase)
 	assert.Len(t, p.Status.Conditions, 1)
 	assert.Equal(t, corev1.PodReady, p.Status.Conditions[0].Type)
-	assert.Empty(t, p.Status.PodIP)
+	assert.Equal(t, "10.0.0.1", p.Status.PodIP)
 	assert.Empty(t, p.Status.HostIP)
 	assert.Nil(t, p.Status.ContainerStatuses)
 }
