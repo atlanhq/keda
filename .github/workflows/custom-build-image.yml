@@ -42,3 +42,27 @@ jobs:
           tags: |
             ghcr.io/atlanhq/keda:2.21.0-main-${{ github.sha }}
             ghcr.io/atlanhq/keda:${{ steps.branch_tag.outputs.value }}-${{ github.sha }}
+
+      # The metrics adapter and admission webhooks ship from this fork too, so the webhook
+      # carries the fork's verifyName change and all three images share one commit.
+      - name: Build and push metrics apiserver
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.adapter
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/atlanhq/keda-metrics-apiserver:2.21.0-main-${{ github.sha }}
+            ghcr.io/atlanhq/keda-metrics-apiserver:${{ steps.branch_tag.outputs.value }}-${{ github.sha }}
+
+      - name: Build and push admission webhooks
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.webhooks
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/atlanhq/keda-admission-webhooks:2.21.0-main-${{ github.sha }}
+            ghcr.io/atlanhq/keda-admission-webhooks:${{ steps.branch_tag.outputs.value }}-${{ github.sha }}
