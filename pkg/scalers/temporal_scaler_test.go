@@ -1359,7 +1359,7 @@ func TestGetCombinedBacklogCount(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := getCombinedBacklogCount(sdk.TaskQueueDescription{VersionsInfo: tt.versions})
+			got := getCombinedBacklogCount(sdk.TaskQueueDescription{VersionsInfo: tt.versions}) //nolint:staticcheck // see taskQueueVersionInfo
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -1379,7 +1379,7 @@ func (c *describeOnlyClient) DescribeTaskQueueEnhanced(context.Context, sdk.Desc
 func TestGetMetricsAndActivityLostBacklogCount(t *testing.T) {
 	version := "anomalo-app/anomalo-worker-twd:0.4.1"
 	describe := func(stats *sdk.TaskQueueStats) sdk.TaskQueueDescription {
-		return sdk.TaskQueueDescription{VersionsInfo: map[string]taskQueueVersionInfo{
+		return sdk.TaskQueueDescription{VersionsInfo: map[string]taskQueueVersionInfo{ //nolint:staticcheck // see taskQueueVersionInfo
 			version: {TypesInfo: map[sdk.TaskQueueType]sdk.TaskQueueTypeInfo{
 				sdk.TaskQueueTypeWorkflow: {Stats: stats},
 			}},
