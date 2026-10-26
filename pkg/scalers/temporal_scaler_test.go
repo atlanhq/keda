@@ -8,16 +8,23 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	enumspb "go.temporal.io/api/enums/v1"
-	taskqueuepb "go.temporal.io/api/taskqueue/v1"
-	"go.temporal.io/api/workflowservice/v1"
+	sdk "go.temporal.io/sdk/client"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
@@ -60,26 +67,34 @@ var testTemporalMetadata = []parseTemporalMetadataTestData{
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy"}, true},
 	// workerDeploymentBuildId without workerDeploymentName
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentBuildId": "v1"}, true},
-	// buildId is rejected during parsing, so the combination never reaches Validate()
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy", "workerDeploymentBuildId": "v1", "buildId": "v1"}, true},
-	// selectAllActive is rejected during parsing, so the combination never reaches Validate()
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy", "workerDeploymentBuildId": "v1", "selectAllActive": "true"}, true},
+	// the fork still accepts buildId alongside a deployment version
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy", "workerDeploymentBuildId": "v1", "buildId": "v1"}, false},
+	// the fork still accepts selectAllActive alongside a deployment version
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy", "workerDeploymentBuildId": "v1", "selectAllActive": "true"}, false},
 	// valid deployment config
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "my-deploy", "workerDeploymentBuildId": "v1"}, false},
-	// legacy buildId is rejected as of v2.21
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "buildId": "v1"}, true},
-	// workflowTaskQueueForCount without includeRunningWorkflowCount
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workflowTaskQueueForCount": "wf-queue"}, true},
+	// legacy buildId is still accepted by the fork
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "buildId": "v1"}, false},
+	// workflowTaskQueueForCount alone is valid: includeRunningWorkflowCount defaults to true
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workflowTaskQueueForCount": "wf-queue"}, false},
 	// includeRunningWorkflowCount alone is valid
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "includeRunningWorkflowCount": "true"}, false},
 	// includeRunningWorkflowCount + workflowTaskQueueForCount is valid
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "includeRunningWorkflowCount": "true", "workflowTaskQueueForCount": "wf-queue"}, false},
 	// includeRunningWorkflowCount rejects unsafe characters in taskQueue
 	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": "bad queue' OR '1'='1", "namespace": temporalNamespace, "includeRunningWorkflowCount": "true"}, true},
-	// selectAllActive is rejected as of v2.21
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "selectAllActive": "true"}, true},
-	// selectUnversioned is rejected as of v2.21
-	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "selectUnversioned": "true"}, true},
+	// the fork still accepts selectAllActive
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "selectAllActive": "true"}, false},
+	// the fork still accepts selectUnversioned
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "selectUnversioned": "true"}, false},
+	// temporal-worker-controller Current/Ramping version shape
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "workerDeploymentName": "app-ns/app-worker-twd", "workerDeploymentBuildId": "0.4.1", "selectUnversioned": "true"}, false},
+	// unsafe characters are rejected by default, since includeRunningWorkflowCount defaults to true
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": "bad queue' OR '1'='1", "namespace": temporalNamespace}, true},
+	// unsafe characters never reach a visibility query when includeRunningWorkflowCount is off
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": "bad queue' OR '1'='1", "namespace": temporalNamespace, "includeRunningWorkflowCount": "false"}, false},
+	// includeRunningWorkflowCount off with workflowTaskQueueForCount set is accepted (ignored)
+	{map[string]string{"endpoint": temporalEndpoint, "taskQueue": temporalQueueName, "namespace": temporalNamespace, "includeRunningWorkflowCount": "false", "workflowTaskQueueForCount": "wf-queue"}, false},
 }
 
 var temporalMetricIdentifiers = []temporalMetricIdentifier{
@@ -141,13 +156,16 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"namespace": "default",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			wantErr: true,
 		},
@@ -158,13 +176,16 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueue": "testxx",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			wantErr: false,
 		},
@@ -177,13 +198,16 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"activationTargetQueueSize": "12",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 12,
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   12,
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			wantErr: false,
 		},
@@ -195,14 +219,17 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueue": "testxx",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				APIKey:                    "test01",
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				APIKey:                      "test01",
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			authParams: map[string]string{
 				"apiKey": "test01",
@@ -218,14 +245,17 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"queueTypes": "workflow,activity",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				QueueTypes:                []string{"workflow", "activity"},
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				QueueTypes:                  []string{"workflow", "activity"},
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			wantErr: false,
 		},
@@ -242,14 +272,17 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"taskQueueFromEnv": "taskQueue",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				APIKey:                    "test01",
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				APIKey:                      "test01",
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			authParams: map[string]string{
 				"apiKey": "test01",
@@ -265,14 +298,17 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey":    "test-api-key",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				APIKey:                    "test-api-key",
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				APIKey:                      "test-api-key",
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			authParams: map[string]string{
 				"apiKey": "test-api-key",
@@ -291,14 +327,17 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey": "test-api-key",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				APIKey:                    "test-api-key",
-				MinConnectTimeout:         5,
-				EnableTLS:                 false,
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				APIKey:                      "test-api-key",
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   false,
 			},
 			wantErr: false,
 		},
@@ -311,14 +350,17 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"tlsServerName": "my-namespace.tmpr.cloud",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
-				TLSServerName:             "my-namespace.tmpr.cloud",
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
+				TLSServerName:               "my-namespace.tmpr.cloud",
 			},
 			wantErr: false,
 		},
@@ -334,15 +376,18 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"apiKey": "test01",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				APIKey:                    "test01",
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
-				TLSServerName:             "my-namespace.tmpr.cloud",
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				APIKey:                      "test01",
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
+				TLSServerName:               "my-namespace.tmpr.cloud",
 			},
 			wantErr: false,
 		},
@@ -361,18 +406,66 @@ func TestParseTemporalMetadata(t *testing.T) {
 				"ca":          "ca-data",
 			},
 			wantMeta: &temporalMetadata{
-				Endpoint:                  "test:7233",
-				Namespace:                 "default",
-				TaskQueue:                 "testxx",
-				TargetQueueSize:           5,
-				ActivationTargetQueueSize: 0,
-				Cert:                      "cert-data",
-				Key:                       "key-data",
-				KeyPassword:               "password",
-				CA:                        "ca-data",
-				MinConnectTimeout:         5,
-				EnableTLS:                 true,
-				TLSServerName:             "my-namespace.tmpr.cloud",
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				Cert:                        "cert-data",
+				Key:                         "key-data",
+				KeyPassword:                 "password",
+				CA:                          "ca-data",
+				IncludeRunningWorkflowCount: true,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
+				TLSServerName:               "my-namespace.tmpr.cloud",
+			},
+			wantErr: false,
+		},
+		{
+			name: "includeRunningWorkflowCount disabled",
+			metadata: map[string]string{
+				"endpoint":                    "test:7233",
+				"namespace":                   "default",
+				"taskQueue":                   "testxx",
+				"includeRunningWorkflowCount": "false",
+			},
+			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "testxx",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				IncludeRunningWorkflowCount: false,
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
+			},
+			wantErr: false,
+		},
+		{
+			name: "workflowTaskQueueForCount set",
+			metadata: map[string]string{
+				"endpoint":                  "test:7233",
+				"namespace":                 "default",
+				"taskQueue":                 "activity-queue",
+				"workflowTaskQueueForCount": "workflow-queue",
+			},
+			wantMeta: &temporalMetadata{
+				GateSlotsOnRunningWorkflow:  true,
+				Endpoint:                    "test:7233",
+				Namespace:                   "default",
+				TaskQueue:                   "activity-queue",
+				TargetQueueSize:             5,
+				ActivationTargetQueueSize:   0,
+				IncludeRunningWorkflowCount: true,
+				WorkflowTaskQueueForCount:   "workflow-queue",
+				WorkerMetricsPort:           9464,
+				MinConnectTimeout:           5,
+				EnableTLS:                   true,
 			},
 			wantErr: false,
 		},
@@ -413,83 +506,6 @@ func TestTemporalDefaultQueueTypes(t *testing.T) {
 	assert.Len(t, getQueueTypes(metadata.QueueTypes), 1, "only one type should be there")
 }
 
-func makeVersionTaskQueue(name string, qt enumspb.TaskQueueType, backlog int64) *workflowservice.DescribeWorkerDeploymentVersionResponse_VersionTaskQueue {
-	return &workflowservice.DescribeWorkerDeploymentVersionResponse_VersionTaskQueue{
-		Name:  name,
-		Type:  qt,
-		Stats: &taskqueuepb.TaskQueueStats{ApproximateBacklogCount: backlog},
-	}
-}
-
-func TestSumDeploymentBacklog(t *testing.T) {
-	all := []*workflowservice.DescribeWorkerDeploymentVersionResponse_VersionTaskQueue{
-		makeVersionTaskQueue("queue-a", enumspb.TASK_QUEUE_TYPE_WORKFLOW, 10),
-		makeVersionTaskQueue("queue-a", enumspb.TASK_QUEUE_TYPE_ACTIVITY, 20),
-		makeVersionTaskQueue("queue-a", enumspb.TASK_QUEUE_TYPE_NEXUS, 5),
-		makeVersionTaskQueue("queue-b", enumspb.TASK_QUEUE_TYPE_WORKFLOW, 100),
-		{Name: "queue-a", Type: enumspb.TASK_QUEUE_TYPE_WORKFLOW, Stats: nil},
-	}
-
-	cases := []struct {
-		name          string
-		taskQueues    []*workflowservice.DescribeWorkerDeploymentVersionResponse_VersionTaskQueue
-		taskQueueName string
-		queueTypes    []string
-		want          int64
-	}{
-		{
-			name:       "no filters sums everything",
-			taskQueues: all,
-			want:       135,
-		},
-		{
-			name:          "filter by task queue name",
-			taskQueues:    all,
-			taskQueueName: "queue-a",
-			want:          35,
-		},
-		{
-			name:       "filter by queue type workflow",
-			taskQueues: all,
-			queueTypes: []string{"workflow"},
-			want:       110,
-		},
-		{
-			name:          "filter by name and type",
-			taskQueues:    all,
-			taskQueueName: "queue-a",
-			queueTypes:    []string{"activity"},
-			want:          20,
-		},
-		{
-			name:          "filter matches nothing",
-			taskQueues:    all,
-			taskQueueName: "nonexistent",
-			want:          0,
-		},
-		{
-			name:       "nil stats entry skipped",
-			taskQueues: all,
-			queueTypes: []string{"workflow"},
-			// queue-a workflow=10, queue-a workflow with nil stats=skipped, queue-b workflow=100
-			want: 110,
-		},
-		{
-			name:       "multiple type filter",
-			taskQueues: all,
-			queueTypes: []string{"workflow", "activity"},
-			want:       130,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := sumDeploymentBacklog(tc.taskQueues, tc.taskQueueName, tc.queueTypes)
-			assert.Equal(t, tc.want, got)
-		})
-	}
-}
-
 func TestScalerMode(t *testing.T) {
 	cases := []struct {
 		name string
@@ -498,6 +514,10 @@ func TestScalerMode(t *testing.T) {
 	}{
 		{"no versioning fields", temporalMetadata{}, "unversioned"},
 		{"workerDeploymentName set", temporalMetadata{WorkerDeploymentName: "d"}, "deployment-version"},
+		{"workerDeploymentName with selectUnversioned", temporalMetadata{WorkerDeploymentName: "d", Unversioned: true}, "deployment-version"},
+		{"buildId set", temporalMetadata{BuildID: "v1"}, "build-id"},
+		{"selectAllActive set", temporalMetadata{AllActive: true}, "build-id"},
+		{"selectUnversioned set", temporalMetadata{Unversioned: true}, "build-id"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -506,72 +526,37 @@ func TestScalerMode(t *testing.T) {
 	}
 }
 
-func TestRunningWorkflowCountQuery(t *testing.T) {
+func TestParseTemporalMetadataWorkerMetricsPort(t *testing.T) {
 	cases := []struct {
-		name    string
-		meta    temporalMetadata
-		want    string
-		wantErr bool
+		name     string
+		metadata map[string]string
+		wantPort int
 	}{
 		{
-			name: "unversioned scopes with is null",
-			meta: temporalMetadata{TaskQueue: "orders"},
-			want: "ExecutionStatus = 'Running' AND TaskQueue = 'orders' AND TemporalWorkerDeploymentVersion is null",
+			name: "default port",
+			metadata: map[string]string{
+				"endpoint":  "test:7233",
+				"taskQueue": "q",
+			},
+			wantPort: 9464,
 		},
 		{
-			name: "deployment version scopes by TemporalWorkerDeploymentVersion using the v1.32+ colon delimiter",
-			meta: temporalMetadata{TaskQueue: "orders", WorkerDeploymentName: "orders-svc", WorkerDeploymentBuildID: "v1"},
-			want: "ExecutionStatus = 'Running' AND TaskQueue = 'orders' AND TemporalWorkerDeploymentVersion = 'orders-svc:v1'",
-		},
-		{
-			name: "workflowTaskQueueForCount overrides taskQueue",
-			meta: temporalMetadata{TaskQueue: "activities", WorkflowTaskQueueForCount: "workflows"},
-			want: "ExecutionStatus = 'Running' AND TaskQueue = 'workflows' AND TemporalWorkerDeploymentVersion is null",
-		},
-		{
-			name:    "unsafe task queue is rejected",
-			meta:    temporalMetadata{TaskQueue: "bad' OR '1"},
-			wantErr: true,
-		},
-		{
-			name:    "unsafe deployment name is rejected",
-			meta:    temporalMetadata{TaskQueue: "orders", WorkerDeploymentName: "bad name", WorkerDeploymentBuildID: "v1"},
-			wantErr: true,
+			name: "custom port",
+			metadata: map[string]string{
+				"endpoint":          "test:7233",
+				"taskQueue":         "q",
+				"workerMetricsPort": "8080",
+			},
+			wantPort: 8080,
 		},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &temporalScaler{metadata: &tc.meta}
-			got, err := s.runningWorkflowCountQuery()
-			if tc.wantErr {
-				assert.Error(t, err)
-				return
-			}
-			assert.NoError(t, err)
-			assert.Equal(t, tc.want, got)
-		})
-	}
-}
 
-func TestIsActiveWithoutBacklogVersionStatus(t *testing.T) {
-	cases := []struct {
-		name   string
-		status enumspb.WorkerDeploymentVersionStatus
-		want   bool
-	}{
-		{"draining stays active without hitting visibility", enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_DRAINING, true},
-		{"drained scales down", enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_DRAINED, false},
-		{"inactive scales down", enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_INACTIVE, false},
-		{"unspecified scales down", enumspb.WORKER_DEPLOYMENT_VERSION_STATUS_UNSPECIFIED, false},
-	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &temporalScaler{
-				metadata: &temporalMetadata{TaskQueue: "orders", WorkerDeploymentName: "orders-svc", WorkerDeploymentBuildID: "v1"},
-				logger:   logger,
-			}
-			got := s.isActiveWithoutBacklog(context.Background(), true, tc.status)
-			assert.Equal(t, tc.want, got)
+			config := &scalersconfig.ScalerConfig{TriggerMetadata: tc.metadata}
+			meta, err := parseTemporalMetadata(config, logger)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.wantPort, meta.WorkerMetricsPort)
 		})
 	}
 }
@@ -639,6 +624,810 @@ func TestAuthType(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, authType(&tc.meta))
+		})
+	}
+}
+
+func TestParseUsedSlots(t *testing.T) {
+	// Slot scraping always filters to ActivityWorker only. WorkflowWorker slots
+	// reflect the Temporal SDK sticky cache (always >= 1 while worker is alive)
+	// and are not meaningful for scaling decisions.
+	activityOnly := map[string]bool{"ActivityWorker": true}
+
+	cases := []struct {
+		name      string
+		input     string
+		taskQueue string
+		want      int64
+		wantErr   bool
+	}{
+		{
+			name:      "counts only activity slots, ignores workflow and local",
+			taskQueue: "atlan-cosmos-production",
+			input: `# HELP temporal_worker_task_slots_used Current number of used slots per task type
+# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{namespace="default",service_name="temporal-core-sdk",task_queue="atlan-cosmos-production",worker_type="ActivityWorker"} 5
+temporal_worker_task_slots_used{namespace="default",service_name="temporal-core-sdk",task_queue="atlan-cosmos-production",worker_type="WorkflowWorker"} 1
+temporal_worker_task_slots_used{namespace="default",service_name="temporal-core-sdk",task_queue="atlan-cosmos-production",worker_type="LocalActivityWorker"} 0
+`,
+			want: 5,
+		},
+		{
+			name:      "no matching queue",
+			taskQueue: "atlan-redshift-production",
+			input: `# HELP temporal_worker_task_slots_used Current number of used slots per task type
+# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{namespace="default",service_name="temporal-core-sdk",task_queue="atlan-cosmos-production",worker_type="ActivityWorker"} 5
+`,
+			want: 0,
+		},
+		{
+			name:      "empty task queue matches all",
+			taskQueue: "",
+			input: `# HELP temporal_worker_task_slots_used Current number of used slots per task type
+# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{namespace="default",service_name="temporal-core-sdk",task_queue="atlan-cosmos-production",worker_type="ActivityWorker"} 3
+temporal_worker_task_slots_used{namespace="default",service_name="temporal-core-sdk",task_queue="atlan-other-production",worker_type="ActivityWorker"} 7
+`,
+			want: 10,
+		},
+		{
+			name:      "metric not present",
+			taskQueue: "q",
+			input: `# HELP some_other_metric A different metric
+# TYPE some_other_metric gauge
+some_other_metric{foo="bar"} 42
+`,
+			want: 0,
+		},
+		{
+			name:      "empty input",
+			taskQueue: "q",
+			input:     "",
+			want:      0,
+		},
+		{
+			name:      "multiple activity queues on same worker",
+			taskQueue: "atlan-cosmos-production",
+			input: `# HELP temporal_worker_task_slots_used Current number of used slots per task type
+# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{namespace="default",task_queue="atlan-cosmos-production",worker_type="ActivityWorker"} 4
+temporal_worker_task_slots_used{namespace="default",task_queue="atlan-cosmos-production",worker_type="WorkflowWorker"} 2
+temporal_worker_task_slots_used{namespace="default",task_queue="other-queue",worker_type="ActivityWorker"} 8
+`,
+			want: 4,
+		},
+		{
+			name:      "workflow sticky cache slot excluded from metric",
+			taskQueue: "atlan-redshift-production",
+			input: `# HELP temporal_worker_task_slots_used Current number of used slots per task type
+# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{namespace="default",task_queue="atlan-redshift-production",worker_type="ActivityWorker"} 0
+temporal_worker_task_slots_used{namespace="default",task_queue="atlan-redshift-production",worker_type="WorkflowWorker"} 1
+temporal_worker_task_slots_used{namespace="default",task_queue="atlan-redshift-production",worker_type="LocalActivityWorker"} 0
+`,
+			want: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := strings.NewReader(tc.input)
+			got, err := parseUsedSlots(r, tc.taskQueue, activityOnly)
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestParseSlots(t *testing.T) {
+	activityOnly := map[string]bool{"ActivityWorker": true}
+
+	cases := []struct {
+		name              string
+		input             string
+		taskQueue         string
+		wantUsed          int64
+		wantAvailable     int64
+		wantAvailableSeen bool
+	}{
+		{
+			name:      "real activity: used+available == max",
+			taskQueue: "atlan-publish-metastore",
+			input: `# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{task_queue="atlan-publish-metastore",worker_type="ActivityWorker"} 1
+# TYPE temporal_worker_task_slots_available gauge
+temporal_worker_task_slots_available{task_queue="atlan-publish-metastore",worker_type="ActivityWorker"} 5
+`,
+			wantUsed:          1,
+			wantAvailable:     5,
+			wantAvailableSeen: true,
+		},
+		{
+			name:      "phantom: used=1 while available still at max",
+			taskQueue: "atlan-publish-metastore",
+			input: `# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{task_queue="atlan-publish-metastore",worker_type="ActivityWorker"} 1
+# TYPE temporal_worker_task_slots_available gauge
+temporal_worker_task_slots_available{task_queue="atlan-publish-metastore",worker_type="ActivityWorker"} 6
+`,
+			wantUsed:          1,
+			wantAvailable:     6,
+			wantAvailableSeen: true,
+		},
+		{
+			name:      "available filtered to ActivityWorker + task queue",
+			taskQueue: "q",
+			input: `# TYPE temporal_worker_task_slots_available gauge
+temporal_worker_task_slots_available{task_queue="q",worker_type="ActivityWorker"} 4
+temporal_worker_task_slots_available{task_queue="q",worker_type="WorkflowWorker"} 100
+temporal_worker_task_slots_available{task_queue="other",worker_type="ActivityWorker"} 9
+`,
+			wantUsed:          0,
+			wantAvailable:     4,
+			wantAvailableSeen: true,
+		},
+		{
+			name:      "available gauge absent (older SDK)",
+			taskQueue: "q",
+			input: `# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{task_queue="q",worker_type="ActivityWorker"} 2
+`,
+			wantUsed:          2,
+			wantAvailable:     0,
+			wantAvailableSeen: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			used, available, availableSeen, err := parseSlots(strings.NewReader(tc.input), tc.taskQueue, activityOnly)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.wantUsed, used, "used")
+			assert.Equal(t, tc.wantAvailable, available, "available")
+			assert.Equal(t, tc.wantAvailableSeen, availableSeen, "availablePresent")
+		})
+	}
+}
+
+func TestEffectiveUsedSlots(t *testing.T) {
+	cases := []struct {
+		name             string
+		slotsPerWorker   int
+		used             int64
+		available        int64
+		availablePresent bool
+		want             int64
+	}{
+		{
+			name:           "limit unset falls back to raw used",
+			slotsPerWorker: 0,
+			used:           1, available: 6, availablePresent: true,
+			want: 1,
+		},
+		{
+			name:           "available absent falls back to raw used",
+			slotsPerWorker: 6,
+			used:           1, available: 0, availablePresent: false,
+			want: 1,
+		},
+		{
+			name:           "phantom discounted to zero (available at max)",
+			slotsPerWorker: 6,
+			used:           1, available: 6, availablePresent: true,
+			want: 0,
+		},
+		{
+			name:           "real single activity counted",
+			slotsPerWorker: 6,
+			used:           1, available: 5, availablePresent: true,
+			want: 1,
+		},
+		{
+			name:           "real multiple activities counted",
+			slotsPerWorker: 6,
+			used:           4, available: 2, availablePresent: true,
+			want: 4,
+		},
+		{
+			name:           "idle pod reports zero",
+			slotsPerWorker: 6,
+			used:           0, available: 6, availablePresent: true,
+			want: 0,
+		},
+		{
+			name:           "available above limit clamps to zero",
+			slotsPerWorker: 6,
+			used:           0, available: 7, availablePresent: true,
+			want: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &temporalScaler{metadata: &temporalMetadata{ActivitySlotsPerWorker: tc.slotsPerWorker}}
+			got := s.effectiveUsedSlots(tc.used, tc.available, tc.availablePresent)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// testServerPort extracts the host and port from an httptest.Server URL.
+func testServerPort(t *testing.T, srv *httptest.Server) (string, int) {
+	t.Helper()
+	host := strings.TrimPrefix(srv.URL, "http://")
+	parts := strings.Split(host, ":")
+	port, err := strconv.Atoi(parts[1])
+	if err != nil {
+		t.Fatalf("failed to parse test server port: %v", err)
+	}
+	return parts[0], port
+}
+
+// newFakeWorkerPod creates a running pod with the worker label and given IP.
+func newFakeWorkerPod(name, namespace, ip string) *corev1.Pod {
+	return newFakeWorkerPodWithBuildID(name, namespace, ip, "")
+}
+
+// newFakeWorkerPodWithBuildID creates a running worker pod and optionally
+// applies the upstream `temporal.io/build-id` label.
+func newFakeWorkerPodWithBuildID(name, namespace, ip, buildID string) *corev1.Pod {
+	labels := map[string]string{"app.kubernetes.io/component": "worker"}
+	if buildID != "" {
+		labels["temporal.io/build-id"] = buildID
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    labels,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: ip,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+}
+
+func TestGetUsedWorkerSlotsCacheFallback(t *testing.T) {
+	metricsBody := `# HELP temporal_worker_task_slots_used Current number of used slots per task type
+# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="ActivityWorker"} 3
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, metricsBody)
+	}))
+
+	ip, port := testServerPort(t, srv)
+	ns := "test-ns"
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	pod := newFakeWorkerPod("worker-0", ns, ip)
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pod).Build()
+
+	s := &temporalScaler{
+		metadata:     &temporalMetadata{TaskQueue: "q", WorkerMetricsPort: port},
+		httpClient:   srv.Client(),
+		kubeClient:   kubeClient,
+		logger:       logr.Discard(),
+		podNamespace: ns,
+	}
+
+	// First call: server is up, should scrape successfully and cache.
+	slots, err := s.getUsedWorkerSlots(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(3), slots)
+	assert.Equal(t, int64(3), s.lastSlots.value)
+
+	// Shut down server to simulate transient failure.
+	srv.Close()
+
+	// Second call: scrape fails, should fall back to cached value.
+	slots, err = s.getUsedWorkerSlots(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(3), slots)
+
+	// Expire the cache manually, should return 0.
+	s.slotsMu.Lock()
+	s.lastSlots.timestamp = time.Now().Add(-slotsCacheTTL - time.Second)
+	s.slotsMu.Unlock()
+
+	slots, err = s.getUsedWorkerSlots(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), slots)
+}
+
+// TestGetUsedWorkerSlotsBuildIDFilter locks down that a per-version ScaledObject
+// only sums slots from its own version's pods. Without the filter, two SOs
+// sharing a namespace would each see every version's pods and double-count the
+// slots term — the multi-version "5 workers for 1 workflow" over-count.
+func TestGetUsedWorkerSlotsBuildIDFilter(t *testing.T) {
+	// Each pod's metrics endpoint reports 7 used activity slots so the
+	// per-pod contribution is identical and the only thing that varies
+	// across cases is which pods the listing returns.
+	metricsBody := `# HELP temporal_worker_task_slots_used Current number of used slots per task type
+# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{namespace="default",task_queue="q",worker_type="ActivityWorker"} 7
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, metricsBody)
+	}))
+	defer srv.Close()
+	ip, port := testServerPort(t, srv)
+	ns := "test-ns"
+
+	cases := []struct {
+		name                    string
+		buildID                 string
+		workerDeploymentBuildID string
+		want                    int64
+	}{
+		{
+			name:    "legacy buildId filters out other versions' pods",
+			buildID: "v1",
+			want:    14, // 2 v1 pods * 7 slots
+		},
+		{
+			name:                    "workerDeploymentBuildId filters out other versions' pods",
+			workerDeploymentBuildID: "v1",
+			want:                    14,
+		},
+		{
+			name:                    "workerDeploymentBuildId takes precedence over legacy buildId",
+			buildID:                 "v2",
+			workerDeploymentBuildID: "v1",
+			want:                    14,
+		},
+		{
+			name: "unversioned scaler (no buildID) sums all worker pods",
+			want: 35, // 5 worker pods * 7 slots (2 v1 + 2 v2 + 1 unlabelled)
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			pods := []runtime.Object{
+				newFakeWorkerPodWithBuildID("v1-a", ns, ip, "v1"),
+				newFakeWorkerPodWithBuildID("v1-b", ns, ip, "v1"),
+				newFakeWorkerPodWithBuildID("v2-a", ns, ip, "v2"),
+				newFakeWorkerPodWithBuildID("v2-b", ns, ip, "v2"),
+				newFakeWorkerPod("unlabelled", ns, ip),
+			}
+			kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pods...).Build()
+			s := &temporalScaler{
+				metadata: &temporalMetadata{
+					TaskQueue:               "q",
+					WorkerMetricsPort:       port,
+					BuildID:                 tc.buildID,
+					WorkerDeploymentBuildID: tc.workerDeploymentBuildID,
+				},
+				httpClient:   srv.Client(),
+				kubeClient:   kubeClient,
+				logger:       logr.Discard(),
+				podNamespace: ns,
+			}
+			slots, err := s.getUsedWorkerSlots(context.Background())
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, slots)
+		})
+	}
+}
+
+func TestGetUsedWorkerSlotsTimeout(t *testing.T) {
+	// Server that takes too long to respond.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	}))
+	defer srv.Close()
+
+	ip, port := testServerPort(t, srv)
+	ns := "test-ns"
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	pod := newFakeWorkerPod("worker-0", ns, ip)
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pod).Build()
+
+	s := &temporalScaler{
+		metadata:     &temporalMetadata{TaskQueue: "q", WorkerMetricsPort: port},
+		httpClient:   srv.Client(),
+		kubeClient:   kubeClient,
+		logger:       logr.Discard(),
+		podNamespace: ns,
+	}
+
+	// Use a very short parent context timeout to trigger the scrape budget expiry.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// Should return 0 (scrape timed out, no cache).
+	slots, err := s.getUsedWorkerSlots(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), slots)
+}
+
+func TestComposeMetric(t *testing.T) {
+	tests := []struct {
+		name           string
+		backlog        int64
+		runningCount   int64
+		usedSlots      int64
+		slotsAvailable bool
+		gateOnWorkflow bool
+		want           int64
+	}{
+		// Gated (default, combined-pool) behaviour — slots count only when a
+		// workflow is running on the queue, suppressing ghost-flicker.
+		{name: "idle", backlog: 0, runningCount: 0, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: true, want: 0},
+		{name: "ghost flicker — slots without workflow ignored", backlog: 0, runningCount: 0, usedSlots: 1, slotsAvailable: true, gateOnWorkflow: true, want: 0},
+		{name: "ghost flicker (multi)", backlog: 0, runningCount: 0, usedSlots: 5, slotsAvailable: true, gateOnWorkflow: true, want: 0},
+		{name: "active workflow with many activities", backlog: 0, runningCount: 1, usedSlots: 50, slotsAvailable: true, gateOnWorkflow: true, want: 51},
+		{name: "active workflow + backlog + slots", backlog: 100, runningCount: 2, usedSlots: 8, slotsAvailable: true, gateOnWorkflow: true, want: 110},
+		{name: "backlog only", backlog: 25, runningCount: 0, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: true, want: 25},
+		{name: "backlog with ghost flicker", backlog: 7, runningCount: 0, usedSlots: 1, slotsAvailable: true, gateOnWorkflow: true, want: 7},
+		{name: "slots scrape failed, workflow running", backlog: 0, runningCount: 3, usedSlots: 99, slotsAvailable: false, gateOnWorkflow: true, want: 3},
+		{name: "slots scrape failed, no workflow", backlog: 4, runningCount: 0, usedSlots: 99, slotsAvailable: false, gateOnWorkflow: true, want: 4},
+		{name: "slots scrape failed with backlog and workflow", backlog: 10, runningCount: 2, usedSlots: 99, slotsAvailable: false, gateOnWorkflow: true, want: 12},
+
+		// Ungated (dedicated activity-pool) behaviour — slots count on their
+		// own, since the parent workflow runs on a different queue
+		// (runningCount is structurally 0 here).
+		{name: "dedicated pool: started activity keeps pool warm (the hang bug)", backlog: 0, runningCount: 0, usedSlots: 1, slotsAvailable: true, gateOnWorkflow: false, want: 1},
+		{name: "dedicated pool: multiple activities executing", backlog: 0, runningCount: 0, usedSlots: 4, slotsAvailable: true, gateOnWorkflow: false, want: 4},
+		{name: "dedicated pool: idle scales to zero even while a workflow runs elsewhere", backlog: 0, runningCount: 0, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: false, want: 0},
+		{name: "dedicated pool: queued activities count via backlog", backlog: 6, runningCount: 0, usedSlots: 0, slotsAvailable: true, gateOnWorkflow: false, want: 6},
+		{name: "dedicated pool: backlog + executing activities", backlog: 3, runningCount: 0, usedSlots: 2, slotsAvailable: true, gateOnWorkflow: false, want: 5},
+		{name: "dedicated pool: slots scrape failed falls back to backlog", backlog: 9, runningCount: 0, usedSlots: 99, slotsAvailable: false, gateOnWorkflow: false, want: 9},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := composeMetric(tc.backlog, tc.runningCount, tc.usedSlots, tc.slotsAvailable, tc.gateOnWorkflow)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestBuildRunningCountQuery covers the three modes of visibility-query
+// construction for CountWorkflowExecutions:
+//
+//  1. workerDeploymentName + workerDeploymentBuildID set →
+//     TemporalWorkerDeploymentVersion query (worker-deployment-versioning
+//     model, RECOMMENDED). Field names match upstream KEDA v2.20.1.
+//  2. buildID only → legacy BuildIds = 'versioned:<buildID>' query
+//     (older worker-versioning-rules model).
+//  3. Neither → task-queue-wide.
+func TestBuildRunningCountQuery(t *testing.T) {
+	tests := []struct {
+		name                    string
+		taskQueue               string
+		workerDeploymentName    string
+		workerDeploymentBuildID string
+		buildID                 string
+		want                    string
+	}{
+		{
+			name:      "no version fields — task-queue-wide query",
+			taskQueue: "my-task-queue",
+			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'my-task-queue'",
+		},
+		{
+			name:      "buildID set, no workerDeploymentName — legacy worker-versioning-rules path",
+			taskQueue: "my-task-queue",
+			buildID:   "main-abc123",
+			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'my-task-queue' AND BuildIds = 'versioned:main-abc123'",
+		},
+		{
+			name:                    "workerDeploymentName + workerDeploymentBuildID — worker-deployment-versioning path",
+			taskQueue:               "atlan-athena-production",
+			workerDeploymentName:    "athena-app/athena-worker-twd",
+			workerDeploymentBuildID: "main-3d1a552",
+			want:                    "ExecutionStatus = 'Running' AND TaskQueue = 'atlan-athena-production' AND TemporalWorkerDeploymentVersion = 'athena-app/athena-worker-twd:main-3d1a552'",
+		},
+		{
+			name:      "single quote in task queue is escaped",
+			taskQueue: "we'rd-queue",
+			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'we''rd-queue'",
+		},
+		{
+			name:      "single quote in buildID is escaped (legacy)",
+			taskQueue: "tq",
+			buildID:   "ver'1",
+			want:      "ExecutionStatus = 'Running' AND TaskQueue = 'tq' AND BuildIds = 'versioned:ver''1'",
+		},
+		{
+			name:                    "single quote in deployment + buildID escaped (worker-deployment-versioning)",
+			taskQueue:               "tq",
+			workerDeploymentName:    "ns/d'ep",
+			workerDeploymentBuildID: "v'1",
+			want:                    "ExecutionStatus = 'Running' AND TaskQueue = 'tq' AND TemporalWorkerDeploymentVersion = 'ns/d''ep:v''1'",
+		},
+		{
+			name:                 "workerDeploymentName without workerDeploymentBuildID — falls through to no-version (treat both required)",
+			taskQueue:            "tq",
+			workerDeploymentName: "ns/dep",
+			want:                 "ExecutionStatus = 'Running' AND TaskQueue = 'tq'",
+		},
+		{
+			name:                    "workerDeploymentBuildID without workerDeploymentName — falls through to no-version (treat both required)",
+			taskQueue:               "tq",
+			workerDeploymentBuildID: "main-3d1a552",
+			want:                    "ExecutionStatus = 'Running' AND TaskQueue = 'tq'",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildRunningCountQuery(tc.taskQueue, tc.workerDeploymentName, tc.workerDeploymentBuildID, tc.buildID)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestBacklogVersionID is the ARUN-1259 regression: the backlog query must name
+// the version's own bucket with the fully-qualified "<deployment>:<buildId>"
+// string. A bare build ID resolves to a legacy build-id-only physical queue --
+// a different, always-empty queue that the server additionally treats as an
+// unversioned describe, subtracting the Current version's backlog share instead
+// of merging it.
+func TestBacklogVersionID(t *testing.T) {
+	tests := []struct {
+		name                    string
+		workerDeploymentName    string
+		workerDeploymentBuildID string
+		buildID                 string
+		want                    string
+	}{
+		{
+			name:                    "worker deployment versioning: fully-qualified version string",
+			workerDeploymentName:    "automation-engine",
+			workerDeploymentBuildID: "main-bae9545",
+			want:                    "automation-engine:main-bae9545",
+		},
+		{
+			name:                    "TWC shape: legacy buildId unset, still qualified",
+			workerDeploymentName:    "atlan-publish-app",
+			workerDeploymentBuildID: "main-7cf3c9f",
+			buildID:                 "",
+			want:                    "atlan-publish-app:main-7cf3c9f",
+		},
+		{
+			name:    "legacy worker-versioning-rules: bare buildId passes through",
+			buildID: "main-bae9545",
+			want:    "main-bae9545",
+		},
+		{
+			name:                    "deployment name missing: not a version string, fall back to legacy",
+			workerDeploymentBuildID: "main-bae9545",
+			want:                    "",
+		},
+		{
+			name: "unversioned worker: no scoping",
+			want: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &temporalScaler{metadata: &temporalMetadata{
+				WorkerDeploymentName:    tc.workerDeploymentName,
+				WorkerDeploymentBuildID: tc.workerDeploymentBuildID,
+				BuildID:                 tc.buildID,
+			}}
+			assert.Equal(t, tc.want, s.backlogVersionID())
+		})
+	}
+}
+
+// TestBuildVersionSelection covers the selection wrapper, including the
+// non-Current/Ramping shape that used to fall through to a nil selection
+// because the gate only consulted the always-empty legacy BuildID field.
+func TestBuildVersionSelection(t *testing.T) {
+	tests := []struct {
+		name        string
+		allActive   bool
+		unversioned bool
+		versionID   string
+		want        *sdk.TaskQueueVersionSelection
+	}{
+		{
+			name: "no flags, no version: nil selection",
+			want: nil,
+		},
+		{
+			name:        "Current/Ramping SO",
+			allActive:   true,
+			unversioned: true,
+			versionID:   "automation-engine:main-bae9545",
+			want: &sdk.TaskQueueVersionSelection{
+				AllActive:   true,
+				Unversioned: true,
+				BuildIDs:    []string{"automation-engine:main-bae9545"},
+			},
+		},
+		{
+			name:      "non-Current SO: version alone, previously nil",
+			versionID: "automation-engine:main-bae9545",
+			want: &sdk.TaskQueueVersionSelection{
+				BuildIDs: []string{"automation-engine:main-bae9545"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, buildVersionSelection(tc.allActive, tc.unversioned, tc.versionID))
+		})
+	}
+}
+
+// TestGetQueueSizeNamesTheVersionBucket locks down the call site against the
+// exact fleet configuration: TWC emits workerDeploymentName +
+// workerDeploymentBuildId and never buildId, so the wire request must carry the
+// qualified version string and never "" or a bare build ID.
+func TestGetQueueSizeNamesTheVersionBucket(t *testing.T) {
+	s := &temporalScaler{metadata: &temporalMetadata{
+		AllActive:               true,
+		Unversioned:             true,
+		WorkerDeploymentName:    "automation-engine",
+		WorkerDeploymentBuildID: "main-bae9545",
+		BuildID:                 "",
+	}}
+	got := buildVersionSelection(s.metadata.AllActive, s.metadata.Unversioned, s.backlogVersionID())
+	assert.Equal(t, []string{"automation-engine:main-bae9545"}, got.BuildIDs,
+		"backlog query must name the deployment version's bucket, not the unversioned bucket or a bare build ID")
+	assert.NotEqual(t, s.workerBuildID(), got.BuildIDs[0],
+		"workerBuildID() is the pod-label form and must not be used to scope the Temporal query")
+}
+
+// taskQueueVersionInfo is the per-version entry DescribeTaskQueueEnhanced returns in
+// VersionsInfo. The SDK marks the type deprecated in favour of TaskQueueVersioningInfo, which
+// describes versioning rules rather than per-version stats, so it cannot build these fixtures.
+type taskQueueVersionInfo = sdk.TaskQueueVersionInfo //nolint:staticcheck // see above
+
+func TestGetCombinedBacklogCount(t *testing.T) {
+	bucket := func(types map[sdk.TaskQueueType]*sdk.TaskQueueStats) taskQueueVersionInfo {
+		info := taskQueueVersionInfo{TypesInfo: map[sdk.TaskQueueType]sdk.TaskQueueTypeInfo{}}
+		for tqType, stats := range types {
+			info.TypesInfo[tqType] = sdk.TaskQueueTypeInfo{Stats: stats}
+		}
+		return info
+	}
+
+	tests := []struct {
+		name     string
+		versions map[string]taskQueueVersionInfo
+		want     int64
+	}{
+		{
+			name: "counted backlog passes through",
+			versions: map[string]taskQueueVersionInfo{
+				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 3, ApproximateBacklogAge: 10 * time.Second},
+				}),
+			},
+			want: 3,
+		},
+		{
+			name: "aged backlog with a lost count reads as one task",
+			versions: map[string]taskQueueVersionInfo{
+				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 36 * time.Second},
+				}),
+			},
+			want: 1,
+		},
+		{
+			name: "empty bucket stays zero",
+			versions: map[string]taskQueueVersionInfo{
+				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 0},
+					sdk.TaskQueueTypeActivity: {},
+				}),
+			},
+			want: 0,
+		},
+		{
+			name: "floor applies per bucket, alongside counted buckets",
+			versions: map[string]taskQueueVersionInfo{
+				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 9 * time.Hour},
+					sdk.TaskQueueTypeActivity: {ApproximateBacklogCount: 2, ApproximateBacklogAge: time.Minute},
+				}),
+				"": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: {ApproximateBacklogCount: 0, ApproximateBacklogAge: 5 * time.Minute},
+				}),
+			},
+			want: 4,
+		},
+		{
+			name: "missing stats are skipped",
+			versions: map[string]taskQueueVersionInfo{
+				"app:main-1adb6ca": bucket(map[sdk.TaskQueueType]*sdk.TaskQueueStats{
+					sdk.TaskQueueTypeWorkflow: nil,
+				}),
+			},
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getCombinedBacklogCount(sdk.TaskQueueDescription{VersionsInfo: tt.versions}) //nolint:staticcheck // see taskQueueVersionInfo
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// describeOnlyClient serves DescribeTaskQueueEnhanced from a fixed response. Any
+// other sdk.Client method panics through the nil embedded interface.
+type describeOnlyClient struct {
+	sdk.Client
+	resp sdk.TaskQueueDescription
+}
+
+func (c *describeOnlyClient) DescribeTaskQueueEnhanced(context.Context, sdk.DescribeTaskQueueEnhancedOptions) (sdk.TaskQueueDescription, error) {
+	return c.resp, nil
+}
+
+func TestGetMetricsAndActivityLostBacklogCount(t *testing.T) {
+	version := "anomalo-app/anomalo-worker-twd:0.4.1"
+	describe := func(stats *sdk.TaskQueueStats) sdk.TaskQueueDescription {
+		return sdk.TaskQueueDescription{VersionsInfo: map[string]taskQueueVersionInfo{ //nolint:staticcheck // see taskQueueVersionInfo
+			version: {TypesInfo: map[sdk.TaskQueueType]sdk.TaskQueueTypeInfo{
+				sdk.TaskQueueTypeWorkflow: {Stats: stats},
+			}},
+		}}
+	}
+
+	tests := []struct {
+		name       string
+		stats      *sdk.TaskQueueStats
+		wantActive bool
+		wantValue  int64
+	}{
+		{
+			name:       "task waiting with a lost count wakes a scaled-to-zero pool",
+			stats:      &sdk.TaskQueueStats{ApproximateBacklogCount: 0, ApproximateBacklogAge: 36 * time.Second},
+			wantActive: true,
+			wantValue:  1,
+		},
+		{
+			name:       "empty queue stays inactive",
+			stats:      &sdk.TaskQueueStats{ApproximateBacklogCount: 0, ApproximateBacklogAge: 0},
+			wantActive: false,
+			wantValue:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &temporalScaler{
+				metadata: &temporalMetadata{
+					TaskQueue:                 "atlan-anomalo-production",
+					QueueTypes:                []string{"workflow"},
+					WorkerDeploymentName:      "anomalo-app/anomalo-worker-twd",
+					WorkerDeploymentBuildID:   "0.4.1",
+					AllActive:                 true,
+					Unversioned:               true,
+					TargetQueueSize:           100,
+					ActivationTargetQueueSize: 0,
+				},
+				tcl:    &describeOnlyClient{resp: describe(tt.stats)},
+				logger: logr.Discard(),
+			}
+
+			metrics, active, err := s.GetMetricsAndActivity(context.Background(), "s0-temporal-atlan-anomalo-production")
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantActive, active)
+			assert.Len(t, metrics, 1)
+			assert.Equal(t, tt.wantValue, metrics[0].Value.Value())
 		})
 	}
 }

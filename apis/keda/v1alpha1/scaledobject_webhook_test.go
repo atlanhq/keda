@@ -946,11 +946,12 @@ var _ = It("should validate the so creation when the name is at the label value 
 	}).ShouldNot(HaveOccurred())
 })
 
-var _ = It("shouldn't validate the so creation when no custom HPA name is set and the generated HPA name would exceed the label value limit", func() {
+// Atlan fork: a long derived HPA name is a warning, not a rejection (see verifyName).
+var _ = It("should validate the so creation when no custom HPA name is set and the generated HPA name would exceed the label value limit", func() {
 
 	namespaceName := "so-generated-hpa-too-long"
 	namespace := createNamespace(namespaceName)
-	// 55 chars: keda-hpa- prefix (9) + 55 = 64, overflows
+	// 55 chars: keda-hpa- prefix (9) + 55 = 64, over the label limit; admitted with a warning
 	longName := strings.Repeat("a", maxK8sLabelValueLength-len("keda-hpa-")+1)
 	so := createScaledObject(longName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
 
@@ -959,7 +960,7 @@ var _ = It("shouldn't validate the so creation when no custom HPA name is set an
 
 	Eventually(func() error {
 		return k8sClient.Create(context.Background(), so)
-	}).Should(HaveOccurred())
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("should validate the so creation when no custom HPA name is set and the generated HPA name fits within the label value limit", func() {
@@ -978,7 +979,8 @@ var _ = It("should validate the so creation when no custom HPA name is set and t
 	}).ShouldNot(HaveOccurred())
 })
 
-var _ = It("shouldn't validate the so update when removing the custom HPA name would make the generated HPA name exceed the label value limit", func() {
+// Atlan fork: dropping the custom HPA name is admitted with a warning (see verifyName).
+var _ = It("should validate the so update when removing the custom HPA name would make the generated HPA name exceed the label value limit", func() {
 
 	namespaceName := "so-update-remove-custom-hpa"
 	namespace := createNamespace(namespaceName)
@@ -995,7 +997,7 @@ var _ = It("shouldn't validate the so update when removing the custom HPA name w
 	so.Spec.Advanced.HorizontalPodAutoscalerConfig = nil
 	Eventually(func() error {
 		return k8sClient.Update(context.Background(), so)
-	}).Should(HaveOccurred())
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("shouldn't create so when stabilizationWindowSeconds exceeds 3600", func() {
