@@ -17,7 +17,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	sdk "go.temporal.io/sdk/client"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -1357,182 +1356,29 @@ func TestGetMetricsAndActivityLostBacklogCount(t *testing.T) {
 	}
 }
 
-// Container limits for a worker whose derived slots sit on the floor (16) and
-// one whose CPU term decides them (32).
-const (
-	smallWorkerCPU    = "500m"
-	smallWorkerMemory = "485283633"
-	largeWorkerCPU    = "1500m"
-	largeWorkerMemory = "2997516348"
-)
-
-type workerContainerOpts struct {
-	sdkVersion    string
-	cpu, memory   string
-	env           []corev1.EnvVar
-	envFrom       bool
-	sidecarFirst  bool
-	versionFromFn bool
-}
-
-func newSDKWorkerPod(name, namespace, ip, buildID string, o workerContainerOpts) *corev1.Pod {
-	pod := newFakeWorkerPodWithBuildID(name, namespace, ip, buildID)
-	worker := corev1.Container{Name: "app"}
-	if o.sdkVersion != "" {
-		v := corev1.EnvVar{Name: sdkVersionEnv, Value: o.sdkVersion}
-		if o.versionFromFn {
-			v = corev1.EnvVar{Name: sdkVersionEnv, ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['sdk']"},
-			}}
-		}
-		worker.Env = append(worker.Env, v)
-	}
-	worker.Env = append(worker.Env, o.env...)
-	if o.envFrom {
-		worker.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{
-			LocalObjectReference: corev1.LocalObjectReference{Name: "worker-env"},
-		}}}
-	}
-	limits := corev1.ResourceList{}
-	if o.cpu != "" {
-		limits[corev1.ResourceCPU] = resource.MustParse(o.cpu)
-	}
-	if o.memory != "" {
-		limits[corev1.ResourceMemory] = resource.MustParse(o.memory)
-	}
-	worker.Resources.Limits = limits
-	sidecar := corev1.Container{
-		Name: "daprd",
-		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("4"),
-			corev1.ResourceMemory: resource.MustParse("8Gi"),
-		}},
-	}
-	if o.sidecarFirst {
-		pod.Spec.Containers = []corev1.Container{sidecar, worker}
-	} else {
-		pod.Spec.Containers = []corev1.Container{worker, sidecar}
-	}
-	return pod
-}
-
-func TestDeriveActivitySlots(t *testing.T) {
-	cases := []struct {
-		name   string
-		cpu    string
-		memory string
-		want   int64
-	}{
-		{name: "half CPU, under 1GiB hits the floor", cpu: smallWorkerCPU, memory: smallWorkerMemory, want: 16},
-		{name: "1.5 CPU rounds down to one CPU", cpu: largeWorkerCPU, memory: largeWorkerMemory, want: 32},
-		{name: "memory bound", cpu: "3", memory: "2Gi", want: 32},
-		{name: "CPU bound", cpu: "2", memory: "8Gi", want: 64},
-		{name: "capped at 100", cpu: "8", memory: "16Gi", want: 100},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cpu, mem := resource.MustParse(tc.cpu), resource.MustParse(tc.memory)
-			assert.Equal(t, tc.want, deriveActivitySlots(cpu.MilliValue(), mem.Value()))
-		})
-	}
-}
-
-func TestDerivedActivitySlotLimit(t *testing.T) {
-	small := workerContainerOpts{sdkVersion: "3.56.0", cpu: smallWorkerCPU, memory: smallWorkerMemory}
-	with := func(o workerContainerOpts, f func(*workerContainerOpts)) workerContainerOpts {
-		f(&o)
-		return o
-	}
-	cases := []struct {
-		name   string
-		opts   workerContainerOpts
-		want   int64
-		wantOK bool
-	}{
-		{name: "small worker derives 16", opts: small, want: 16, wantOK: true},
-		{name: "large worker derives 32",
-			opts: workerContainerOpts{sdkVersion: "3.56.0", cpu: largeWorkerCPU, memory: largeWorkerMemory}, want: 32, wantOK: true},
-		{name: "v-prefixed version", opts: with(small, func(o *workerContainerOpts) { o.sdkVersion = "v3.56.0" }), want: 16, wantOK: true},
-		{name: "worker container found after a sidecar",
-			opts: with(small, func(o *workerContainerOpts) { o.sidecarFirst = true }), want: 16, wantOK: true},
-		{name: "explicit override wins",
-			opts: with(small, func(o *workerContainerOpts) {
-				o.env = []corev1.EnvVar{{Name: maxConcurrentActivitiesEnv, Value: "40"}}
-			}), want: 40, wantOK: true},
-		{name: "last override declaration wins",
-			opts: with(small, func(o *workerContainerOpts) {
-				o.env = []corev1.EnvVar{{Name: maxConcurrentActivitiesEnv, Value: "40"}, {Name: maxConcurrentActivitiesEnv, Value: "25"}}
-			}), want: 25, wantOK: true},
-		{name: "blank override derives",
-			opts: with(small, func(o *workerContainerOpts) {
-				o.env = []corev1.EnvVar{{Name: maxConcurrentActivitiesEnv, Value: " "}}
-			}), want: 16, wantOK: true},
-		{name: "explicit override is honoured with envFrom present",
-			opts: with(small, func(o *workerContainerOpts) {
-				o.envFrom = true
-				o.env = []corev1.EnvVar{{Name: maxConcurrentActivitiesEnv, Value: "40"}}
-			}), want: 40, wantOK: true},
-		{name: "override from valueFrom is unknown",
-			opts: with(small, func(o *workerContainerOpts) {
-				o.env = []corev1.EnvVar{{Name: maxConcurrentActivitiesEnv, ValueFrom: &corev1.EnvVarSource{
-					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{Key: "slots"},
-				}}}
-			})},
-		{name: "unparseable override",
-			opts: with(small, func(o *workerContainerOpts) {
-				o.env = []corev1.EnvVar{{Name: maxConcurrentActivitiesEnv, Value: "many"}}
-			})},
-		{name: "envFrom may carry the override", opts: with(small, func(o *workerContainerOpts) { o.envFrom = true })},
-		{name: "release that does not derive", opts: with(small, func(o *workerContainerOpts) { o.sdkVersion = "3.56.1" })},
-		{name: "release before derivation", opts: with(small, func(o *workerContainerOpts) { o.sdkVersion = "3.55.3" })},
-		{name: "no SDK version", opts: with(small, func(o *workerContainerOpts) { o.sdkVersion = "" })},
-		{name: "SDK version from valueFrom", opts: with(small, func(o *workerContainerOpts) { o.versionFromFn = true })},
-		{name: "no CPU limit", opts: with(small, func(o *workerContainerOpts) { o.cpu = "" })},
-		{name: "no memory limit", opts: with(small, func(o *workerContainerOpts) { o.memory = "" })},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := derivedActivitySlotLimit(newSDKWorkerPod("w", "ns", "10.0.0.1", "", tc.opts))
-			assert.Equal(t, tc.wantOK, ok)
-			assert.Equal(t, tc.want, got)
-		})
-	}
-}
-
 func TestResolveSlotLimit(t *testing.T) {
-	derivingPod := newSDKWorkerPod("w", "ns", "10.0.0.1", "",
-		workerContainerOpts{sdkVersion: "3.56.0", cpu: smallWorkerCPU, memory: smallWorkerMemory})
-	fixedPod := newSDKWorkerPod("w", "ns", "10.0.0.1", "",
-		workerContainerOpts{sdkVersion: "3.55.3", cpu: smallWorkerCPU, memory: smallWorkerMemory})
 	cases := []struct {
 		name       string
 		trigger    int
-		pod        *corev1.Pod
 		gauges     workerSlotGauges
 		wantLimit  int64
 		wantSource string
 	}{
-		{name: "no available gauge keeps raw used counting", trigger: 100, pod: derivingPod,
+		{name: "no available gauge keeps raw used counting", trigger: 100,
 			gauges: workerSlotGauges{used: 1}},
-		{name: "trigger unset keeps raw used counting", trigger: 0, pod: derivingPod,
+		{name: "trigger unset keeps raw used counting", trigger: 0,
 			gauges: workerSlotGauges{available: 16, availablePresent: true, limit: 16, limitPresent: true}},
-		{name: "worker gauge wins", trigger: 100, pod: derivingPod,
+		{name: "worker gauge wins", trigger: 100,
 			gauges:    workerSlotGauges{available: 20, availablePresent: true, limit: 24, limitPresent: true},
 			wantLimit: 24, wantSource: slotLimitFromWorkerGauge},
-		{name: "derived from pod spec", trigger: 100, pod: derivingPod,
+		{name: "no worker gauge uses trigger", trigger: 100,
 			gauges:    workerSlotGauges{available: 16, availablePresent: true},
-			wantLimit: 16, wantSource: slotLimitFromPodSpec},
-		{name: "derived limit below reported available is discarded", trigger: 100, pod: derivingPod,
-			gauges:    workerSlotGauges{available: 100, availablePresent: true},
-			wantLimit: 100, wantSource: slotLimitFromTrigger},
-		{name: "non-deriving release uses trigger", trigger: 100, pod: fixedPod,
-			gauges:    workerSlotGauges{available: 100, availablePresent: true},
 			wantLimit: 100, wantSource: slotLimitFromTrigger},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &temporalScaler{metadata: &temporalMetadata{ActivitySlotsPerWorker: tc.trigger}}
-			limit, source := s.resolveSlotLimit(tc.pod, tc.gauges)
+			limit, source := s.resolveSlotLimit(tc.gauges)
 			assert.Equal(t, tc.wantLimit, limit)
 			assert.Equal(t, tc.wantSource, source)
 		})
@@ -1568,16 +1414,22 @@ temporal_worker_task_slots_available{task_queue="q",worker_type="ActivityWorker"
 	assert.False(t, g.limitPresent, "a limit missing for some workers does not cover the summed available slots")
 }
 
-// TestGetUsedWorkerSlotsPerPodLimit drives the scrape loop with workers whose
-// SDK derived 16 activity slots while the trigger states 100: idle pods must
-// contribute nothing, and a pod running one activity must contribute one.
+// TestGetUsedWorkerSlotsPerPodLimit drives the scrape loop with workers running
+// 16 activity slots while the trigger states 100. Without a limit gauge, the
+// cap at used slots is what keeps idle pods at zero; with the gauge, the
+// phantom used slot is discounted too.
 func TestGetUsedWorkerSlotsPerPodLimit(t *testing.T) {
-	slotsBody := func(used, available int) string {
-		return fmt.Sprintf(`# TYPE temporal_worker_task_slots_used gauge
+	slotsBody := func(used, available int, limit string) string {
+		b := fmt.Sprintf(`# TYPE temporal_worker_task_slots_used gauge
 temporal_worker_task_slots_used{task_queue="q-od",worker_type="ActivityWorker"} %d
 # TYPE temporal_worker_task_slots_available gauge
 temporal_worker_task_slots_available{task_queue="q-od",worker_type="ActivityWorker"} %d
 `, used, available)
+		if limit != "" {
+			b += `# TYPE temporal_worker_activity_slots_limit gauge
+temporal_worker_activity_slots_limit{task_queue="q-od",worker_type="ActivityWorker"} ` + limit + "\n"
+		}
+		return b
 	}
 	var body atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1587,20 +1439,17 @@ temporal_worker_task_slots_available{task_queue="q-od",worker_type="ActivityWork
 	ip, port := testServerPort(t, srv)
 	ns := "test-ns"
 
-	deriving := workerContainerOpts{sdkVersion: "3.56.0", cpu: smallWorkerCPU, memory: smallWorkerMemory}
-	fixed := workerContainerOpts{sdkVersion: "3.55.3", cpu: smallWorkerCPU, memory: smallWorkerMemory}
-
 	cases := []struct {
 		name string
 		body string
-		opts workerContainerOpts
 		pods int
 		want int64
 	}{
-		{name: "idle derived-limit pods contribute nothing", body: slotsBody(0, 16), opts: deriving, pods: 3, want: 0},
-		{name: "phantom used on idle derived-limit pod is ignored", body: slotsBody(1, 16), opts: deriving, pods: 1, want: 0},
-		{name: "one running activity counts as one", body: slotsBody(1, 15), opts: deriving, pods: 1, want: 1},
-		{name: "fixed-limit release still counts against the trigger", body: slotsBody(1, 99), opts: fixed, pods: 1, want: 1},
+		{name: "idle pods without the gauge contribute nothing", body: slotsBody(0, 16, ""), pods: 3, want: 0},
+		{name: "one running activity without the gauge counts as one", body: slotsBody(1, 15, ""), pods: 1, want: 1},
+		{name: "phantom used slot without the gauge counts as one, not 84", body: slotsBody(1, 16, ""), pods: 1, want: 1},
+		{name: "phantom used slot with the gauge is discounted", body: slotsBody(1, 16, "16"), pods: 1, want: 0},
+		{name: "one running activity with the gauge counts as one", body: slotsBody(1, 15, "16"), pods: 1, want: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1609,7 +1458,7 @@ temporal_worker_task_slots_available{task_queue="q-od",worker_type="ActivityWork
 			_ = corev1.AddToScheme(scheme)
 			var objs []runtime.Object
 			for i := 0; i < tc.pods; i++ {
-				objs = append(objs, newSDKWorkerPod(fmt.Sprintf("od-%d", i), ns, ip, "b1", tc.opts))
+				objs = append(objs, newFakeWorkerPodWithBuildID(fmt.Sprintf("od-%d", i), ns, ip, "b1"))
 			}
 			s := &temporalScaler{
 				metadata: &temporalMetadata{

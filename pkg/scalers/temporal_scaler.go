@@ -52,35 +52,11 @@ const (
 	// gauges (task_queue, worker_type="ActivityWorker"). When a pod exports it,
 	// it is the authoritative limit for that pod.
 	workerActivitySlotsLimitMetric = "temporal_worker_activity_slots_limit"
-
-	// sdkVersionEnv and maxConcurrentActivitiesEnv are the worker-container
-	// env vars that carry the application SDK version and its explicit
-	// activity-slot override.
-	sdkVersionEnv              = "ATLAN_SDK_VERSION"
-	maxConcurrentActivitiesEnv = "TEMPORAL_MAX_CONCURRENT_ACTIVITIES"
-
-	// Factors of the application SDK's derived activity-slot default:
-	// min(cap, perCPU x whole CPUs, memory limit / bytesPerSlot), never below
-	// the floor. Whole CPUs are the CPU limit rounded down, never below 1.
-	derivedActivitySlotsCap          = 100
-	derivedActivitySlotsPerCPU       = 32
-	derivedActivitySlotsBytesPerSlot = 64 * 1024 * 1024
-	derivedActivitySlotsFloor        = 16
 )
-
-// sdkVersionsDerivingActivitySlots lists the application SDK releases that size
-// their activity slots from the container's limits and do not publish
-// workerActivitySlotsLimitMetric. Only pods on these versions get a limit
-// derived from their spec; every other version falls back to the trigger's
-// activitySlotsPerWorker. Releases that publish the gauge never need an entry.
-var sdkVersionsDerivingActivitySlots = map[string]bool{
-	"3.56.0": true,
-}
 
 // Sources a pod's activity-slot limit can be resolved from, in priority order.
 const (
 	slotLimitFromWorkerGauge = "worker_gauge"
-	slotLimitFromPodSpec     = "pod_spec"
 	slotLimitFromTrigger     = "trigger"
 )
 
@@ -314,10 +290,11 @@ func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
 // pod, and is the conservative direction.
 //
 // That residual ghost-flicker is what activitySlotsPerWorker eliminates: when
-// set, usedSlots arrives here already phantom-discounted (derived from
-// available, see effectiveUsedSlots), so a gate=false dedicated pool reports 0
-// when idle and actually scales to zero, while still going non-zero the instant
-// a real activity consumes a slot.
+// set, usedSlots arrives here derived from available and capped at used (see
+// effectiveUsedSlots). It is fully phantom-discounted when the limit matches the
+// one the pod runs with, which a pod's limit gauge guarantees, so a gate=false
+// dedicated pool reports 0 when idle and actually scales to zero, while still
+// going non-zero the instant a real activity consumes a slot.
 func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable, gateSlotsOnRunningWorkflow bool) int64 {
 	metric := backlog + runningCount
 	if slotsAvailable && (!gateSlotsOnRunningWorkflow || runningCount > 0) {
@@ -577,7 +554,7 @@ func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, pod *corev1.Pod)
 	if err != nil {
 		return 0, err
 	}
-	limit, source := s.resolveSlotLimit(pod, gauges)
+	limit, source := s.resolveSlotLimit(gauges)
 	occupied := effectiveUsedSlots(gauges.used, gauges.available, gauges.availablePresent, limit)
 	s.logger.V(1).Info("worker pod slots",
 		"pod", pod.Name, "used", gauges.used, "available", gauges.available,
@@ -638,19 +615,14 @@ func sumSlotFamily(family *dto.MetricFamily, taskQueue string, workerTypes map[s
 // slots are counted, when the trigger does not set activitySlotsPerWorker or the
 // pod does not export the available gauge the limit is compared against.
 //
-// A worker's limit is not one number per ScaledObject. The application SDK can
-// size a worker's slots from its container's CPU and memory limits, and a
-// vertical pod autoscaler rewrites those limits per pod, so pods of one version
-// can run with different limits. Each pod's limit is resolved in this order:
-//
-//  1. workerActivitySlotsLimitMetric, when the pod exports it.
-//  2. The SDK's derivation applied to the pod's own spec, for SDK releases
-//     that derive the limit without exporting the gauge (see
-//     derivedActivitySlotLimit). A pod reporting more available slots than the
-//     derived limit was configured some other way, so the derived value is
-//     discarded for it.
-//  3. The trigger's activitySlotsPerWorker.
-func (s *temporalScaler) resolveSlotLimit(pod *corev1.Pod, g workerSlotGauges) (int64, string) {
+// The worker is the only source of its own limit. Pods of one version can run
+// with different limits, because a worker may size its slots from its
+// container's resources and a vertical pod autoscaler sets those per pod, so
+// workerActivitySlotsLimitMetric, when the pod exports it, is that pod's limit.
+// Otherwise the trigger's activitySlotsPerWorker is used. Either way
+// effectiveUsedSlots caps the result at the pod's used slots, so a trigger value
+// above what the pod really runs with cannot count idle slots as occupied.
+func (s *temporalScaler) resolveSlotLimit(g workerSlotGauges) (int64, string) {
 	trigger := int64(s.metadata.ActivitySlotsPerWorker)
 	if trigger <= 0 || !g.availablePresent {
 		return 0, ""
@@ -658,92 +630,7 @@ func (s *temporalScaler) resolveSlotLimit(pod *corev1.Pod, g workerSlotGauges) (
 	if g.limitPresent && g.limit > 0 {
 		return g.limit, slotLimitFromWorkerGauge
 	}
-	if derived, ok := derivedActivitySlotLimit(pod); ok && g.available <= derived {
-		return derived, slotLimitFromPodSpec
-	}
 	return trigger, slotLimitFromTrigger
-}
-
-// derivedActivitySlotLimit reproduces the application SDK's activity-slot
-// resolution from a pod's spec, for SDK versions listed in
-// sdkVersionsDerivingActivitySlots: an explicit TEMPORAL_MAX_CONCURRENT_ACTIVITIES
-// wins, otherwise the limit is derived from the worker container's CPU and
-// memory limits. The SDK reads those limits from its cgroup once, at startup.
-// The spec matches them unless the pod has since been resized in place; a limit
-// derived too high is harmless on an idle pod because effectiveUsedSlots never
-// counts more than the pod's used slots.
-//
-// ok is false whenever the spec cannot say for certain what the worker chose:
-// no container carries a literal SDK version, the version is not listed, the
-// override comes from valueFrom/envFrom or does not parse, or a CPU or memory
-// limit is missing.
-func derivedActivitySlotLimit(pod *corev1.Pod) (limit int64, ok bool) {
-	c := sdkWorkerContainer(pod)
-	if c == nil {
-		return 0, false
-	}
-	version, _, _ := containerEnv(c, sdkVersionEnv)
-	if !sdkVersionsDerivingActivitySlots[strings.TrimPrefix(strings.TrimSpace(version), "v")] {
-		return 0, false
-	}
-
-	override, set, literal := containerEnv(c, maxConcurrentActivitiesEnv)
-	if set && !literal {
-		return 0, false
-	}
-	if override = strings.TrimSpace(override); override != "" {
-		n, err := strconv.ParseInt(override, 10, 64)
-		if err != nil || n <= 0 {
-			return 0, false
-		}
-		return n, true
-	}
-	if !set && len(c.EnvFrom) > 0 {
-		return 0, false
-	}
-
-	cpu, hasCPU := c.Resources.Limits[corev1.ResourceCPU]
-	mem, hasMem := c.Resources.Limits[corev1.ResourceMemory]
-	if !hasCPU || !hasMem || cpu.MilliValue() <= 0 || mem.Value() <= 0 {
-		return 0, false
-	}
-	return deriveActivitySlots(cpu.MilliValue(), mem.Value()), true
-}
-
-// deriveActivitySlots is the application SDK's derived activity-slot default for
-// a container with the given CPU (millicores) and memory (bytes) limits.
-func deriveActivitySlots(cpuMilli, memoryBytes int64) int64 {
-	cpus := cpuMilli / 1000
-	if cpus < 1 {
-		cpus = 1
-	}
-	slots := min(int64(derivedActivitySlotsCap), cpus*derivedActivitySlotsPerCPU)
-	slots = min(slots, memoryBytes/derivedActivitySlotsBytesPerSlot)
-	return max(int64(derivedActivitySlotsFloor), slots)
-}
-
-// sdkWorkerContainer returns the container running the application SDK worker:
-// the first one that declares ATLAN_SDK_VERSION with a literal value. Sidecars
-// do not carry it.
-func sdkWorkerContainer(pod *corev1.Pod) *corev1.Container {
-	for i := range pod.Spec.Containers {
-		if v, set, literal := containerEnv(&pod.Spec.Containers[i], sdkVersionEnv); set && literal && strings.TrimSpace(v) != "" {
-			return &pod.Spec.Containers[i]
-		}
-	}
-	return nil
-}
-
-// containerEnv looks up an env var declared in the container's env list. The
-// last declaration wins, as it does in the kubelet. literal is false when the
-// value comes from valueFrom and so cannot be read from the spec.
-func containerEnv(c *corev1.Container, name string) (value string, set bool, literal bool) {
-	for _, e := range c.Env {
-		if e.Name == name {
-			value, set, literal = e.Value, true, e.ValueFrom == nil
-		}
-	}
-	return value, set, literal
 }
 
 // effectiveUsedSlots converts a pod's raw slot gauges into the number of slots
