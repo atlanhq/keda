@@ -46,6 +46,42 @@ const (
 	// Version. Temporal bans this character in deployment names, so the string is
 	// unambiguous without escaping.
 	workerDeploymentVersionSeparator = ":"
+
+	// workerActivitySlotsLimitMetric is the gauge a worker publishes with the
+	// activity-slot limit it is running with, labelled like the core slot
+	// gauges (task_queue, worker_type="ActivityWorker"). When a pod exports it,
+	// it is the authoritative limit for that pod.
+	workerActivitySlotsLimitMetric = "temporal_worker_activity_slots_limit"
+
+	// sdkVersionEnv and maxConcurrentActivitiesEnv are the worker-container
+	// env vars that carry the application SDK version and its explicit
+	// activity-slot override.
+	sdkVersionEnv              = "ATLAN_SDK_VERSION"
+	maxConcurrentActivitiesEnv = "TEMPORAL_MAX_CONCURRENT_ACTIVITIES"
+
+	// Factors of the application SDK's derived activity-slot default:
+	// min(cap, perCPU x whole CPUs, memory limit / bytesPerSlot), never below
+	// the floor. Whole CPUs are the CPU limit rounded down, never below 1.
+	derivedActivitySlotsCap          = 100
+	derivedActivitySlotsPerCPU       = 32
+	derivedActivitySlotsBytesPerSlot = 64 * 1024 * 1024
+	derivedActivitySlotsFloor        = 16
+)
+
+// sdkVersionsDerivingActivitySlots lists the application SDK releases that size
+// their activity slots from the container's limits and do not publish
+// workerActivitySlotsLimitMetric. Only pods on these versions get a limit
+// derived from their spec; every other version falls back to the trigger's
+// activitySlotsPerWorker. Releases that publish the gauge never need an entry.
+var sdkVersionsDerivingActivitySlots = map[string]bool{
+	"3.56.0": true,
+}
+
+// Sources a pod's activity-slot limit can be resolved from, in priority order.
+const (
+	slotLimitFromWorkerGauge = "worker_gauge"
+	slotLimitFromPodSpec     = "pod_spec"
+	slotLimitFromTrigger     = "trigger"
 )
 
 var (
@@ -356,8 +392,8 @@ func (s *temporalScaler) getRunningWorkflowCount(ctx context.Context) (int64, er
 }
 
 // getUsedWorkerSlots discovers worker pods in the ScaledObject's namespace and
-// scrapes their Prometheus metrics endpoint to sum temporal_worker_task_slots_used
-// for worker types matching the configured queueTypes. This prevents premature
+// scrapes their Prometheus metrics endpoint to sum the activity slots occupied
+// on each pod (see scrapeWorkerSlots). This prevents premature
 // scale-down when workers are actively executing tasks but the task queue backlog
 // is empty.
 //
@@ -411,7 +447,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 		}
 
 		attemptedCount++
-		slots, err := s.scrapeWorkerSlots(scrapeCtx, pod.Status.PodIP)
+		slots, err := s.scrapeWorkerSlots(scrapeCtx, pod)
 		if err != nil {
 			s.logger.Info("failed to scrape worker pod metrics, skipping",
 				"pod", pod.Name, "ip", pod.Status.PodIP, "error", err)
@@ -514,11 +550,11 @@ func buildVersionSelection(allActive, unversioned bool, versionID string) *sdk.T
 	}
 }
 
-// scrapeWorkerSlots fetches Prometheus metrics from a single worker pod and returns
-// the sum of temporal_worker_task_slots_used for worker types matching the
-// configured queueTypes and task queue.
-func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, podIP string) (int64, error) {
-	hostPort := net.JoinHostPort(podIP, strconv.Itoa(s.metadata.WorkerMetricsPort))
+// scrapeWorkerSlots fetches Prometheus metrics from a single worker pod and
+// returns the number of activity slots actually occupied on it for the
+// configured task queue.
+func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, pod *corev1.Pod) (int64, error) {
+	hostPort := net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(s.metadata.WorkerMetricsPort))
 	url := fmt.Sprintf("http://%s/metrics", hostPort)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -537,52 +573,177 @@ func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, podIP string) (i
 
 	limitedBody := io.LimitReader(resp.Body, maxMetricsResponseBytes)
 	activityOnly := map[string]bool{"ActivityWorker": true}
-	used, available, availablePresent, err := parseSlots(limitedBody, s.metadata.TaskQueue, activityOnly)
+	gauges, err := parseWorkerSlotGauges(limitedBody, s.metadata.TaskQueue, activityOnly)
 	if err != nil {
 		return 0, err
 	}
-	return s.effectiveUsedSlots(used, available, availablePresent), nil
+	limit, source := s.resolveSlotLimit(pod, gauges)
+	occupied := effectiveUsedSlots(gauges.used, gauges.available, gauges.availablePresent, limit)
+	s.logger.V(1).Info("worker pod slots",
+		"pod", pod.Name, "used", gauges.used, "available", gauges.available,
+		"limit", limit, "limitSource", source, "occupied", occupied)
+	return occupied, nil
 }
 
-// parseSlots parses Prometheus text format and returns the summed
-// temporal_worker_task_slots_used and temporal_worker_task_slots_available for
-// the worker types matching the task queue. availablePresent reports whether
-// the available gauge was actually exported for a matching series (older SDKs
-// may not emit it), so callers can fall back to raw used-slots when it is
-// missing.
-func parseSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) (used int64, available int64, availablePresent bool, err error) {
+// workerSlotGauges holds one pod's activity-slot gauges, summed across the
+// series matching the task queue and worker type. The *Present flags tell an
+// absent gauge apart from one that is present and zero.
+type workerSlotGauges struct {
+	used             int64
+	available        int64
+	availablePresent bool
+	limit            int64
+	// limitPresent is true only when every series reporting available slots
+	// also reports a limit, so limit and available cover the same workers.
+	limitPresent bool
+}
+
+// parseWorkerSlotGauges parses Prometheus text format and returns the slot
+// gauges for the worker types matching the task queue.
+func parseWorkerSlotGauges(r io.Reader, taskQueue string, workerTypes map[string]bool) (workerSlotGauges, error) {
 	var parser expfmt.TextParser
 	families, err := parser.TextToMetricFamilies(r)
 	if err != nil {
-		return 0, 0, false, fmt.Errorf("parse prometheus metrics: %w", err)
+		return workerSlotGauges{}, fmt.Errorf("parse prometheus metrics: %w", err)
 	}
 
-	used, _ = sumSlotFamily(families["temporal_worker_task_slots_used"], taskQueue, workerTypes)
-	available, availablePresent = sumSlotFamily(families["temporal_worker_task_slots_available"], taskQueue, workerTypes)
-	return used, available, availablePresent, nil
+	var g workerSlotGauges
+	var availableSeries, limitSeries int
+	g.used, _ = sumSlotFamily(families["temporal_worker_task_slots_used"], taskQueue, workerTypes)
+	g.available, availableSeries = sumSlotFamily(families["temporal_worker_task_slots_available"], taskQueue, workerTypes)
+	g.limit, limitSeries = sumSlotFamily(families[workerActivitySlotsLimitMetric], taskQueue, workerTypes)
+	g.availablePresent = availableSeries > 0
+	g.limitPresent = limitSeries > 0 && limitSeries == availableSeries
+	return g, nil
 }
 
 // sumSlotFamily sums the gauge values of a slot metric family across the metrics
-// whose worker_type and task_queue match. found reports whether at least one
-// matching series existed (distinguishing "absent" from "present and zero").
-func sumSlotFamily(family *dto.MetricFamily, taskQueue string, workerTypes map[string]bool) (sum int64, found bool) {
+// whose worker_type and task_queue match. series is how many matched, which
+// distinguishes "absent" (0) from "present and zero".
+func sumSlotFamily(family *dto.MetricFamily, taskQueue string, workerTypes map[string]bool) (sum int64, series int) {
 	if family == nil {
-		return 0, false
+		return 0, 0
 	}
 	for _, m := range family.GetMetric() {
 		if matchesWorkerSlot(m, taskQueue, workerTypes) {
 			sum += int64(m.GetGauge().GetValue())
-			found = true
+			series++
 		}
 	}
-	return sum, found
+	return sum, series
 }
 
-// parseUsedSlots returns only the summed used-slots gauge. Retained as a thin
-// wrapper over parseSlots for callers/tests that only need the raw used value.
-func parseUsedSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) (int64, error) {
-	used, _, _, err := parseSlots(r, taskQueue, workerTypes)
-	return used, err
+// resolveSlotLimit returns the activity-slot limit to count one pod's
+// occupancy against, and where it came from. It returns 0, meaning raw used
+// slots are counted, when the trigger does not set activitySlotsPerWorker or the
+// pod does not export the available gauge the limit is compared against.
+//
+// A worker's limit is not one number per ScaledObject. The application SDK can
+// size a worker's slots from its container's CPU and memory limits, and a
+// vertical pod autoscaler rewrites those limits per pod, so pods of one version
+// can run with different limits. Each pod's limit is resolved in this order:
+//
+//  1. workerActivitySlotsLimitMetric, when the pod exports it.
+//  2. The SDK's derivation applied to the pod's own spec, for SDK releases
+//     that derive the limit without exporting the gauge (see
+//     derivedActivitySlotLimit). A pod reporting more available slots than the
+//     derived limit was configured some other way, so the derived value is
+//     discarded for it.
+//  3. The trigger's activitySlotsPerWorker.
+func (s *temporalScaler) resolveSlotLimit(pod *corev1.Pod, g workerSlotGauges) (int64, string) {
+	trigger := int64(s.metadata.ActivitySlotsPerWorker)
+	if trigger <= 0 || !g.availablePresent {
+		return 0, ""
+	}
+	if g.limitPresent && g.limit > 0 {
+		return g.limit, slotLimitFromWorkerGauge
+	}
+	if derived, ok := derivedActivitySlotLimit(pod); ok && g.available <= derived {
+		return derived, slotLimitFromPodSpec
+	}
+	return trigger, slotLimitFromTrigger
+}
+
+// derivedActivitySlotLimit reproduces the application SDK's activity-slot
+// resolution from a pod's spec, for SDK versions listed in
+// sdkVersionsDerivingActivitySlots: an explicit TEMPORAL_MAX_CONCURRENT_ACTIVITIES
+// wins, otherwise the limit is derived from the worker container's CPU and
+// memory limits. The SDK reads those limits from its cgroup once, at startup.
+// The spec matches them unless the pod has since been resized in place; a limit
+// derived too high is harmless on an idle pod because effectiveUsedSlots never
+// counts more than the pod's used slots.
+//
+// ok is false whenever the spec cannot say for certain what the worker chose:
+// no container carries a literal SDK version, the version is not listed, the
+// override comes from valueFrom/envFrom or does not parse, or a CPU or memory
+// limit is missing.
+func derivedActivitySlotLimit(pod *corev1.Pod) (limit int64, ok bool) {
+	c := sdkWorkerContainer(pod)
+	if c == nil {
+		return 0, false
+	}
+	version, _, _ := containerEnv(c, sdkVersionEnv)
+	if !sdkVersionsDerivingActivitySlots[strings.TrimPrefix(strings.TrimSpace(version), "v")] {
+		return 0, false
+	}
+
+	override, set, literal := containerEnv(c, maxConcurrentActivitiesEnv)
+	if set && !literal {
+		return 0, false
+	}
+	if override = strings.TrimSpace(override); override != "" {
+		n, err := strconv.ParseInt(override, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, false
+		}
+		return n, true
+	}
+	if !set && len(c.EnvFrom) > 0 {
+		return 0, false
+	}
+
+	cpu, hasCPU := c.Resources.Limits[corev1.ResourceCPU]
+	mem, hasMem := c.Resources.Limits[corev1.ResourceMemory]
+	if !hasCPU || !hasMem || cpu.MilliValue() <= 0 || mem.Value() <= 0 {
+		return 0, false
+	}
+	return deriveActivitySlots(cpu.MilliValue(), mem.Value()), true
+}
+
+// deriveActivitySlots is the application SDK's derived activity-slot default for
+// a container with the given CPU (millicores) and memory (bytes) limits.
+func deriveActivitySlots(cpuMilli, memoryBytes int64) int64 {
+	cpus := cpuMilli / 1000
+	if cpus < 1 {
+		cpus = 1
+	}
+	slots := min(int64(derivedActivitySlotsCap), cpus*derivedActivitySlotsPerCPU)
+	slots = min(slots, memoryBytes/derivedActivitySlotsBytesPerSlot)
+	return max(int64(derivedActivitySlotsFloor), slots)
+}
+
+// sdkWorkerContainer returns the container running the application SDK worker:
+// the first one that declares ATLAN_SDK_VERSION with a literal value. Sidecars
+// do not carry it.
+func sdkWorkerContainer(pod *corev1.Pod) *corev1.Container {
+	for i := range pod.Spec.Containers {
+		if v, set, literal := containerEnv(&pod.Spec.Containers[i], sdkVersionEnv); set && literal && strings.TrimSpace(v) != "" {
+			return &pod.Spec.Containers[i]
+		}
+	}
+	return nil
+}
+
+// containerEnv looks up an env var declared in the container's env list. The
+// last declaration wins, as it does in the kubelet. literal is false when the
+// value comes from valueFrom and so cannot be read from the spec.
+func containerEnv(c *corev1.Container, name string) (value string, set bool, literal bool) {
+	for _, e := range c.Env {
+		if e.Name == name {
+			value, set, literal = e.Value, true, e.ValueFrom == nil
+		}
+	}
+	return value, set, literal
 }
 
 // effectiveUsedSlots converts a pod's raw slot gauges into the number of slots
@@ -597,28 +758,24 @@ func parseUsedSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) 
 // pinning a dedicated on-demand pool at one pod per tenant 24/7.
 //
 // `available` is NOT corrupted by the bug: a genuinely running activity
-// decrements it, the phantom does not. So when the per-worker activity-slot
-// limit is known (activitySlotsPerWorker, set to the worker's
-// maxConcurrentActivities), the honest occupancy is max(0, limit - available):
+// decrements it, the phantom does not. So when the pod's activity-slot limit is
+// known (see resolveSlotLimit), the honest occupancy is max(0, limit - available):
 //
 //	real activity  -> available < limit -> > 0  (pod kept warm)
 //	phantom / idle -> available == limit -> 0   (pool free to drain)
 //
+// The result never exceeds raw `used`: the phantom only adds to `used`, so real
+// occupancy cannot be higher. That bounds the damage of a limit set above the
+// one the pod runs with, which would otherwise read every idle slot beyond the
+// real limit as occupied and hold an idle version at its maximum replica count.
+//
 // When the limit is unset (0) or the available gauge is absent, it falls back
 // to raw `used` so existing ScaledObjects are unaffected.
-func (s *temporalScaler) effectiveUsedSlots(used, available int64, availablePresent bool) int64 {
-	limit := int64(s.metadata.ActivitySlotsPerWorker)
+func effectiveUsedSlots(used, available int64, availablePresent bool, limit int64) int64 {
 	if limit <= 0 || !availablePresent {
 		return used
 	}
-	realUsed := limit - available
-	if realUsed < 0 {
-		realUsed = 0
-	}
-	if realUsed > limit {
-		realUsed = limit
-	}
-	return realUsed
+	return max(0, min(limit-available, limit, used))
 }
 
 // matchesWorkerSlot returns true if the metric's worker_type is in the allowed set
