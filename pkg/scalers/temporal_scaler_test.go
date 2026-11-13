@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -713,13 +714,13 @@ temporal_worker_task_slots_used{namespace="default",task_queue="atlan-redshift-p
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := strings.NewReader(tc.input)
-			got, err := parseUsedSlots(r, tc.taskQueue, activityOnly)
+			g, err := parseWorkerSlotGauges(r, tc.taskQueue, activityOnly)
 			if tc.wantErr {
 				assert.Error(t, err)
 				return
 			}
 			assert.NoError(t, err)
-			assert.Equal(t, tc.want, got)
+			assert.Equal(t, tc.want, g.used)
 		})
 	}
 }
@@ -785,11 +786,11 @@ temporal_worker_task_slots_used{task_queue="q",worker_type="ActivityWorker"} 2
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			used, available, availableSeen, err := parseSlots(strings.NewReader(tc.input), tc.taskQueue, activityOnly)
+			g, err := parseWorkerSlotGauges(strings.NewReader(tc.input), tc.taskQueue, activityOnly)
 			assert.NoError(t, err)
-			assert.Equal(t, tc.wantUsed, used, "used")
-			assert.Equal(t, tc.wantAvailable, available, "available")
-			assert.Equal(t, tc.wantAvailableSeen, availableSeen, "availablePresent")
+			assert.Equal(t, tc.wantUsed, g.used, "used")
+			assert.Equal(t, tc.wantAvailable, g.available, "available")
+			assert.Equal(t, tc.wantAvailableSeen, g.availablePresent, "availablePresent")
 		})
 	}
 }
@@ -840,6 +841,18 @@ func TestEffectiveUsedSlots(t *testing.T) {
 			want: 0,
 		},
 		{
+			name:           "limit above the real one cannot count idle slots",
+			slotsPerWorker: 100,
+			used:           0, available: 16, availablePresent: true,
+			want: 0,
+		},
+		{
+			name:           "limit above the real one counts at most the used slots",
+			slotsPerWorker: 100,
+			used:           2, available: 14, availablePresent: true,
+			want: 2,
+		},
+		{
 			name:           "available above limit clamps to zero",
 			slotsPerWorker: 6,
 			used:           0, available: 7, availablePresent: true,
@@ -849,8 +862,7 @@ func TestEffectiveUsedSlots(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &temporalScaler{metadata: &temporalMetadata{ActivitySlotsPerWorker: tc.slotsPerWorker}}
-			got := s.effectiveUsedSlots(tc.used, tc.available, tc.availablePresent)
+			got := effectiveUsedSlots(tc.used, tc.available, tc.availablePresent, int64(tc.slotsPerWorker))
 			assert.Equal(t, tc.want, got)
 		})
 	}
@@ -1428,6 +1440,129 @@ func TestGetMetricsAndActivityLostBacklogCount(t *testing.T) {
 			assert.Equal(t, tt.wantActive, active)
 			assert.Len(t, metrics, 1)
 			assert.Equal(t, tt.wantValue, metrics[0].Value.Value())
+		})
+	}
+}
+
+func TestResolveSlotLimit(t *testing.T) {
+	cases := []struct {
+		name       string
+		trigger    int
+		gauges     workerSlotGauges
+		wantLimit  int64
+		wantSource string
+	}{
+		{name: "no available gauge keeps raw used counting", trigger: 100,
+			gauges: workerSlotGauges{used: 1}},
+		{name: "trigger unset keeps raw used counting", trigger: 0,
+			gauges: workerSlotGauges{available: 16, availablePresent: true, limit: 16, limitPresent: true}},
+		{name: "worker gauge wins", trigger: 100,
+			gauges:    workerSlotGauges{available: 20, availablePresent: true, limit: 24, limitPresent: true},
+			wantLimit: 24, wantSource: slotLimitFromWorkerGauge},
+		{name: "no worker gauge uses trigger", trigger: 100,
+			gauges:    workerSlotGauges{available: 16, availablePresent: true},
+			wantLimit: 100, wantSource: slotLimitFromTrigger},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &temporalScaler{metadata: &temporalMetadata{ActivitySlotsPerWorker: tc.trigger}}
+			limit, source := s.resolveSlotLimit(tc.gauges)
+			assert.Equal(t, tc.wantLimit, limit)
+			assert.Equal(t, tc.wantSource, source)
+		})
+	}
+}
+
+func TestParseWorkerSlotGaugesLimit(t *testing.T) {
+	body := `# TYPE temporal_worker_activity_slots_limit gauge
+temporal_worker_activity_slots_limit{task_queue="q",worker_type="ActivityWorker"} 24
+temporal_worker_activity_slots_limit{task_queue="other",worker_type="ActivityWorker"} 50
+# TYPE temporal_worker_task_slots_available gauge
+temporal_worker_task_slots_available{task_queue="q",worker_type="ActivityWorker"} 20
+`
+	activityOnly := map[string]bool{"ActivityWorker": true}
+	g, err := parseWorkerSlotGauges(strings.NewReader(body), "q", activityOnly)
+	assert.NoError(t, err)
+	assert.True(t, g.limitPresent)
+	assert.Equal(t, int64(24), g.limit)
+	assert.Equal(t, int64(20), g.available)
+
+	g, err = parseWorkerSlotGauges(strings.NewReader(body), "absent", activityOnly)
+	assert.NoError(t, err)
+	assert.False(t, g.limitPresent)
+
+	partial := `# TYPE temporal_worker_activity_slots_limit gauge
+temporal_worker_activity_slots_limit{task_queue="q",worker_type="ActivityWorker",worker="a"} 16
+# TYPE temporal_worker_task_slots_available gauge
+temporal_worker_task_slots_available{task_queue="q",worker_type="ActivityWorker",worker="a"} 16
+temporal_worker_task_slots_available{task_queue="q",worker_type="ActivityWorker",worker="b"} 90
+`
+	g, err = parseWorkerSlotGauges(strings.NewReader(partial), "q", activityOnly)
+	assert.NoError(t, err)
+	assert.False(t, g.limitPresent, "a limit missing for some workers does not cover the summed available slots")
+}
+
+// TestGetUsedWorkerSlotsPerPodLimit drives the scrape loop with workers running
+// 16 activity slots while the trigger states 100. Without a limit gauge, the
+// cap at used slots is what keeps idle pods at zero; with the gauge, the
+// phantom used slot is discounted too.
+func TestGetUsedWorkerSlotsPerPodLimit(t *testing.T) {
+	slotsBody := func(used, available int, limit string) string {
+		b := fmt.Sprintf(`# TYPE temporal_worker_task_slots_used gauge
+temporal_worker_task_slots_used{task_queue="q-od",worker_type="ActivityWorker"} %d
+# TYPE temporal_worker_task_slots_available gauge
+temporal_worker_task_slots_available{task_queue="q-od",worker_type="ActivityWorker"} %d
+`, used, available)
+		if limit != "" {
+			b += `# TYPE temporal_worker_activity_slots_limit gauge
+temporal_worker_activity_slots_limit{task_queue="q-od",worker_type="ActivityWorker"} ` + limit + "\n"
+		}
+		return b
+	}
+	var body atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, body.Load())
+	}))
+	defer srv.Close()
+	ip, port := testServerPort(t, srv)
+	ns := "test-ns"
+
+	cases := []struct {
+		name string
+		body string
+		pods int
+		want int64
+	}{
+		{name: "idle pods without the gauge contribute nothing", body: slotsBody(0, 16, ""), pods: 3, want: 0},
+		{name: "one running activity without the gauge counts as one", body: slotsBody(1, 15, ""), pods: 1, want: 1},
+		{name: "phantom used slot without the gauge counts as one, not 84", body: slotsBody(1, 16, ""), pods: 1, want: 1},
+		{name: "phantom used slot with the gauge is discounted", body: slotsBody(1, 16, "16"), pods: 1, want: 0},
+		{name: "one running activity with the gauge counts as one", body: slotsBody(1, 15, "16"), pods: 1, want: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body.Store(tc.body)
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			var objs []runtime.Object
+			for i := 0; i < tc.pods; i++ {
+				objs = append(objs, newFakeWorkerPodWithBuildID(fmt.Sprintf("od-%d", i), ns, ip, "b1"))
+			}
+			s := &temporalScaler{
+				metadata: &temporalMetadata{
+					TaskQueue:               "q-od",
+					WorkerMetricsPort:       port,
+					WorkerDeploymentBuildID: "b1",
+					ActivitySlotsPerWorker:  100,
+				},
+				httpClient:   srv.Client(),
+				kubeClient:   fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build(),
+				logger:       logr.Discard(),
+				podNamespace: ns,
+			}
+			slots, err := s.getUsedWorkerSlots(context.Background())
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, slots)
 		})
 	}
 }
