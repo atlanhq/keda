@@ -49,6 +49,18 @@ const (
 	// Version. Temporal bans this character in deployment names, so the string is
 	// unambiguous without escaping.
 	workerDeploymentVersionSeparator = ":"
+
+	// workerActivitySlotsLimitMetric is the gauge a worker publishes with the
+	// activity-slot limit it is running with, labelled like the core slot
+	// gauges (task_queue, worker_type="ActivityWorker"). When a pod exports it,
+	// it is the authoritative limit for that pod.
+	workerActivitySlotsLimitMetric = "temporal_worker_activity_slots_limit"
+)
+
+// Sources a pod's activity-slot limit can be resolved from, in priority order.
+const (
+	slotLimitFromWorkerGauge = "worker_gauge"
+	slotLimitFromTrigger     = "trigger"
 )
 
 var (
@@ -349,10 +361,11 @@ func (s *temporalScaler) getQueueSize(ctx context.Context) (int64, error) {
 // pod, and is the conservative direction.
 //
 // That residual ghost-flicker is what activitySlotsPerWorker eliminates: when
-// set, usedSlots arrives here already phantom-discounted (derived from
-// available, see effectiveUsedSlots), so a gate=false dedicated pool reports 0
-// when idle and actually scales to zero, while still going non-zero the instant
-// a real activity consumes a slot.
+// set, usedSlots arrives here derived from available and capped at used (see
+// effectiveUsedSlots). It is fully phantom-discounted when the limit matches the
+// one the pod runs with, which a pod's limit gauge guarantees, so a gate=false
+// dedicated pool reports 0 when idle and actually scales to zero, while still
+// going non-zero the instant a real activity consumes a slot.
 func composeMetric(backlog, runningCount, usedSlots int64, slotsAvailable, gateSlotsOnRunningWorkflow bool) int64 {
 	metric := backlog + runningCount
 	if slotsAvailable && (!gateSlotsOnRunningWorkflow || runningCount > 0) {
@@ -449,8 +462,8 @@ func authType(m *temporalMetadata) string {
 }
 
 // getUsedWorkerSlots discovers worker pods in the ScaledObject's namespace and
-// scrapes their Prometheus metrics endpoint to sum temporal_worker_task_slots_used
-// for worker types matching the configured queueTypes. This prevents premature
+// scrapes their Prometheus metrics endpoint to sum the activity slots occupied
+// on each pod (see scrapeWorkerSlots). This prevents premature
 // scale-down when workers are actively executing tasks but the task queue backlog
 // is empty.
 //
@@ -504,7 +517,7 @@ func (s *temporalScaler) getUsedWorkerSlots(ctx context.Context) (int64, error) 
 		}
 
 		attemptedCount++
-		slots, err := s.scrapeWorkerSlots(scrapeCtx, pod.Status.PodIP)
+		slots, err := s.scrapeWorkerSlots(scrapeCtx, pod)
 		if err != nil {
 			s.logger.Info("failed to scrape worker pod metrics, skipping",
 				"pod", pod.Name, "ip", pod.Status.PodIP, "error", err)
@@ -607,11 +620,11 @@ func buildVersionSelection(allActive, unversioned bool, versionID string) *sdk.T
 	}
 }
 
-// scrapeWorkerSlots fetches Prometheus metrics from a single worker pod and returns
-// the sum of temporal_worker_task_slots_used for worker types matching the
-// configured queueTypes and task queue.
-func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, podIP string) (int64, error) {
-	hostPort := net.JoinHostPort(podIP, strconv.Itoa(s.metadata.WorkerMetricsPort))
+// scrapeWorkerSlots fetches Prometheus metrics from a single worker pod and
+// returns the number of activity slots actually occupied on it for the
+// configured task queue.
+func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, pod *corev1.Pod) (int64, error) {
+	hostPort := net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(s.metadata.WorkerMetricsPort))
 	url := fmt.Sprintf("http://%s/metrics", hostPort)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -630,55 +643,90 @@ func (s *temporalScaler) scrapeWorkerSlots(ctx context.Context, podIP string) (i
 
 	limitedBody := io.LimitReader(resp.Body, maxMetricsResponseBytes)
 	activityOnly := map[string]bool{"ActivityWorker": true}
-	used, available, availablePresent, err := parseSlots(limitedBody, s.metadata.TaskQueue, activityOnly)
+	gauges, err := parseWorkerSlotGauges(limitedBody, s.metadata.TaskQueue, activityOnly)
 	if err != nil {
 		return 0, err
 	}
-	return s.effectiveUsedSlots(used, available, availablePresent), nil
+	limit, source := s.resolveSlotLimit(gauges)
+	occupied := effectiveUsedSlots(gauges.used, gauges.available, gauges.availablePresent, limit)
+	s.logger.V(1).Info("worker pod slots",
+		"pod", pod.Name, "used", gauges.used, "available", gauges.available,
+		"limit", limit, "limitSource", source, "occupied", occupied)
+	return occupied, nil
 }
 
-// parseSlots parses Prometheus text format and returns the summed
-// temporal_worker_task_slots_used and temporal_worker_task_slots_available for
-// the worker types matching the task queue. availablePresent reports whether
-// the available gauge was actually exported for a matching series (older SDKs
-// may not emit it), so callers can fall back to raw used-slots when it is
-// missing.
-func parseSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) (used int64, available int64, availablePresent bool, err error) {
+// workerSlotGauges holds one pod's activity-slot gauges, summed across the
+// series matching the task queue and worker type. The *Present flags tell an
+// absent gauge apart from one that is present and zero.
+type workerSlotGauges struct {
+	used             int64
+	available        int64
+	availablePresent bool
+	limit            int64
+	// limitPresent is true only when every series reporting available slots
+	// also reports a limit, so limit and available cover the same workers.
+	limitPresent bool
+}
+
+// parseWorkerSlotGauges parses Prometheus text format and returns the slot
+// gauges for the worker types matching the task queue.
+func parseWorkerSlotGauges(r io.Reader, taskQueue string, workerTypes map[string]bool) (workerSlotGauges, error) {
 	// prometheus/common v0.66+ has no package-wide default name validation scheme; a zero
 	// TextParser panics on the first name it validates, so pin the UTF-8 scheme the old
 	// default used.
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	families, err := parser.TextToMetricFamilies(r)
 	if err != nil {
-		return 0, 0, false, fmt.Errorf("parse prometheus metrics: %w", err)
+		return workerSlotGauges{}, fmt.Errorf("parse prometheus metrics: %w", err)
 	}
 
-	used, _ = sumSlotFamily(families["temporal_worker_task_slots_used"], taskQueue, workerTypes)
-	available, availablePresent = sumSlotFamily(families["temporal_worker_task_slots_available"], taskQueue, workerTypes)
-	return used, available, availablePresent, nil
+	var g workerSlotGauges
+	var availableSeries, limitSeries int
+	g.used, _ = sumSlotFamily(families["temporal_worker_task_slots_used"], taskQueue, workerTypes)
+	g.available, availableSeries = sumSlotFamily(families["temporal_worker_task_slots_available"], taskQueue, workerTypes)
+	g.limit, limitSeries = sumSlotFamily(families[workerActivitySlotsLimitMetric], taskQueue, workerTypes)
+	g.availablePresent = availableSeries > 0
+	g.limitPresent = limitSeries > 0 && limitSeries == availableSeries
+	return g, nil
 }
 
 // sumSlotFamily sums the gauge values of a slot metric family across the metrics
-// whose worker_type and task_queue match. found reports whether at least one
-// matching series existed (distinguishing "absent" from "present and zero").
-func sumSlotFamily(family *dto.MetricFamily, taskQueue string, workerTypes map[string]bool) (sum int64, found bool) {
+// whose worker_type and task_queue match. series is how many matched, which
+// distinguishes "absent" (0) from "present and zero".
+func sumSlotFamily(family *dto.MetricFamily, taskQueue string, workerTypes map[string]bool) (sum int64, series int) {
 	if family == nil {
-		return 0, false
+		return 0, 0
 	}
 	for _, m := range family.GetMetric() {
 		if matchesWorkerSlot(m, taskQueue, workerTypes) {
 			sum += int64(m.GetGauge().GetValue())
-			found = true
+			series++
 		}
 	}
-	return sum, found
+	return sum, series
 }
 
-// parseUsedSlots returns only the summed used-slots gauge. Retained as a thin
-// wrapper over parseSlots for callers/tests that only need the raw used value.
-func parseUsedSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) (int64, error) {
-	used, _, _, err := parseSlots(r, taskQueue, workerTypes)
-	return used, err
+// resolveSlotLimit returns the activity-slot limit to count one pod's
+// occupancy against, and where it came from. It returns 0, meaning raw used
+// slots are counted, when the trigger does not set activitySlotsPerWorker or the
+// pod does not export the available gauge the limit is compared against.
+//
+// The worker is the only source of its own limit. Pods of one version can run
+// with different limits, because a worker may size its slots from its
+// container's resources and a vertical pod autoscaler sets those per pod, so
+// workerActivitySlotsLimitMetric, when the pod exports it, is that pod's limit.
+// Otherwise the trigger's activitySlotsPerWorker is used. Either way
+// effectiveUsedSlots caps the result at the pod's used slots, so a trigger value
+// above what the pod really runs with cannot count idle slots as occupied.
+func (s *temporalScaler) resolveSlotLimit(g workerSlotGauges) (int64, string) {
+	trigger := int64(s.metadata.ActivitySlotsPerWorker)
+	if trigger <= 0 || !g.availablePresent {
+		return 0, ""
+	}
+	if g.limitPresent && g.limit > 0 {
+		return g.limit, slotLimitFromWorkerGauge
+	}
+	return trigger, slotLimitFromTrigger
 }
 
 // effectiveUsedSlots converts a pod's raw slot gauges into the number of slots
@@ -693,28 +741,24 @@ func parseUsedSlots(r io.Reader, taskQueue string, workerTypes map[string]bool) 
 // pinning a dedicated on-demand pool at one pod per tenant 24/7.
 //
 // `available` is NOT corrupted by the bug: a genuinely running activity
-// decrements it, the phantom does not. So when the per-worker activity-slot
-// limit is known (activitySlotsPerWorker, set to the worker's
-// maxConcurrentActivities), the honest occupancy is max(0, limit - available):
+// decrements it, the phantom does not. So when the pod's activity-slot limit is
+// known (see resolveSlotLimit), the honest occupancy is max(0, limit - available):
 //
 //	real activity  -> available < limit -> > 0  (pod kept warm)
 //	phantom / idle -> available == limit -> 0   (pool free to drain)
 //
+// The result never exceeds raw `used`: the phantom only adds to `used`, so real
+// occupancy cannot be higher. That bounds the damage of a limit set above the
+// one the pod runs with, which would otherwise read every idle slot beyond the
+// real limit as occupied and hold an idle version at its maximum replica count.
+//
 // When the limit is unset (0) or the available gauge is absent, it falls back
 // to raw `used` so existing ScaledObjects are unaffected.
-func (s *temporalScaler) effectiveUsedSlots(used, available int64, availablePresent bool) int64 {
-	limit := int64(s.metadata.ActivitySlotsPerWorker)
+func effectiveUsedSlots(used, available int64, availablePresent bool, limit int64) int64 {
 	if limit <= 0 || !availablePresent {
 		return used
 	}
-	realUsed := limit - available
-	if realUsed < 0 {
-		realUsed = 0
-	}
-	if realUsed > limit {
-		realUsed = limit
-	}
-	return realUsed
+	return max(0, min(limit-available, limit, used))
 }
 
 // matchesWorkerSlot returns true if the metric's worker_type is in the allowed set
