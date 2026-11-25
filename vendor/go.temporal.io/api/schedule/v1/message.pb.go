@@ -1047,10 +1047,14 @@ type SchedulePatch struct {
 	BackfillRequest []*BackfillRequest `protobuf:"bytes,2,rep,name=backfill_request,json=backfillRequest,proto3" json:"backfill_request,omitempty"`
 	// If set, change the state to paused or unpaused (respectively) and set the
 	// notes field to the value of the string.
-	Pause         string `protobuf:"bytes,3,opt,name=pause,proto3" json:"pause,omitempty"`
-	Unpause       string `protobuf:"bytes,4,opt,name=unpause,proto3" json:"unpause,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Pause   string `protobuf:"bytes,3,opt,name=pause,proto3" json:"pause,omitempty"`
+	Unpause string `protobuf:"bytes,4,opt,name=unpause,proto3" json:"unpause,omitempty"`
+	// Experimental.
+	// If set, applies the specified time-skipping configuration to this schedule,
+	// replacing any existing time-skipping configuration.
+	TimeSkippingConfig *v12.TimeSkippingConfig `protobuf:"bytes,5,opt,name=time_skipping_config,json=timeSkippingConfig,proto3" json:"time_skipping_config,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *SchedulePatch) Reset() {
@@ -1111,6 +1115,13 @@ func (x *SchedulePatch) GetUnpause() string {
 	return ""
 }
 
+func (x *SchedulePatch) GetTimeSkippingConfig() *v12.TimeSkippingConfig {
+	if x != nil {
+		return x.TimeSkippingConfig
+	}
+	return nil
+}
+
 type ScheduleInfo struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Number of actions taken so far.
@@ -1142,8 +1153,14 @@ type ScheduleInfo struct {
 	//
 	// Deprecated: Marked as deprecated in temporal/api/schedule/v1/message.proto.
 	InvalidScheduleError string `protobuf:"bytes,8,opt,name=invalid_schedule_error,json=invalidScheduleError,proto3" json:"invalid_schedule_error,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Size of the schedule's internal state (including payloads) in bytes.
+	StateSizeBytes int64 `protobuf:"varint,12,opt,name=state_size_bytes,json=stateSizeBytes,proto3" json:"state_size_bytes,omitempty"`
+	// Experimental.
+	// Information about time skipping for this schedule.
+	// If the schedule has never enabled time skipping, this will be unset.
+	TimeSkippingInfo *v12.TimeSkippingInfo `protobuf:"bytes,13,opt,name=time_skipping_info,json=timeSkippingInfo,proto3" json:"time_skipping_info,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ScheduleInfo) Reset() {
@@ -1254,6 +1271,20 @@ func (x *ScheduleInfo) GetInvalidScheduleError() string {
 	return ""
 }
 
+func (x *ScheduleInfo) GetStateSizeBytes() int64 {
+	if x != nil {
+		return x.StateSizeBytes
+	}
+	return 0
+}
+
+func (x *ScheduleInfo) GetTimeSkippingInfo() *v12.TimeSkippingInfo {
+	if x != nil {
+		return x.TimeSkippingInfo
+	}
+	return nil
+}
+
 type Schedule struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Spec          *ScheduleSpec          `protobuf:"bytes,1,opt,name=spec,proto3" json:"spec,omitempty"`
@@ -1339,8 +1370,10 @@ type ScheduleListInfo struct {
 	// From info (maybe fewer entries):
 	RecentActions     []*ScheduleActionResult  `protobuf:"bytes,5,rep,name=recent_actions,json=recentActions,proto3" json:"recent_actions,omitempty"`
 	FutureActionTimes []*timestamppb.Timestamp `protobuf:"bytes,6,rep,name=future_action_times,json=futureActionTimes,proto3" json:"future_action_times,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Size of the schedule's internal state (including payloads) in bytes.
+	StateSizeBytes int64 `protobuf:"varint,7,opt,name=state_size_bytes,json=stateSizeBytes,proto3" json:"state_size_bytes,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ScheduleListInfo) Reset() {
@@ -1413,6 +1446,13 @@ func (x *ScheduleListInfo) GetFutureActionTimes() []*timestamppb.Timestamp {
 		return x.FutureActionTimes
 	}
 	return nil
+}
+
+func (x *ScheduleListInfo) GetStateSizeBytes() int64 {
+	if x != nil {
+		return x.StateSizeBytes
+	}
+	return 0
 }
 
 // ScheduleListEntry is returned by ListSchedules.
@@ -1557,12 +1597,13 @@ const file_temporal_api_schedule_v1_message_proto_rawDesc = "" +
 	"\n" +
 	"start_time\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\tstartTime\x125\n" +
 	"\bend_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\aendTime\x12S\n" +
-	"\x0eoverlap_policy\x18\x03 \x01(\x0e2,.temporal.api.enums.v1.ScheduleOverlapPolicyR\roverlapPolicy\"\xfb\x01\n" +
+	"\x0eoverlap_policy\x18\x03 \x01(\x0e2,.temporal.api.enums.v1.ScheduleOverlapPolicyR\roverlapPolicy\"\xd9\x02\n" +
 	"\rSchedulePatch\x12d\n" +
 	"\x13trigger_immediately\x18\x01 \x01(\v23.temporal.api.schedule.v1.TriggerImmediatelyRequestR\x12triggerImmediately\x12T\n" +
 	"\x10backfill_request\x18\x02 \x03(\v2).temporal.api.schedule.v1.BackfillRequestR\x0fbackfillRequest\x12\x14\n" +
 	"\x05pause\x18\x03 \x01(\tR\x05pause\x12\x18\n" +
-	"\aunpause\x18\x04 \x01(\tR\aunpause\"\x85\x05\n" +
+	"\aunpause\x18\x04 \x01(\tR\aunpause\x12\\\n" +
+	"\x14time_skipping_config\x18\x05 \x01(\v2*.temporal.api.common.v1.TimeSkippingConfigR\x12timeSkippingConfig\"\x87\x06\n" +
 	"\fScheduleInfo\x12!\n" +
 	"\faction_count\x18\x01 \x01(\x03R\vactionCount\x122\n" +
 	"\x15missed_catchup_window\x18\x02 \x01(\x03R\x13missedCatchupWindow\x12'\n" +
@@ -1578,19 +1619,22 @@ const file_temporal_api_schedule_v1_message_proto_rawDesc = "" +
 	"createTime\x12;\n" +
 	"\vupdate_time\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"updateTime\x128\n" +
-	"\x16invalid_schedule_error\x18\b \x01(\tB\x02\x18\x01R\x14invalidScheduleError\"\x8f\x02\n" +
+	"\x16invalid_schedule_error\x18\b \x01(\tB\x02\x18\x01R\x14invalidScheduleError\x12(\n" +
+	"\x10state_size_bytes\x18\f \x01(\x03R\x0estateSizeBytes\x12V\n" +
+	"\x12time_skipping_info\x18\r \x01(\v2(.temporal.api.common.v1.TimeSkippingInfoR\x10timeSkippingInfo\"\x8f\x02\n" +
 	"\bSchedule\x12:\n" +
 	"\x04spec\x18\x01 \x01(\v2&.temporal.api.schedule.v1.ScheduleSpecR\x04spec\x12@\n" +
 	"\x06action\x18\x02 \x01(\v2(.temporal.api.schedule.v1.ScheduleActionR\x06action\x12F\n" +
 	"\bpolicies\x18\x03 \x01(\v2*.temporal.api.schedule.v1.SchedulePoliciesR\bpolicies\x12=\n" +
-	"\x05state\x18\x04 \x01(\v2'.temporal.api.schedule.v1.ScheduleStateR\x05state\"\xea\x02\n" +
+	"\x05state\x18\x04 \x01(\v2'.temporal.api.schedule.v1.ScheduleStateR\x05state\"\x94\x03\n" +
 	"\x10ScheduleListInfo\x12:\n" +
 	"\x04spec\x18\x01 \x01(\v2&.temporal.api.schedule.v1.ScheduleSpecR\x04spec\x12I\n" +
 	"\rworkflow_type\x18\x02 \x01(\v2$.temporal.api.common.v1.WorkflowTypeR\fworkflowType\x12\x14\n" +
 	"\x05notes\x18\x03 \x01(\tR\x05notes\x12\x16\n" +
 	"\x06paused\x18\x04 \x01(\bR\x06paused\x12U\n" +
 	"\x0erecent_actions\x18\x05 \x03(\v2..temporal.api.schedule.v1.ScheduleActionResultR\rrecentActions\x12J\n" +
-	"\x13future_action_times\x18\x06 \x03(\v2\x1a.google.protobuf.TimestampR\x11futureActionTimes\"\xfd\x01\n" +
+	"\x13future_action_times\x18\x06 \x03(\v2\x1a.google.protobuf.TimestampR\x11futureActionTimes\x12(\n" +
+	"\x10state_size_bytes\x18\a \x01(\x03R\x0estateSizeBytes\"\xfd\x01\n" +
 	"\x11ScheduleListEntry\x12\x1f\n" +
 	"\vschedule_id\x18\x01 \x01(\tR\n" +
 	"scheduleId\x120\n" +
@@ -1635,9 +1679,11 @@ var file_temporal_api_schedule_v1_message_proto_goTypes = []any{
 	(*v11.NewWorkflowExecutionInfo)(nil), // 19: temporal.api.workflow.v1.NewWorkflowExecutionInfo
 	(*v12.WorkflowExecution)(nil),        // 20: temporal.api.common.v1.WorkflowExecution
 	(v1.WorkflowExecutionStatus)(0),      // 21: temporal.api.enums.v1.WorkflowExecutionStatus
-	(*v12.WorkflowType)(nil),             // 22: temporal.api.common.v1.WorkflowType
-	(*v12.Memo)(nil),                     // 23: temporal.api.common.v1.Memo
-	(*v12.SearchAttributes)(nil),         // 24: temporal.api.common.v1.SearchAttributes
+	(*v12.TimeSkippingConfig)(nil),       // 22: temporal.api.common.v1.TimeSkippingConfig
+	(*v12.TimeSkippingInfo)(nil),         // 23: temporal.api.common.v1.TimeSkippingInfo
+	(*v12.WorkflowType)(nil),             // 24: temporal.api.common.v1.WorkflowType
+	(*v12.Memo)(nil),                     // 25: temporal.api.common.v1.Memo
+	(*v12.SearchAttributes)(nil),         // 26: temporal.api.common.v1.SearchAttributes
 }
 var file_temporal_api_schedule_v1_message_proto_depIdxs = []int32{
 	1,  // 0: temporal.api.schedule.v1.StructuredCalendarSpec.second:type_name -> temporal.api.schedule.v1.Range
@@ -1671,27 +1717,29 @@ var file_temporal_api_schedule_v1_message_proto_depIdxs = []int32{
 	18, // 28: temporal.api.schedule.v1.BackfillRequest.overlap_policy:type_name -> temporal.api.enums.v1.ScheduleOverlapPolicy
 	9,  // 29: temporal.api.schedule.v1.SchedulePatch.trigger_immediately:type_name -> temporal.api.schedule.v1.TriggerImmediatelyRequest
 	10, // 30: temporal.api.schedule.v1.SchedulePatch.backfill_request:type_name -> temporal.api.schedule.v1.BackfillRequest
-	20, // 31: temporal.api.schedule.v1.ScheduleInfo.running_workflows:type_name -> temporal.api.common.v1.WorkflowExecution
-	7,  // 32: temporal.api.schedule.v1.ScheduleInfo.recent_actions:type_name -> temporal.api.schedule.v1.ScheduleActionResult
-	17, // 33: temporal.api.schedule.v1.ScheduleInfo.future_action_times:type_name -> google.protobuf.Timestamp
-	17, // 34: temporal.api.schedule.v1.ScheduleInfo.create_time:type_name -> google.protobuf.Timestamp
-	17, // 35: temporal.api.schedule.v1.ScheduleInfo.update_time:type_name -> google.protobuf.Timestamp
-	4,  // 36: temporal.api.schedule.v1.Schedule.spec:type_name -> temporal.api.schedule.v1.ScheduleSpec
-	6,  // 37: temporal.api.schedule.v1.Schedule.action:type_name -> temporal.api.schedule.v1.ScheduleAction
-	5,  // 38: temporal.api.schedule.v1.Schedule.policies:type_name -> temporal.api.schedule.v1.SchedulePolicies
-	8,  // 39: temporal.api.schedule.v1.Schedule.state:type_name -> temporal.api.schedule.v1.ScheduleState
-	4,  // 40: temporal.api.schedule.v1.ScheduleListInfo.spec:type_name -> temporal.api.schedule.v1.ScheduleSpec
-	22, // 41: temporal.api.schedule.v1.ScheduleListInfo.workflow_type:type_name -> temporal.api.common.v1.WorkflowType
-	7,  // 42: temporal.api.schedule.v1.ScheduleListInfo.recent_actions:type_name -> temporal.api.schedule.v1.ScheduleActionResult
-	17, // 43: temporal.api.schedule.v1.ScheduleListInfo.future_action_times:type_name -> google.protobuf.Timestamp
-	23, // 44: temporal.api.schedule.v1.ScheduleListEntry.memo:type_name -> temporal.api.common.v1.Memo
-	24, // 45: temporal.api.schedule.v1.ScheduleListEntry.search_attributes:type_name -> temporal.api.common.v1.SearchAttributes
-	14, // 46: temporal.api.schedule.v1.ScheduleListEntry.info:type_name -> temporal.api.schedule.v1.ScheduleListInfo
-	47, // [47:47] is the sub-list for method output_type
-	47, // [47:47] is the sub-list for method input_type
-	47, // [47:47] is the sub-list for extension type_name
-	47, // [47:47] is the sub-list for extension extendee
-	0,  // [0:47] is the sub-list for field type_name
+	22, // 31: temporal.api.schedule.v1.SchedulePatch.time_skipping_config:type_name -> temporal.api.common.v1.TimeSkippingConfig
+	20, // 32: temporal.api.schedule.v1.ScheduleInfo.running_workflows:type_name -> temporal.api.common.v1.WorkflowExecution
+	7,  // 33: temporal.api.schedule.v1.ScheduleInfo.recent_actions:type_name -> temporal.api.schedule.v1.ScheduleActionResult
+	17, // 34: temporal.api.schedule.v1.ScheduleInfo.future_action_times:type_name -> google.protobuf.Timestamp
+	17, // 35: temporal.api.schedule.v1.ScheduleInfo.create_time:type_name -> google.protobuf.Timestamp
+	17, // 36: temporal.api.schedule.v1.ScheduleInfo.update_time:type_name -> google.protobuf.Timestamp
+	23, // 37: temporal.api.schedule.v1.ScheduleInfo.time_skipping_info:type_name -> temporal.api.common.v1.TimeSkippingInfo
+	4,  // 38: temporal.api.schedule.v1.Schedule.spec:type_name -> temporal.api.schedule.v1.ScheduleSpec
+	6,  // 39: temporal.api.schedule.v1.Schedule.action:type_name -> temporal.api.schedule.v1.ScheduleAction
+	5,  // 40: temporal.api.schedule.v1.Schedule.policies:type_name -> temporal.api.schedule.v1.SchedulePolicies
+	8,  // 41: temporal.api.schedule.v1.Schedule.state:type_name -> temporal.api.schedule.v1.ScheduleState
+	4,  // 42: temporal.api.schedule.v1.ScheduleListInfo.spec:type_name -> temporal.api.schedule.v1.ScheduleSpec
+	24, // 43: temporal.api.schedule.v1.ScheduleListInfo.workflow_type:type_name -> temporal.api.common.v1.WorkflowType
+	7,  // 44: temporal.api.schedule.v1.ScheduleListInfo.recent_actions:type_name -> temporal.api.schedule.v1.ScheduleActionResult
+	17, // 45: temporal.api.schedule.v1.ScheduleListInfo.future_action_times:type_name -> google.protobuf.Timestamp
+	25, // 46: temporal.api.schedule.v1.ScheduleListEntry.memo:type_name -> temporal.api.common.v1.Memo
+	26, // 47: temporal.api.schedule.v1.ScheduleListEntry.search_attributes:type_name -> temporal.api.common.v1.SearchAttributes
+	14, // 48: temporal.api.schedule.v1.ScheduleListEntry.info:type_name -> temporal.api.schedule.v1.ScheduleListInfo
+	49, // [49:49] is the sub-list for method output_type
+	49, // [49:49] is the sub-list for method input_type
+	49, // [49:49] is the sub-list for extension type_name
+	49, // [49:49] is the sub-list for extension extendee
+	0,  // [0:49] is the sub-list for field type_name
 }
 
 func init() { file_temporal_api_schedule_v1_message_proto_init() }

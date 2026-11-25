@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/operatorservice/v1"
@@ -16,6 +18,7 @@ import (
 
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal/common/metrics"
+	"go.temporal.io/sdk/internal/extstore"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/log"
 )
@@ -42,6 +45,38 @@ const (
 	QueryTypeWorkflowMetadata string = "__temporal_workflow_metadata"
 )
 
+// GrpcCompression controls gRPC compression for connections to the Temporal
+// server.
+//
+// Exposed as: [go.temporal.io/sdk/client.GrpcCompression]
+type GrpcCompression interface {
+	grpcCompression()
+}
+
+type (
+	// GrpcCompressionGzip compresses outbound gRPC request bodies with gzip and
+	// accepts gzip-compressed responses. This is the default. If a specific
+	// server RPC does not support gzip, the client may retry that RPC without
+	// compression and continue using gzip for other RPCs.
+	//
+	// Exposed as: [go.temporal.io/sdk/client.GrpcCompressionGzip]
+	GrpcCompressionGzip struct{}
+
+	// GrpcCompressionNone disables gRPC request compression. The client will
+	// still accept compressed responses for encodings registered with grpc-go.
+	//
+	// Exposed as: [go.temporal.io/sdk/client.GrpcCompressionNone]
+	GrpcCompressionNone struct{}
+)
+
+func (*GrpcCompressionGzip) grpcCompression() {}
+func (*GrpcCompressionNone) grpcCompression() {}
+
+var (
+	_ GrpcCompression = (*GrpcCompressionGzip)(nil)
+	_ GrpcCompression = (*GrpcCompressionNone)(nil)
+)
+
 type (
 	// Client is the client for starting and getting information about a workflow executions as well as
 	// completing activities asynchronously.
@@ -62,9 +97,10 @@ type (
 		// The current timeout resolution implementation is in seconds and uses math.Ceil(d.Seconds()) as the duration. But is
 		// subjected to change in the future.
 		//
-		// WorkflowRun has three methods:
+		// WorkflowRun provides:
 		//  - GetID() string: which return workflow ID (which is same as StartWorkflowOptions.ID if provided)
 		//  - GetRunID() string: which return the first started workflow run ID (please see below)
+		//  - GetFirstExecutionRunID() string: which returns the first execution run ID in the workflow chain
 		//  - Get(ctx context.Context, valuePtr interface{}) error: which will fill the workflow
 		//    execution result to valuePtr, if workflow execution is a success, or return corresponding
 		//    error. This is a blocking API.
@@ -77,15 +113,16 @@ type (
 		// GetRunID() will always return "run ID 1" and  Get(ctx context.Context, valuePtr interface{}) will return the result of second run.
 		//
 		// NOTE: DO NOT USE THIS API INSIDE A WORKFLOW, USE workflow.ExecuteChildWorkflow instead
-		ExecuteWorkflow(ctx context.Context, options StartWorkflowOptions, workflow interface{}, args ...interface{}) (WorkflowRun, error)
+		ExecuteWorkflow(ctx context.Context, options StartWorkflowOptions, workflow any, args ...any) (WorkflowRun, error)
 
 		// GetWorkflow retrieves a workflow execution and return a WorkflowRun instance
 		//  - workflow ID of the workflow.
 		//  - runID can be default(empty string). if empty string then it will pick the last running execution of that workflow ID.
 		//
-		// WorkflowRun has three methods:
+		// WorkflowRun provides:
 		//  - GetID() string: which return workflow ID (which is same as StartWorkflowOptions.ID if provided)
 		//  - GetRunID() string: which return the first started workflow run ID (please see below)
+		//  - GetFirstExecutionRunID() string: which is empty for handles returned by GetWorkflow
 		//  - Get(ctx context.Context, valuePtr interface{}) error: which will fill the workflow
 		//    execution result to valuePtr, if workflow execution is a success, or return corresponding
 		//    error. This is a blocking API.
@@ -95,32 +132,34 @@ type (
 		// however, Get(ctx context.Context, valuePtr interface{}) will return result from the run which did not return ContinueAsNewError.
 		GetWorkflow(ctx context.Context, workflowID string, runID string) WorkflowRun
 
-		// SignalWorkflow sends a signals to a workflow in execution
+		// SignalWorkflow sends a signals to a running workflow.
 		//  - workflow ID of the workflow.
-		//  - runID can be default(empty string). if empty string then it will pick the running execution of that workflow ID.
+		//  - runID can be default(empty string). If set to empty string, then it will pick the running execution of that workflow ID.
 		//  - signalName name to identify the signal.
 		// The errors it can return:
 		//  - serviceerror.NotFound
 		//  - serviceerror.Internal
 		//  - serviceerror.Unavailable
-		SignalWorkflow(ctx context.Context, workflowID string, runID string, signalName string, arg interface{}) error
+		SignalWorkflow(ctx context.Context, workflowID string, runID string, signalName string, arg any) error
 
 		// SignalWithStartWorkflow sends a signal to a running workflow.
 		// If the workflow is not running or not found, it starts the workflow and then sends the signal in transaction.
-		//  - workflowID, signalName, signalArg are same as SignalWorkflow's parameters
-		//  - options, workflow, workflowArgs are same as StartWorkflow's parameters
+		//  - workflowID, signalName, signalArg are the same as SignalWorkflow's parameters
+		//  - options, workflow, workflowArgs are the same as StartWorkflow's parameters
 		//  - the workflowID parameter is used instead of options.ID. If the latter is present, it must match the workflowID.
-		// Note: options.WorkflowIDReusePolicy is default to AllowDuplicate.
+		//
+		// Note: options.WorkflowIDReusePolicy defaults to AllowDuplicate.
+		//
 		// The errors it can return:
 		//  - serviceerror.NotFound
 		//  - serviceerror.InvalidArgument
 		//  - serviceerror.Internal
 		//  - serviceerror.Unavailable
-		SignalWithStartWorkflow(ctx context.Context, workflowID string, signalName string, signalArg interface{},
-			options StartWorkflowOptions, workflow interface{}, workflowArgs ...interface{}) (WorkflowRun, error)
+		SignalWithStartWorkflow(ctx context.Context, workflowID string, signalName string, signalArg any,
+			options StartWorkflowOptions, workflow any, workflowArgs ...any) (WorkflowRun, error)
 
 		// NewWithStartWorkflowOperation returns a WithStartWorkflowOperation for use in UpdateWithStartWorkflow.
-		NewWithStartWorkflowOperation(options StartWorkflowOptions, workflow interface{}, args ...interface{}) WithStartWorkflowOperation
+		NewWithStartWorkflowOperation(options StartWorkflowOptions, workflow any, args ...any) WithStartWorkflowOperation
 
 		// CancelWorkflow cancels a workflow in execution
 		//  - workflow ID of the workflow.
@@ -132,6 +171,11 @@ type (
 		//  - serviceerror.Unavailable
 		CancelWorkflow(ctx context.Context, workflowID string, runID string) error
 
+		// CancelWorkflowWithOptions requests cancellation of a workflow execution.
+		// The options can specify the first execution run ID to ensure the request
+		// targets the intended workflow execution chain.
+		CancelWorkflowWithOptions(ctx context.Context, options CancelWorkflowOptions) error
+
 		// TerminateWorkflow terminates a workflow execution.
 		// workflowID is required, other parameters are optional.
 		//  - workflow ID of the workflow.
@@ -141,7 +185,12 @@ type (
 		//  - serviceerror.InvalidArgument
 		//  - serviceerror.Internal
 		//  - serviceerror.Unavailable
-		TerminateWorkflow(ctx context.Context, workflowID string, runID string, reason string, details ...interface{}) error
+		TerminateWorkflow(ctx context.Context, workflowID string, runID string, reason string, details ...any) error
+
+		// TerminateWorkflowWithOptions terminates a workflow execution.
+		// The options can specify the first execution run ID to ensure the request
+		// targets the intended workflow execution chain.
+		TerminateWorkflowWithOptions(ctx context.Context, options TerminateWorkflowOptions) error
 
 		// GetWorkflowHistory gets history events of a particular workflow
 		//  - workflow ID of the workflow.
@@ -164,11 +213,10 @@ type (
 		GetWorkflowHistory(ctx context.Context, workflowID string, runID string, isLongPoll bool, filterType enumspb.HistoryEventFilterType) HistoryEventIterator
 
 		// CompleteActivity reports activity completed.
-		// activity Execute method can return activity.ErrResultPending to
-		// indicate the activity is not completed when it's Execute method returns. In that case, this CompleteActivity() method
-		// should be called when that activity is completed with the actual result and error. If err is nil, activity task
-		// completed event will be reported; if err is CanceledError, activity task canceled event will be reported; otherwise,
-		// activity task failed event will be reported.
+		// An activity's implementation can return activity.ErrResultPending to indicate it will be completed asynchronously.
+		// In that case, this CompleteActivity() method should be called when the activity is completed with the
+		// actual result and error. If err is nil, activity task completed event will be reported; if err is CanceledError,
+		// activity task canceled event will be reported; otherwise, activity task failed event will be reported.
 		// An activity implementation should use GetActivityInfo(ctx).TaskToken function to get task token to use for completion.
 		// Example:-
 		//  To complete with a result.
@@ -176,22 +224,71 @@ type (
 		//  To fail the activity with an error.
 		//      CompleteActivity(token, nil, temporal.NewApplicationError("reason", details)
 		// The activity can fail with below errors ApplicationError, TimeoutError, CanceledError.
-		CompleteActivity(ctx context.Context, taskToken []byte, result interface{}, err error) error
+		//
+		// If using a context-aware converter (DataConverterWithSerializationContext or
+		// FailureConverterWithSerializationContext), consider using
+		// CompleteActivityWithOptions to provide full activity metadata
+		// (ActivityType, WorkflowType, TaskQueue) to your codec.
+		CompleteActivity(ctx context.Context, taskToken []byte, result any, err error) error
+
+		// CompleteActivityWithOptions reports activity completed with full context options.
+		// Similar to CompleteActivity but accepts a struct with optional ActivitySerializationContext
+		// fields (ActivityType, WorkflowType, TaskQueue, etc.) for custom codec support.
+		CompleteActivityWithOptions(ctx context.Context, opts CompleteActivityOptions) error
 
 		// CompleteActivityByID reports activity completed.
-		// Similar to CompleteActivity, but may save user from keeping taskToken info.
-		// activity Execute method can return activity.ErrResultPending to
-		// indicate the activity is not completed when it's Execute method returns. In that case, this CompleteActivityById() method
-		// should be called when that activity is completed with the actual result and error. If err is nil, activity task
-		// completed event will be reported; if err is CanceledError, activity task canceled event will be reported; otherwise,
-		// activity task failed event will be reported.
+		// Similar to CompleteActivity, but may save the user from keeping taskToken info.
+		// This method works only for workflow activities. workflowID and runID must be set to the workflow ID and workflow run ID
+		// of the workflow that started the activity. To complete a standalone activity (not started by workflow),
+		// use CompleteActivityByActivityID.
+		//
+		// An activity's implementation can return activity.ErrResultPending to indicate it will be completed asynchronously.
+		// In that case, this CompleteActivityByID() method should be called when the activity is completed with the
+		// actual result and error. If err is nil, activity task completed event will be reported; if err is CanceledError,
+		// activity task canceled event will be reported; otherwise, activity task failed event will be reported.
 		// An activity implementation should use activityID provided in ActivityOption to use for completion.
-		// namespace name, workflowID, activityID are required, runID is optional.
+		// namespace, workflowID and activityID are required, runID is optional.
 		// The errors it can return:
 		//  - ApplicationError
 		//  - TimeoutError
 		//  - CanceledError
-		CompleteActivityByID(ctx context.Context, namespace, workflowID, runID, activityID string, result interface{}, err error) error
+		//
+		// If using a context-aware converter (DataConverterWithSerializationContext or
+		// FailureConverterWithSerializationContext), consider using
+		// CompleteActivityByIDWithOptions to provide full activity metadata
+		// (ActivityType, WorkflowType, TaskQueue) to your codec.
+		CompleteActivityByID(ctx context.Context, namespace, workflowID, runID, activityID string, result any, err error) error
+
+		// CompleteActivityByIDWithOptions reports activity completed with full context options.
+		// Similar to CompleteActivityByID but accepts a struct with optional ActivitySerializationContext
+		// fields (ActivityType, WorkflowType, TaskQueue) for custom codec support.
+		CompleteActivityByIDWithOptions(ctx context.Context, opts CompleteActivityByIDOptions) error
+
+		// CompleteActivityByActivityID reports activity completed.
+		// Similar to CompleteActivity, but may save the user from keeping taskToken info.
+		// This method works only for standalone activities. To complete a workflow activity, use CompleteActivityByID.
+		//
+		// An activity's implementation can return activity.ErrResultPending to indicate it will be completed asynchronously.
+		// In that case, this CompleteActivityByActivityID() method should be called when the activity is completed with
+		// the actual result and error. If err is nil, activity task completed event will be reported; if err is CanceledError,
+		// activity task canceled event will be reported; otherwise, activity task failed event will be reported.
+		// An activity implementation should use activityID provided in ActivityOption to use for completion.
+		// namespace and activityID are required, activityRunID is optional.
+		// The errors it can return:
+		//  - ApplicationError
+		//  - TimeoutError
+		//  - CanceledError
+		//
+		// If using a context-aware converter (DataConverterWithSerializationContext or
+		// FailureConverterWithSerializationContext), consider using
+		// CompleteActivityByActivityIDWithOptions to provide full activity metadata
+		// (ActivityType, WorkflowType, TaskQueue) to your codec.
+		CompleteActivityByActivityID(ctx context.Context, namespace, activityID, activityRunID string, result any, err error) error
+
+		// CompleteActivityByActivityIDWithOptions reports standalone activity completed with full context options.
+		// Similar to CompleteActivityByActivityID but accepts a struct with optional
+		// ActivitySerializationContext fields for custom codec support.
+		CompleteActivityByActivityIDWithOptions(ctx context.Context, opts CompleteActivityByActivityIDOptions) error
 
 		// RecordActivityHeartbeat records heartbeat for an activity.
 		// details - is the progress you want to record along with heart beat for this activity.
@@ -199,7 +296,17 @@ type (
 		//  - serviceerror.NotFound
 		//  - serviceerror.Internal
 		//  - serviceerror.Unavailable
-		RecordActivityHeartbeat(ctx context.Context, taskToken []byte, details ...interface{}) error
+		//
+		// If using a context-aware converter (DataConverterWithSerializationContext or
+		// FailureConverterWithSerializationContext), consider using
+		// RecordActivityHeartbeatWithOptions to provide full activity metadata
+		// (ActivityType, WorkflowType, TaskQueue) to your codec.
+		RecordActivityHeartbeat(ctx context.Context, taskToken []byte, details ...any) error
+
+		// RecordActivityHeartbeatWithOptions records heartbeat with full context options.
+		// Similar to RecordActivityHeartbeat but accepts a struct with optional
+		// ActivitySerializationContext fields for custom codec support.
+		RecordActivityHeartbeatWithOptions(ctx context.Context, opts RecordActivityHeartbeatOptions) error
 
 		// RecordActivityHeartbeatByID records heartbeat for an activity.
 		// details - is the progress you want to record along with heart beat for this activity.
@@ -207,7 +314,17 @@ type (
 		//  - serviceerror.NotFound
 		//  - serviceerror.Internal
 		//  - serviceerror.Unavailable
-		RecordActivityHeartbeatByID(ctx context.Context, namespace, workflowID, runID, activityID string, details ...interface{}) error
+		//
+		// If using a context-aware converter (DataConverterWithSerializationContext or
+		// FailureConverterWithSerializationContext), consider using
+		// RecordActivityHeartbeatByIDWithOptions to provide full activity metadata
+		// (ActivityType, WorkflowType, TaskQueue) to your codec.
+		RecordActivityHeartbeatByID(ctx context.Context, namespace, workflowID, runID, activityID string, details ...any) error
+
+		// RecordActivityHeartbeatByIDWithOptions records heartbeat with full context options.
+		// Similar to RecordActivityHeartbeatByID but accepts a struct with optional
+		// ActivitySerializationContext fields for custom codec support.
+		RecordActivityHeartbeatByIDWithOptions(ctx context.Context, opts RecordActivityHeartbeatByIDOptions) error
 
 		// ListClosedWorkflow gets closed workflow executions based on request filters
 		// The errors it can return:
@@ -301,7 +418,7 @@ type (
 		//  - serviceerror.Unavailable
 		//  - serviceerror.NotFound
 		//  - serviceerror.QueryFailed
-		QueryWorkflow(ctx context.Context, workflowID string, runID string, queryType string, args ...interface{}) (converter.EncodedValue, error)
+		QueryWorkflow(ctx context.Context, workflowID string, runID string, queryType string, args ...any) (converter.EncodedValue, error)
 
 		// QueryWorkflowWithOptions queries a given workflow execution and returns the query result synchronously.
 		// See QueryWorkflowWithOptionsRequest and QueryWorkflowWithOptionsResponse for more information.
@@ -319,9 +436,12 @@ type (
 		//  - serviceerror.Internal
 		//  - serviceerror.Unavailable
 		//  - serviceerror.NotFound
+		//
+		// Deprecated: Use DescribeWorkflow and its response's RawResponse field instead.
 		DescribeWorkflowExecution(ctx context.Context, workflowID, runID string) (*workflowservice.DescribeWorkflowExecutionResponse, error)
 
 		// DescribeWorkflow returns information about the specified workflow execution.
+		// The response's RawResponse field contains the full server response.
 		// The errors it can return:
 		//  - serviceerror.InvalidArgument
 		//  - serviceerror.Internal
@@ -353,12 +473,21 @@ type (
 		// UpdateWorkerBuildIdCompatibility allows you to update the worker-build-id based version sets for a particular
 		// task queue. This is used in conjunction with workers who specify their build id and thus opt into the
 		// feature.
+		//
+		// Deprecated: Build-ID based versioning is deprecated. Use Worker Deployment based versioning instead.
+		// See https://docs.temporal.io/worker-versioning for more information.
 		UpdateWorkerBuildIdCompatibility(ctx context.Context, options *UpdateWorkerBuildIdCompatibilityOptions) error
 
 		// GetWorkerBuildIdCompatibility returns the worker-build-id based version sets for a particular task queue.
+		//
+		// Deprecated: Build-ID based versioning is deprecated. Use Worker Deployment based versioning instead.
+		// See https://docs.temporal.io/worker-versioning for more information.
 		GetWorkerBuildIdCompatibility(ctx context.Context, options *GetWorkerBuildIdCompatibilityOptions) (*WorkerBuildIDVersionSets, error)
 
 		// GetWorkerTaskReachability returns which versions are is still in use by open or closed workflows.
+		//
+		// Deprecated: Build-ID based versioning is deprecated. Use Worker Deployment based versioning instead.
+		// See https://docs.temporal.io/worker-versioning for more information.
 		GetWorkerTaskReachability(ctx context.Context, options *GetWorkerTaskReachabilityOptions) (*WorkerTaskReachability, error)
 
 		// DescribeTaskQueueEnhanced returns information about the target task queue, broken down by Build Id:
@@ -369,18 +498,24 @@ type (
 		// about the task queue, or an error when the response identifies an unsupported server.
 		// Note that using a sticky queue as target is not supported.
 		// Also, workflow reachability status is eventually consistent, and it could take a few minutes to update.
-		// WARNING: Worker versioning is currently experimental, and requires server 1.24+
+		//
+		// Deprecated: Build-ID based versioning is deprecated. Use Worker Deployment based versioning instead.
+		// See https://docs.temporal.io/worker-versioning for more information.
 		DescribeTaskQueueEnhanced(ctx context.Context, options DescribeTaskQueueEnhancedOptions) (TaskQueueDescription, error)
 
 		// UpdateWorkerVersioningRules allows updating the worker-build-id based assignment and redirect rules for a given
 		// task queue. This is used in conjunction with workers who specify their build id and thus opt into the feature.
 		// The errors it can return:
 		//  - serviceerror.FailedPrecondition when the conflict token is invalid
-		// WARNING: Worker versioning is currently experimental, and requires server 1.24+
+		//
+		// Deprecated: Build-ID based versioning is deprecated. Use Worker Deployment based versioning instead.
+		// See https://docs.temporal.io/worker-versioning for more information.
 		UpdateWorkerVersioningRules(ctx context.Context, options UpdateWorkerVersioningRulesOptions) (*WorkerVersioningRules, error)
 
 		// GetWorkerVersioningRules returns the worker-build-id assignment and redirect rules for a task queue.
-		// WARNING: Worker versioning is currently experimental, and requires server 1.24+
+		//
+		// Deprecated: Build-ID based versioning is deprecated. Use Worker Deployment based versioning instead.
+		// See https://docs.temporal.io/worker-versioning for more information.
 		GetWorkerVersioningRules(ctx context.Context, options GetWorkerVersioningOptions) (*WorkerVersioningRules, error)
 
 		// CheckHealth performs a server health check using the gRPC health check
@@ -411,6 +546,65 @@ type (
 		// if not specified the most recent runID will be used.
 		GetWorkflowUpdateHandle(GetWorkflowUpdateHandleOptions) WorkflowUpdateHandle
 
+		// ExecuteActivity starts a standalone activity execution and returns an ActivityHandle.
+		// The user can use this to start using a function or activity type name.
+		// Either by
+		//     ExecuteActivity(ctx, options, "activityTypeName", arg1, arg2, arg3)
+		//     or
+		//     ExecuteActivity(ctx, options, activityFn, arg1, arg2, arg3)
+		//
+		// Returns an ActivityExecutionAlreadyStarted error if an activity with the same ID already exists
+		// in this namespace, unless permitted by the specified ID conflict policy.
+		//
+		// NOTE: Standalone activities are not associated with a workflow execution.
+		// They are scheduled directly on a task queue and executed by a worker.
+		//
+		// NOTE: Experimental
+		ExecuteActivity(ctx context.Context, options ClientStartActivityOptions, activity any, args ...any) (ClientActivityHandle, error)
+
+		// GetActivityHandle creates a handle to the referenced activity.
+		//
+		// NOTE: Experimental
+		GetActivityHandle(options ClientGetActivityHandleOptions) ClientActivityHandle
+
+		// ListActivities lists activity executions based on query.
+		//
+		// Currently, all errors are returned in the iterator and not the base level error.
+		//
+		// NOTE: Experimental
+		ListActivities(ctx context.Context, options ClientListActivitiesOptions) (ClientListActivitiesResult, error)
+
+		// CountActivities counts activity executions based on query. The result
+		// includes the total count and optionally grouped counts if the query includes
+		// a GROUP BY clause.
+		//
+		// NOTE: Experimental
+		CountActivities(ctx context.Context, options ClientCountActivitiesOptions) (*ClientCountActivitiesResult, error)
+
+		// NewNexusClient creates a new Nexus client bound to the given endpoint and service.
+		// This is for standalone Nexus operations outside of workflow context.
+		// For Nexus operations within workflows, use workflow.NewNexusClient instead.
+		//
+		// NOTE: Experimental
+		NewNexusClient(options ClientNexusClientOptions) (ClientNexusClient, error)
+
+		// GetNexusOperationHandle creates a handle to the referenced Nexus operation.
+		// No network call is made. The handle can be used to poll, describe, cancel, or terminate.
+		//
+		// NOTE: Experimental
+		GetNexusOperationHandle(options ClientGetNexusOperationHandleOptions) ClientNexusOperationHandle
+
+		// ListNexusOperations lists Nexus operation executions based on query.
+		// Currently, all errors are returned in the iterator and not the base level error.
+		//
+		// NOTE: Experimental
+		ListNexusOperations(ctx context.Context, options ClientListNexusOperationsOptions) (ClientListNexusOperationsResult, error)
+
+		// CountNexusOperations counts Nexus operation executions based on query.
+		//
+		// NOTE: Experimental
+		CountNexusOperations(ctx context.Context, options ClientCountNexusOperationsOptions) (*ClientCountNexusOperationsResult, error)
+
 		// WorkflowService provides access to the underlying gRPC service. This should only be used for advanced use cases
 		// that cannot be accomplished via other Client methods. Unlike calls to other Client methods, calls directly to the
 		// service are not configured with internal semantics such as automatic retries.
@@ -432,6 +626,282 @@ type (
 
 		// Close client and clean up underlying resources.
 		Close()
+	}
+
+	// CompleteActivityByIDOptions provides options for CompleteActivityByIDWithOptions.
+	//
+	// ActivityType, WorkflowType, and TaskQueue values are not validated by the SDK.
+	// Providing incorrect values may cause serialization/deserialization mismatches
+	// if your codec uses them, for example, as encryption keys or signature input.
+	//
+	// Exposed as: [go.temporal.io/sdk/client.CompleteActivityByIDOptions]
+	CompleteActivityByIDOptions struct {
+		// Namespace is the Temporal Namespace containing the Workflow Execution.
+		// This is the request Namespace used to locate the Activity, matching the
+		// namespace parameter on CompleteActivityByID.
+		//
+		// This field is required.
+		Namespace string
+
+		// WorkflowID is the ID of the Workflow Execution that scheduled the Activity.
+		//
+		// This field is required.
+		WorkflowID string
+
+		// RunID is the Run ID of the Workflow Execution that scheduled the Activity.
+		// Leave empty to target the latest run for WorkflowID.
+		RunID string
+
+		// ActivityID is the ID of the Activity to complete.
+		//
+		// This field is required.
+		ActivityID string
+
+		// Result completes the Activity as successful with this value.
+		// If both Result and Err are set, Err takes precedence.
+		Result any
+
+		// Err completes the Activity as failed with this error.
+		// If both Result and Err are set, Err takes precedence.
+		Err error
+
+		// Optional fields for ActivitySerializationContext.
+		// When set, these are passed to DataConverterWithSerializationContext and
+		// FailureConverterWithSerializationContext to provide activity metadata
+		// for encoding. Useful when the caller has access to this metadata.
+
+		// ActivityType is the optional Activity Type to include in the Activity
+		// serialization context when encoding Result or Err.
+		ActivityType string
+
+		// WorkflowType is the optional Workflow Type to include in the Activity
+		// serialization context when encoding Result or Err.
+		WorkflowType string
+
+		// TaskQueue is the optional Task Queue to include in the Activity
+		// serialization context when encoding Result or Err.
+		TaskQueue string
+	}
+
+	// RecordActivityHeartbeatByIDOptions provides options for RecordActivityHeartbeatByIDWithOptions.
+	//
+	// ActivityType, WorkflowType, and TaskQueue values are not validated by the SDK.
+	// Providing incorrect values may cause serialization/deserialization mismatches
+	// if your codec uses them, for example, as encryption keys or signature input.
+	//
+	// Exposed as: [go.temporal.io/sdk/client.RecordActivityHeartbeatByIDOptions]
+	RecordActivityHeartbeatByIDOptions struct {
+		// Namespace is the Temporal Namespace containing the Workflow Execution.
+		// If empty, the Client's Namespace is used.
+		// This is the request Namespace used to locate the Activity, matching the
+		// namespace parameter on RecordActivityHeartbeatByID.
+		Namespace string
+
+		// WorkflowID is the ID of the Workflow Execution that scheduled the Activity.
+		//
+		// This field is required.
+		WorkflowID string
+
+		// RunID is the Run ID of the Workflow Execution that scheduled the Activity.
+		// Leave empty to target the latest run for WorkflowID.
+		RunID string
+
+		// ActivityID is the ID of the Activity to heartbeat.
+		//
+		// This field is required.
+		ActivityID string
+
+		// Details are the Activity heartbeat details to report.
+		// These values are encoded with the Client's DataConverter and may be
+		// stored externally if ExternalStorage is configured.
+		Details []any
+
+		// Optional fields for ActivitySerializationContext.
+
+		// ActivityType is the optional Activity Type to include in the Activity
+		// serialization context when encoding Details.
+		ActivityType string
+
+		// WorkflowType is the optional Workflow Type to include in the Activity
+		// serialization context when encoding Details.
+		WorkflowType string
+
+		// TaskQueue is the optional Task Queue to include in the Activity
+		// serialization context when encoding Details.
+		TaskQueue string
+	}
+
+	// CompleteActivityOptions provides options for CompleteActivityWithOptions.
+	//
+	// Serialization context values are not validated by the SDK. Providing
+	// incorrect values may cause serialization/deserialization mismatches if your
+	// codec uses them, for example, as encryption keys or signature input.
+	//
+	// Exposed as: [go.temporal.io/sdk/client.CompleteActivityOptions]
+	CompleteActivityOptions struct {
+		// TaskToken identifies the Activity Task to complete.
+		//
+		// This field is required.
+		TaskToken []byte
+
+		// Result completes the Activity as successful with this value.
+		// If both Result and Err are set, Err takes precedence.
+		Result any
+
+		// Err completes the Activity as failed or canceled with this error.
+		// If both Result and Err are set, Err takes precedence.
+		Err error
+
+		// Optional fields for ActivitySerializationContext.
+		// When set, these are passed to DataConverterWithSerializationContext and
+		// FailureConverterWithSerializationContext to provide activity metadata
+		// for encoding.
+
+		// Namespace is the optional Temporal Namespace to include in serialization
+		// and external storage context. If empty, the Client's Namespace is used
+		// for this context.
+		// This field does not change the Namespace used to complete the Activity,
+		// and should not differ from the Client's Namespace.
+		Namespace string
+
+		// WorkflowID is the optional Workflow ID to include in the Activity
+		// serialization context.
+		WorkflowID string
+
+		// ActivityType is the optional Activity Type to include in the Activity
+		// serialization context when encoding Result or Err.
+		ActivityType string
+
+		// WorkflowType is the optional Workflow Type to include in the Activity
+		// serialization context when encoding Result or Err.
+		WorkflowType string
+
+		// TaskQueue is the optional Task Queue to include in the Activity
+		// serialization context when encoding Result or Err.
+		TaskQueue string
+
+		// NexusSerializationContext is the Nexus serialization context to encode Result and Err with,
+		// in place of the Activity serialization context. When completing a standalone Activity started by a
+		// Nexus operation handler, set it to the value of activity.GetInfo(ctx).NexusSerializationContext
+		// captured in the Activity, because the Nexus caller decodes the result with that context.
+		// Leave nil otherwise.
+		//
+		// NOTE: Experimental
+		NexusSerializationContext *converter.NexusSerializationContext
+	}
+
+	// CompleteActivityByActivityIDOptions provides options for CompleteActivityByActivityIDWithOptions.
+	//
+	// WorkflowID, ActivityType, WorkflowType, and TaskQueue values are not validated
+	// by the SDK. Providing incorrect values may cause serialization/deserialization
+	// mismatches if your codec uses them, for example, as encryption keys or
+	// signature input.
+	//
+	// Exposed as: [go.temporal.io/sdk/client.CompleteActivityByActivityIDOptions]
+	CompleteActivityByActivityIDOptions struct {
+		// Namespace is the Temporal Namespace containing the Activity.
+		// This is the request Namespace used to locate the standalone Activity,
+		// matching the namespace parameter on CompleteActivityByActivityID.
+		//
+		// This field is required.
+		Namespace string
+
+		// ActivityID is the ID of the Activity to complete.
+		//
+		// This field is required.
+		ActivityID string
+
+		// ActivityRunID is the Run ID of the Activity to complete.
+		// Leave empty to target the latest run for ActivityID.
+		ActivityRunID string
+
+		// Result completes the Activity as successful with this value.
+		// If both Result and Err are set, Err takes precedence.
+		Result any
+
+		// Err completes the Activity as failed or canceled with this error.
+		// If both Result and Err are set, Err takes precedence.
+		Err error
+
+		// Optional fields for ActivitySerializationContext.
+
+		// WorkflowID is the optional Workflow ID to include in the Activity
+		// serialization context when encoding Result or Err.
+		WorkflowID string
+
+		// ActivityType is the optional Activity Type to include in the Activity
+		// serialization context when encoding Result or Err.
+		ActivityType string
+
+		// WorkflowType is the optional Workflow Type to include in the Activity
+		// serialization context when encoding Result or Err.
+		WorkflowType string
+
+		// TaskQueue is the optional Task Queue to include in the Activity
+		// serialization context when encoding Result or Err.
+		TaskQueue string
+
+		// NexusSerializationContext is the Nexus serialization context to encode Result and Err with,
+		// in place of the Activity serialization context. When completing a standalone Activity started by a
+		// Nexus operation handler, set it to the value of activity.GetInfo(ctx).NexusSerializationContext
+		// captured in the Activity, because the Nexus caller decodes the result with that context.
+		// Leave nil otherwise.
+		//
+		// NOTE: Experimental
+		NexusSerializationContext *converter.NexusSerializationContext
+	}
+
+	// RecordActivityHeartbeatOptions provides options for RecordActivityHeartbeatWithOptions.
+	//
+	// Serialization context values are not validated by the SDK. Providing
+	// incorrect values may cause serialization/deserialization mismatches if your
+	// codec uses them, for example, as encryption keys or signature input.
+	//
+	// Exposed as: [go.temporal.io/sdk/client.RecordActivityHeartbeatOptions]
+	RecordActivityHeartbeatOptions struct {
+		// TaskToken identifies the Activity Task to heartbeat.
+		//
+		// This field is required.
+		TaskToken []byte
+
+		// Details are the Activity heartbeat details to report.
+		// These values are encoded with the Client's DataConverter and may be
+		// stored externally if ExternalStorage is configured.
+		Details []any
+
+		// Optional fields for ActivitySerializationContext.
+
+		// Namespace is the optional Temporal Namespace to include in serialization
+		// and external storage context. If empty, the Client's Namespace is used
+		// for this context.
+		// This field does not change the Namespace used to heartbeat the Activity,
+		// and should not differ from the Client's Namespace.
+		Namespace string
+
+		// WorkflowID is the optional Workflow ID to include in the Activity
+		// serialization context when encoding Details.
+		WorkflowID string
+
+		// ActivityType is the optional Activity Type to include in the Activity
+		// serialization context when encoding Details.
+		ActivityType string
+
+		// WorkflowType is the optional Workflow Type to include in the Activity
+		// serialization context when encoding Details.
+		WorkflowType string
+
+		// TaskQueue is the optional Task Queue to include in the Activity
+		// serialization context when encoding Details.
+		TaskQueue string
+
+		// NexusSerializationContext is the Nexus serialization context to encode Details with, in
+		// place of the Activity serialization context. When heartbeating a standalone Activity started
+		// by a Nexus operation handler, set it to the value of activity.GetInfo(ctx).NexusSerializationContext
+		// captured in the Activity, because the worker and the Nexus caller decode the details with that
+		// context. Leave nil otherwise.
+		//
+		// NOTE: Experimental
+		NexusSerializationContext *converter.NexusSerializationContext
 	}
 
 	// ClientOptions are optional parameters for Client creation.
@@ -502,6 +972,17 @@ type (
 		// default: no extra options
 		ConnectionOptions ConnectionOptions
 
+		// RPCTimeout limits the duration of an SDK RPC, including retries. A shorter
+		// deadline on the call's context takes precedence. This can be raised to
+		// allow RPCs to take longer than the default 10 seconds.
+		//
+		// Calls with dedicated timeouts, such as long polls and GetSystemInfo, are
+		// not affected. This does not apply to direct calls on WorkflowService or
+		// OperatorService.
+		//
+		// Zero uses the default of 10 seconds. Negative values are not allowed.
+		RPCTimeout time.Duration
+
 		// Optional: HeadersProvider will be invoked on every outgoing gRPC request and gives user ability to
 		// set custom request headers. This can be used to set auth headers for example.
 		HeadersProvider HeadersProvider
@@ -530,9 +1011,51 @@ type (
 		//
 		// Plugins themselves should never mutate this field, the behavior is
 		// undefined.
+		Plugins []ClientPlugin
+
+		// WorkerHeartbeatInterval is the interval at which the worker will send heartbeats to the server.
+		// Interval must be between 1s and 60s, inclusive, or a negative value to disable.
+		//
+		// default: 0 defaults to 60s interval.
 		//
 		// NOTE: Experimental
-		Plugins []ClientPlugin
+		WorkerHeartbeatInterval time.Duration
+
+		// SdkName overrides the SDK name reported in worker heartbeats. When empty,
+		// the built-in SDKName ("temporal-go") is used. This is intended for SDKs that
+		// embed the Go SDK to run another language (e.g. roadrunner-temporal for PHP),
+		// so heartbeats report the wrapping SDK instead of temporal-go.
+		//
+		// NOTE: Experimental
+		SdkName string
+
+		// SdkVersion overrides the SDK version reported in worker heartbeats. When empty,
+		// the built-in SDKVersion is used. See SdkName.
+		//
+		// NOTE: Experimental
+		SdkVersion string
+
+		// DisableWorkerEnvironmentInfo disables reporting the runtime (Go version), detected hosting
+		// environments (Docker, Kubernetes, cloud platforms), and OS platform in worker heartbeats.
+		// This information is sent once per worker, with the first heartbeat accepted by the server.
+		//
+		// NOTE: Experimental
+		DisableWorkerEnvironmentInfo bool
+
+		// ExternalStorage configures external payload storage for this client.
+		// When set, payloads that exceed ExternalStorage.PayloadSizeThreshold
+		// are offloaded to an external store (e.g. S3, GCS) by the configured
+		// driver(s), and a storage reference is substituted into the history event.
+		// References are resolved back to the original payloads transparently before
+		// they reach the data converter or application code.
+		//
+		// NOTE: Experimental
+		ExternalStorage converter.ExternalStorage
+
+		// Configuration for when payload sizes exceed limits.
+		//
+		// NOTE: Experimental
+		PayloadLimits PayloadLimitOptions
 	}
 
 	// HeadersProvider returns a map of gRPC headers that should be used on every request.
@@ -543,7 +1066,7 @@ type (
 	// Result is either nil if API call is allowed or an error, in which case request would be interrupted and
 	// the error will be propagated back through the interceptor chain.
 	TrafficController interface {
-		CheckCallAllowed(ctx context.Context, method string, req, reply interface{}) error
+		CheckCallAllowed(ctx context.Context, method string, req, reply any) error
 	}
 
 	// ConnectionOptions is provided by SDK consumers to control optional connection params.
@@ -594,6 +1117,14 @@ type (
 		// MaxPayloadSize is a number of bytes that gRPC would allow to travel to and from server. Defaults to 128 MB.
 		MaxPayloadSize int
 
+		// GrpcCompression controls transport-level gRPC compression for requests
+		// sent to the Temporal server. If gzip is enabled and a specific server
+		// RPC does not support gzip, the client may retry that RPC without
+		// compression and continue using gzip for other RPCs.
+		//
+		// default: &GrpcCompressionGzip{}
+		GrpcCompression GrpcCompression
+
 		// Advanced dial options for gRPC connections. These are applied after the internal default dial options are
 		// applied. Therefore any dial options here may override internal ones. Dial options WithBlock, WithTimeout,
 		// WithReturnConnectionError, and FailOnNonTempDialError are ignored since [grpc.NewClient] is used.
@@ -613,6 +1144,53 @@ type (
 		// be created as false. This is set to true when server capabilities are
 		// fetched.
 		excludeInternalFromRetry *atomic.Bool
+	}
+
+	// CancelWorkflowOptions contains parameters for cancelling a workflow execution.
+	//
+	// Exposed as: [go.temporal.io/sdk/client.CancelWorkflowOptions]
+	CancelWorkflowOptions struct {
+		// WorkflowID is the ID of the workflow execution to cancel.
+		WorkflowID string
+
+		// RunID is the run ID of the workflow execution to cancel. If empty, the
+		// currently running execution for WorkflowID is targeted. This field is
+		// ignored when FirstExecutionRunID is set.
+		RunID string
+
+		// FirstExecutionRunID is the run ID of the first execution in the workflow
+		// execution chain. If set, RunID is ignored and the currently running
+		// execution for WorkflowID is targeted. The request fails if that execution
+		// is not part of this chain.
+		FirstExecutionRunID string
+
+		// Reason is the reason for requesting cancellation of the workflow execution.
+		Reason string
+	}
+
+	// TerminateWorkflowOptions contains parameters for terminating a workflow execution.
+	//
+	// Exposed as: [go.temporal.io/sdk/client.TerminateWorkflowOptions]
+	TerminateWorkflowOptions struct {
+		// WorkflowID is the ID of the workflow execution to terminate.
+		WorkflowID string
+
+		// RunID is the run ID of the workflow execution to terminate. If empty,
+		// the currently running execution for WorkflowID is targeted. This field is
+		// ignored when FirstExecutionRunID is set.
+		RunID string
+
+		// FirstExecutionRunID is the run ID of the first execution in the workflow
+		// execution chain. If set, RunID is ignored and the currently running
+		// execution for WorkflowID is targeted. The request fails if that execution
+		// is not part of this chain.
+		FirstExecutionRunID string
+
+		// Reason is the reason for terminating the workflow execution.
+		Reason string
+
+		// Details are additional values attached to the termination event.
+		Details []any
 	}
 
 	// StartWorkflowOptions configuration parameters for starting a workflow execution.
@@ -708,7 +1286,7 @@ type (
 		CronSchedule string
 
 		// Memo - Optional non-indexed info that will be shown in list workflow.
-		Memo map[string]interface{}
+		Memo map[string]any
 
 		// SearchAttributes - Optional indexed info that can be used in query of List/Scan/Count workflow APIs. The key and value type must be registered on Temporal server side.
 		// Use GetSearchAttributes API to get valid key and corresponding value type.
@@ -717,7 +1295,7 @@ type (
 		// Deprecated: use TypedSearchAttributes instead.
 		//
 		// [Visibility]: https://docs.temporal.io/visibility
-		SearchAttributes map[string]interface{}
+		SearchAttributes map[string]any
 
 		// TypedSearchAttributes - Specifies Search Attributes that will be attached to the Workflow. Search Attributes are
 		// additional indexed information attributed to workflow and used for search and visibility. The search attributes
@@ -747,8 +1325,6 @@ type (
 		// in single-line Temporal markdown format.
 		//
 		// Optional: defaults to none/empty.
-		//
-		// NOTE: Experimental
 		StaticSummary string
 
 		// Details - General fixed details for this workflow execution that will appear in UI/CLI. This can be in
@@ -756,8 +1332,6 @@ type (
 		// updated. For details that can be updated, use SetCurrentDetails within the workflow.
 		//
 		// Optional: defaults to none/empty.
-		//
-		// NOTE: Experimental
 		StaticDetails string
 
 		// VersioningOverride - Sets the versioning configuration of a specific workflow execution, ignoring current
@@ -765,14 +1339,10 @@ type (
 		// To unset the override after the workflow is running, use [UpdateWorkflowExecutionOptions].
 		//
 		// Optional: defaults to no override.
-		//
-		// NOTE: Experimental
 		VersioningOverride VersioningOverride
 
 		// Priority - Optional priority settings that control relative ordering of
 		// task processing when tasks are backed up in a queue.
-		//
-		// WARNING: Task queue priority is currently experimental.
 		Priority Priority
 
 		// responseInfo - Optional pointer to store information of StartWorkflowExecution response.
@@ -814,7 +1384,8 @@ type (
 		input *ClientExecuteWorkflowInput
 		// flag to ensure the operation is only executed once
 		executed atomic.Bool
-		// channel to indicate that handle or err is available
+		// doneCh is closed by withStartWorkflowOperationImpl.set() once workflowRun/err is available.
+		// Get() waits on doneCh; workflowRun and err must not be read before it closes.
 		doneCh chan struct{}
 		// workflowRun and err cannot be accessed before doneCh is closed
 		workflowRun WorkflowRun
@@ -866,8 +1437,6 @@ type (
 	// For all fields, the field not present or equal to zero/empty string means to
 	// inherit the value from the calling workflow, or if there is no calling
 	// workflow, then use the default value.
-	//
-	// WARNING: Task queue priority is currently experimental.
 	//
 	// Exposed as: [go.temporal.io/sdk/temporal.Priority]
 	Priority struct {
@@ -1007,12 +1576,15 @@ func newClient(ctx context.Context, options ClientOptions, existing Client) (Cli
 
 	if options.Logger == nil {
 		options.Logger = ilog.NewDefaultLogger()
-		options.Logger.Info("No logger configured for temporal client. Created default one.")
 	}
 
 	// Validate mutually exclusive TLS options
 	if options.ConnectionOptions.TLS != nil && options.ConnectionOptions.TLSDisabled {
 		return nil, fmt.Errorf("cannot set both TLS and TLSDisabled in ConnectionOptions")
+	}
+
+	if options.RPCTimeout < 0 {
+		return nil, fmt.Errorf("RPCTimeout must not be negative: %v", options.RPCTimeout)
 	}
 
 	if options.Credentials != nil {
@@ -1061,6 +1633,7 @@ func newClientPluginRoot(ctx context.Context, options ClientPluginNewClientOptio
 		}
 	} else if existing, _ = options.FromExisting.(*WorkflowClient); existing != nil {
 		connection = existing.conn
+		options.ClientOptions.ConnectionOptions.excludeInternalFromRetry = existing.excludeInternalFromRetry
 	} else if options.FromExisting != nil {
 		return nil, fmt.Errorf("existing client must have been created directly from a client package call")
 	}
@@ -1101,6 +1674,7 @@ func newDialParameters(options *ClientOptions, excludeInternalFromRetry *atomic.
 
 // NewServiceClient creates workflow client from workflowservice.WorkflowServiceClient. Must be used internally in unit tests only.
 func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClient, conn *grpc.ClientConn, options ClientOptions) *WorkflowClient {
+	headerCodec := headerCodecFromDataConverter(options.DataConverter)
 	// Namespace can be empty in unit tests.
 	if options.Namespace == "" {
 		options.Namespace = DefaultNamespace
@@ -1113,6 +1687,7 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 	if options.DataConverter == nil {
 		options.DataConverter = converter.GetDefaultDataConverter()
 	}
+	options.DataConverter = MakeTransferAware(options.DataConverter)
 
 	if options.FailureConverter == nil {
 		options.FailureConverter = GetDefaultFailureConverter()
@@ -1132,7 +1707,9 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 
 	// Collect set of applicable worker plugins and interceptors
 	var workerPlugins []WorkerPlugin
+	var clientPlugins []ClientPlugin
 	for _, plugin := range options.Plugins {
+		clientPlugins = append(clientPlugins, plugin)
 		if workerPlugin, _ := plugin.(WorkerPlugin); workerPlugin != nil {
 			workerPlugins = append(workerPlugins, workerPlugin)
 		}
@@ -1144,6 +1721,40 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 		}
 	}
 
+	var heartbeatInterval time.Duration
+	if options.WorkerHeartbeatInterval < 0 {
+		heartbeatInterval = 0
+	} else if options.WorkerHeartbeatInterval == 0 {
+		heartbeatInterval = 60 * time.Second
+	} else {
+		if options.WorkerHeartbeatInterval < time.Second || options.WorkerHeartbeatInterval > 60*time.Second {
+			panic("WorkerHeartbeatInterval must be between 1 second and 60 seconds")
+		}
+		heartbeatInterval = options.WorkerHeartbeatInterval
+	}
+
+	storageParams, err := extstore.ExternalStorageToParams(options.ExternalStorage)
+	if err != nil {
+		panic(fmt.Sprintf("invalid ExternalStorage options: %v", err))
+	}
+
+	storageDriverTypes := collectStorageDriverTypes(options.ExternalStorage.Drivers)
+
+	payloadWarningLimits, err := payloadLimitOptionsToLimits(options.PayloadLimits)
+	if err != nil {
+		panic(fmt.Sprintf("invalid PayloadLimits options: %v", err))
+	}
+
+	// Fall back to the built-in SDK name/version when not overridden.
+	sdkName := options.SdkName
+	if sdkName == "" {
+		sdkName = SDKName
+	}
+	sdkVersion := options.SdkVersion
+	if sdkVersion == "" {
+		sdkVersion = SDKVersion
+	}
+
 	client := &WorkflowClient{
 		workflowService:          workflowServiceClient,
 		conn:                     conn,
@@ -1153,19 +1764,37 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 		logger:                   options.Logger,
 		identity:                 options.Identity,
 		dataConverter:            options.DataConverter,
+		headerCodec:              headerCodec,
 		failureConverter:         options.FailureConverter,
 		contextPropagators:       options.ContextPropagators,
 		workerPlugins:            workerPlugins,
 		workerInterceptors:       workerInterceptors,
+		clientPlugins:            clientPlugins,
 		excludeInternalFromRetry: options.ConnectionOptions.excludeInternalFromRetry,
 		eagerDispatcher: &eagerWorkflowDispatcher{
 			workersByTaskQueue: make(map[string]map[eagerWorker]struct{}),
 		},
-		getSystemInfoTimeout: options.ConnectionOptions.GetSystemInfoTimeout,
+		getSystemInfoTimeout:    options.ConnectionOptions.GetSystemInfoTimeout,
+		rpcTimeout:              options.RPCTimeout,
+		workerHeartbeatInterval: heartbeatInterval,
+		workerGroupingKey:       uuid.NewString(),
+		sdkName:                 sdkName,
+		sdkVersion:              sdkVersion,
+		storageParams:           storageParams,
+		storageDriverTypes:      storageDriverTypes,
+		payloadWarningLimits:    payloadWarningLimits,
+	}
+
+	if heartbeatInterval > 0 {
+		client.heartbeatManager = newHeartbeatManager(client, heartbeatInterval, client.logger, options.DisableWorkerEnvironmentInfo)
 	}
 
 	// Create outbound interceptor by wrapping backwards through chain
-	client.interceptor = &workflowClientInterceptor{client: client}
+	client.interceptor = &workflowClientInterceptor{
+		client:                 client,
+		inboundPayloadVisitor:  extstore.NewExternalRetrievalVisitor(storageParams.WithLogger(client.logger)),
+		outboundPayloadVisitor: client.newOutboundPayloadVisitor(),
+	}
 	for i := len(options.Interceptors) - 1; i >= 0; i-- {
 		client.interceptor = options.Interceptors[i].InterceptClient(client.interceptor)
 	}
@@ -1202,6 +1831,10 @@ func (op *withStartWorkflowOperationImpl) set(workflowRun WorkflowRun, err error
 //
 // Exposed as: [go.temporal.io/sdk/client.NewNamespaceClient]
 func NewNamespaceClient(options ClientOptions) (NamespaceClient, error) {
+	if options.RPCTimeout < 0 {
+		return nil, fmt.Errorf("RPCTimeout must not be negative: %v", options.RPCTimeout)
+	}
+
 	// Initialize root tags
 	if options.MetricsHandler == nil {
 		options.MetricsHandler = metrics.NopHandler
@@ -1231,12 +1864,13 @@ func newNamespaceServiceClient(workflowServiceClient workflowservice.WorkflowSer
 		metricsHandler:   options.MetricsHandler,
 		logger:           options.Logger,
 		identity:         options.Identity,
+		rpcTimeout:       options.RPCTimeout,
 	}
 }
 
 // NewValue creates a new converter.EncodedValue which can be used to decode binary data returned by Temporal.  For example:
-// User had Activity.RecordHeartbeat(ctx, "my-heartbeat") and then got response from calling Client.DescribeWorkflowExecution.
-// The response contains binary field PendingActivityInfo.HeartbeatDetails,
+// User had Activity.RecordHeartbeat(ctx, "my-heartbeat") and then got a response from calling Client.DescribeWorkflow.
+// The response's RawResponse contains the binary field PendingActivityInfo.HeartbeatDetails,
 // which can be decoded by using:
 //
 //	var result string // This need to be same type as the one passed to RecordHeartbeat
@@ -1248,8 +1882,8 @@ func NewValue(data *commonpb.Payloads) converter.EncodedValue {
 }
 
 // NewValues creates a new converter.EncodedValues which can be used to decode binary data returned by Temporal. For example:
-// User had Activity.RecordHeartbeat(ctx, "my-heartbeat", 123) and then got response from calling Client.DescribeWorkflowExecution.
-// The response contains binary field PendingActivityInfo.HeartbeatDetails,
+// User had Activity.RecordHeartbeat(ctx, "my-heartbeat", 123) and then got a response from calling Client.DescribeWorkflow.
+// The response's RawResponse contains the binary field PendingActivityInfo.HeartbeatDetails,
 // which can be decoded by using:
 //
 //	var result1 string
@@ -1313,8 +1947,12 @@ func (m mTLSCredentials) applyToOptions(opts *ConnectionOptions) error {
 		opts.TLS = &tls.Config{}
 	} else if len(opts.TLS.Certificates) != 0 {
 		return fmt.Errorf("cannot apply mTLS credentials, certificates already exist on TLS options")
+	} else {
+		opts.TLS = opts.TLS.Clone()
 	}
-	opts.TLS.Certificates = append(opts.TLS.Certificates, tls.Certificate(m))
+
+	// Use a new slice because Clone shares the certificate backing array.
+	opts.TLS.Certificates = []tls.Certificate{tls.Certificate(m)}
 	return nil
 }
 
@@ -1344,22 +1982,46 @@ func (e *WorkflowUpdateServiceTimeoutOrCanceledError) Error() string {
 
 func (e *WorkflowUpdateServiceTimeoutOrCanceledError) Unwrap() error { return e.cause }
 
-// SetRequestIDOnStartWorkflowOptions is an internal only method for setting a requestID on StartWorkflowOptions.
-// RequestID is purposefully not exposed to users for the time being.
-func SetRequestIDOnStartWorkflowOptions(opts *StartWorkflowOptions, requestID string) {
-	opts.requestID = requestID
+// interface utility wrapper to allow setting links and callbacks
+// on temporal primitive operation options (UpdateWorkflowOptions, StartWorkflowOptions)
+type nexusTemporalOperationOptions interface {
+	setRequestID(requestID string)
+	setLinks(links []*commonpb.Link)
+	setCallbacks(callbacks []*commonpb.Callback)
 }
 
-// SetCallbacksOnStartWorkflowOptions is an internal only method for setting callbacks on StartWorkflowOptions.
-// Callbacks are purposefully not exposed to users for the time being.
-func SetCallbacksOnStartWorkflowOptions(opts *StartWorkflowOptions, callbacks []*commonpb.Callback) {
-	opts.callbacks = callbacks
+// nexusTemporalOperationOptions conforming interfaces
+var (
+	_ nexusTemporalOperationOptions = (*UpdateWorkflowOptions)(nil)
+	_ nexusTemporalOperationOptions = (*StartWorkflowOptions)(nil)
+)
+
+// Set links on any [nexusTemporalOperationOptions] interface via the setLinks API.
+//
+// Intended to be used only internally as a consistent way of setting
+// links on all Nexus Operations
+func SetLinksOnNexusOperation(opts nexusTemporalOperationOptions, links []*commonpb.Link) {
+	opts.setLinks(links)
 }
 
-// SetLinksOnStartWorkflowOptions is an internal only method for setting links on StartWorkflowOptions.
-// Links are purposefully not exposed to users for the time being.
-func SetLinksOnStartWorkflowOptions(opts *StartWorkflowOptions, links []*commonpb.Link) {
-	opts.links = links
+// Set callbacks on any [nexusTemporalOperationOptions] interface via the setCallbacks API.
+//
+// Intended to be used only internally as a consistent way of setting
+// callbacks on all Nexus Operations
+func SetCallbacksOnNexusOperation(opts nexusTemporalOperationOptions, callbacks []*commonpb.Callback) {
+	opts.setCallbacks(callbacks)
+}
+
+// Set non-empty requestID on any [nexusTemporalOperationOptions] interface via the setRequestID API.
+// Used for deduping requests server-side
+//
+// Intended to be used only internally as a consistent way of setting
+// requestIDs on all Nexus Operations
+func SetRequestIDOnNexusOperation(opts nexusTemporalOperationOptions, requestID string) {
+	if requestID == "" {
+		return
+	}
+	opts.setRequestID(requestID)
 }
 
 // SetOnConflictOptionsOnStartWorkflowOptions is an internal only method for setting conflict
@@ -1381,4 +2043,31 @@ func SetResponseInfoOnStartWorkflowOptions(opts *StartWorkflowOptions) *startWor
 		opts.responseInfo = &startWorkflowResponseInfo{}
 	}
 	return opts.responseInfo
+}
+
+// SetResponseInfoOnUpdateWorkflowOptions is an internal only method to set and return a
+// responseInfo pointer. This is done to capture links from the response RPC to be used
+// for nexus forward links on UpdateWorkflow Nexus Operations
+func SetResponseInfoOnUpdateWorkflowOptions(opts *UpdateWorkflowOptions) *updateWorkflowResponseInfo {
+	if opts.responseInfo == nil {
+		opts.responseInfo = &updateWorkflowResponseInfo{}
+	}
+	return opts.responseInfo
+}
+
+// collectStorageDriverTypes returns deduplicated driver types from the given drivers.
+func collectStorageDriverTypes(drivers []converter.StorageDriver) []string {
+	if len(drivers) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(drivers))
+	result := make([]string, 0, len(drivers))
+	for _, d := range drivers {
+		t := d.Type()
+		if _, found := seen[t]; !found {
+			seen[t] = struct{}{}
+			result = append(result, t)
+		}
+	}
+	return result
 }

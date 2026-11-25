@@ -479,8 +479,32 @@ type NamespaceInfo_Capabilities struct {
 	WorkflowPause bool `protobuf:"varint,6,opt,name=workflow_pause,json=workflowPause,proto3" json:"workflow_pause,omitempty"`
 	// True if the namespace supports standalone activities
 	StandaloneActivities bool `protobuf:"varint,7,opt,name=standalone_activities,json=standaloneActivities,proto3" json:"standalone_activities,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// True if the namespace supports server-side completion of outstanding worker polls on shutdown.
+	// When enabled, the server will complete polls for workers that send WorkerInstanceKey in their
+	// poll requests and call ShutdownWorker with the same WorkerInstanceKey. The poll will return
+	// an empty response. When this flag is true, workers should allow polls to return gracefully
+	// rather than terminating any open polls on shutdown.
+	WorkerPollCompleteOnShutdown bool `protobuf:"varint,8,opt,name=worker_poll_complete_on_shutdown,json=workerPollCompleteOnShutdown,proto3" json:"worker_poll_complete_on_shutdown,omitempty"`
+	// True if the namespace supports poller autoscaling
+	PollerAutoscaling bool `protobuf:"varint,9,opt,name=poller_autoscaling,json=pollerAutoscaling,proto3" json:"poller_autoscaling,omitempty"`
+	// True if the namespace supports worker commands (server-to-worker communication via control queues).
+	WorkerCommands bool `protobuf:"varint,10,opt,name=worker_commands,json=workerCommands,proto3" json:"worker_commands,omitempty"`
+	// True if the namespace supports standalone Nexus operations.
+	StandaloneNexusOperation bool `protobuf:"varint,11,opt,name=standalone_nexus_operation,json=standaloneNexusOperation,proto3" json:"standalone_nexus_operation,omitempty"`
+	// True if the namespace supports attaching callbacks on workflow updates
+	WorkflowUpdateCallbacks bool `protobuf:"varint,12,opt,name=workflow_update_callbacks,json=workflowUpdateCallbacks,proto3" json:"workflow_update_callbacks,omitempty"`
+	// When true, workers should use poller autoscaling by default unless explicitly configured otherwise.
+	PollerAutoscalingAutoEnroll bool `protobuf:"varint,13,opt,name=poller_autoscaling_auto_enroll,json=pollerAutoscalingAutoEnroll,proto3" json:"poller_autoscaling_auto_enroll,omitempty"`
+	// True if the namespace supports pagination of `RespondWorkflowTaskCompleted` request.
+	WorkflowTaskCompletionPagination bool `protobuf:"varint,14,opt,name=workflow_task_completion_pagination,json=workflowTaskCompletionPagination,proto3" json:"workflow_task_completion_pagination,omitempty"`
+	// True if the namespace supports start delay for standalone activities.
+	StandaloneActivityStartDelay bool `protobuf:"varint,15,opt,name=standalone_activity_start_delay,json=standaloneActivityStartDelay,proto3" json:"standalone_activity_start_delay,omitempty"`
+	// True if the namespace supports batch operations for standalone activities.
+	StandaloneActivityBatchOperations bool `protobuf:"varint,16,opt,name=standalone_activity_batch_operations,json=standaloneActivityBatchOperations,proto3" json:"standalone_activity_batch_operations,omitempty"`
+	// True if the namespace supports standalone activity operator commands.
+	StandaloneActivityOperatorCommands bool `protobuf:"varint,17,opt,name=standalone_activity_operator_commands,json=standaloneActivityOperatorCommands,proto3" json:"standalone_activity_operator_commands,omitempty"`
+	unknownFields                      protoimpl.UnknownFields
+	sizeCache                          protoimpl.SizeCache
 }
 
 func (x *NamespaceInfo_Capabilities) Reset() {
@@ -562,6 +586,76 @@ func (x *NamespaceInfo_Capabilities) GetStandaloneActivities() bool {
 	return false
 }
 
+func (x *NamespaceInfo_Capabilities) GetWorkerPollCompleteOnShutdown() bool {
+	if x != nil {
+		return x.WorkerPollCompleteOnShutdown
+	}
+	return false
+}
+
+func (x *NamespaceInfo_Capabilities) GetPollerAutoscaling() bool {
+	if x != nil {
+		return x.PollerAutoscaling
+	}
+	return false
+}
+
+func (x *NamespaceInfo_Capabilities) GetWorkerCommands() bool {
+	if x != nil {
+		return x.WorkerCommands
+	}
+	return false
+}
+
+func (x *NamespaceInfo_Capabilities) GetStandaloneNexusOperation() bool {
+	if x != nil {
+		return x.StandaloneNexusOperation
+	}
+	return false
+}
+
+func (x *NamespaceInfo_Capabilities) GetWorkflowUpdateCallbacks() bool {
+	if x != nil {
+		return x.WorkflowUpdateCallbacks
+	}
+	return false
+}
+
+func (x *NamespaceInfo_Capabilities) GetPollerAutoscalingAutoEnroll() bool {
+	if x != nil {
+		return x.PollerAutoscalingAutoEnroll
+	}
+	return false
+}
+
+func (x *NamespaceInfo_Capabilities) GetWorkflowTaskCompletionPagination() bool {
+	if x != nil {
+		return x.WorkflowTaskCompletionPagination
+	}
+	return false
+}
+
+func (x *NamespaceInfo_Capabilities) GetStandaloneActivityStartDelay() bool {
+	if x != nil {
+		return x.StandaloneActivityStartDelay
+	}
+	return false
+}
+
+func (x *NamespaceInfo_Capabilities) GetStandaloneActivityBatchOperations() bool {
+	if x != nil {
+		return x.StandaloneActivityBatchOperations
+	}
+	return false
+}
+
+func (x *NamespaceInfo_Capabilities) GetStandaloneActivityOperatorCommands() bool {
+	if x != nil {
+		return x.StandaloneActivityOperatorCommands
+	}
+	return false
+}
+
 type NamespaceInfo_Limits struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Maximum size in bytes for payload fields in workflow history events
@@ -570,8 +664,12 @@ type NamespaceInfo_Limits struct {
 	BlobSizeLimitError int64 `protobuf:"varint,1,opt,name=blob_size_limit_error,json=blobSizeLimitError,proto3" json:"blob_size_limit_error,omitempty"`
 	// Maximum total memo size in bytes per workflow execution.
 	MemoSizeLimitError int64 `protobuf:"varint,2,opt,name=memo_size_limit_error,json=memoSizeLimitError,proto3" json:"memo_size_limit_error,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Maximum total size in bytes of a single RespondWorkflowTaskCompleted request.
+	// Requests exceeding this fail the workflow task with
+	// WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE. 0 means no explicit limit.
+	WorkflowTaskCompletionSizeLimitError int64 `protobuf:"varint,3,opt,name=workflow_task_completion_size_limit_error,json=workflowTaskCompletionSizeLimitError,proto3" json:"workflow_task_completion_size_limit_error,omitempty"`
+	unknownFields                        protoimpl.UnknownFields
+	sizeCache                            protoimpl.SizeCache
 }
 
 func (x *NamespaceInfo_Limits) Reset() {
@@ -618,11 +716,18 @@ func (x *NamespaceInfo_Limits) GetMemoSizeLimitError() int64 {
 	return 0
 }
 
+func (x *NamespaceInfo_Limits) GetWorkflowTaskCompletionSizeLimitError() int64 {
+	if x != nil {
+		return x.WorkflowTaskCompletionSizeLimitError
+	}
+	return 0
+}
+
 var File_temporal_api_namespace_v1_message_proto protoreflect.FileDescriptor
 
 const file_temporal_api_namespace_v1_message_proto_rawDesc = "" +
 	"\n" +
-	"'temporal/api/namespace/v1/message.proto\x12\x19temporal.api.namespace.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a%temporal/api/enums/v1/namespace.proto\"\xd4\a\n" +
+	"'temporal/api/namespace/v1/message.proto\x12\x19temporal.api.namespace.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a%temporal/api/enums/v1/namespace.proto\"\xc7\r\n" +
 	"\rNamespaceInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12;\n" +
 	"\x05state\x18\x02 \x01(\x0e2%.temporal.api.enums.v1.NamespaceStateR\x05state\x12 \n" +
@@ -636,7 +741,7 @@ const file_temporal_api_namespace_v1_message_proto_rawDesc = "" +
 	"\x12supports_schedules\x18d \x01(\bR\x11supportsSchedules\x1a7\n" +
 	"\tDataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a\xda\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a\xf3\a\n" +
 	"\fCapabilities\x120\n" +
 	"\x14eager_workflow_start\x18\x01 \x01(\bR\x12eagerWorkflowStart\x12\x1f\n" +
 	"\vsync_update\x18\x02 \x01(\bR\n" +
@@ -645,10 +750,22 @@ const file_temporal_api_namespace_v1_message_proto_rawDesc = "" +
 	"\x11worker_heartbeats\x18\x04 \x01(\bR\x10workerHeartbeats\x12K\n" +
 	"\"reported_problems_search_attribute\x18\x05 \x01(\bR\x1freportedProblemsSearchAttribute\x12%\n" +
 	"\x0eworkflow_pause\x18\x06 \x01(\bR\rworkflowPause\x123\n" +
-	"\x15standalone_activities\x18\a \x01(\bR\x14standaloneActivities\x1an\n" +
+	"\x15standalone_activities\x18\a \x01(\bR\x14standaloneActivities\x12F\n" +
+	" worker_poll_complete_on_shutdown\x18\b \x01(\bR\x1cworkerPollCompleteOnShutdown\x12-\n" +
+	"\x12poller_autoscaling\x18\t \x01(\bR\x11pollerAutoscaling\x12'\n" +
+	"\x0fworker_commands\x18\n" +
+	" \x01(\bR\x0eworkerCommands\x12<\n" +
+	"\x1astandalone_nexus_operation\x18\v \x01(\bR\x18standaloneNexusOperation\x12:\n" +
+	"\x19workflow_update_callbacks\x18\f \x01(\bR\x17workflowUpdateCallbacks\x12C\n" +
+	"\x1epoller_autoscaling_auto_enroll\x18\r \x01(\bR\x1bpollerAutoscalingAutoEnroll\x12M\n" +
+	"#workflow_task_completion_pagination\x18\x0e \x01(\bR workflowTaskCompletionPagination\x12E\n" +
+	"\x1fstandalone_activity_start_delay\x18\x0f \x01(\bR\x1cstandaloneActivityStartDelay\x12O\n" +
+	"$standalone_activity_batch_operations\x18\x10 \x01(\bR!standaloneActivityBatchOperations\x12Q\n" +
+	"%standalone_activity_operator_commands\x18\x11 \x01(\bR\"standaloneActivityOperatorCommands\x1a\xc7\x01\n" +
 	"\x06Limits\x121\n" +
 	"\x15blob_size_limit_error\x18\x01 \x01(\x03R\x12blobSizeLimitError\x121\n" +
-	"\x15memo_size_limit_error\x18\x02 \x01(\x03R\x12memoSizeLimitError\"\xcf\x05\n" +
+	"\x15memo_size_limit_error\x18\x02 \x01(\x03R\x12memoSizeLimitError\x12W\n" +
+	")workflow_task_completion_size_limit_error\x18\x03 \x01(\x03R$workflowTaskCompletionSizeLimitError\"\xcf\x05\n" +
 	"\x0fNamespaceConfig\x12b\n" +
 	" workflow_execution_retention_ttl\x18\x01 \x01(\v2\x19.google.protobuf.DurationR\x1dworkflowExecutionRetentionTtl\x12I\n" +
 	"\fbad_binaries\x18\x02 \x01(\v2&.temporal.api.namespace.v1.BadBinariesR\vbadBinaries\x12Z\n" +

@@ -1,9 +1,11 @@
 package internal
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"strconv"
 	"strings"
@@ -25,6 +27,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	failurepb "go.temporal.io/api/failure/v1"
 	nexuspb "go.temporal.io/api/nexus/v1"
+	sdk "go.temporal.io/api/sdk/v1"
 	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -66,8 +69,19 @@ type (
 
 	testActivityHandle struct {
 		callback         ResultHandler
-		activityType     string
 		heartbeatDetails *commonpb.Payloads
+		token            testActivityToken
+		task             *workflowservice.PollActivityTaskQueueResponse
+		// Per-activity context-aware converters for async completion path.
+		dataConverter    converter.DataConverter
+		failureConverter converter.FailureConverter
+		// Timeout tracking
+		startTime         time.Time // when activity started executing
+		lastHeartbeatTime time.Time
+		// Timeout result (set by monitoring goroutine)
+		timedOut           bool
+		timeoutType        enumspb.TimeoutType // which timeout occurred
+		cancelTimeoutWatch func()              // cancels the timeout monitoring goroutine
 	}
 
 	testWorkflowHandle struct {
@@ -81,7 +95,7 @@ type (
 	testNexusOperationHandle struct {
 		env             *testWorkflowEnvironmentImpl
 		seq             int64
-		params          executeNexusOperationParams
+		params          ExecuteNexusOperationParams
 		operationToken  string
 		cancelRequested bool
 		started         bool
@@ -110,6 +124,13 @@ type (
 		env               *testWorkflowEnvironmentImpl
 	}
 
+	// activityTimeoutResult is a marker type used to indicate that an activity
+	// timed out due to missing heartbeats or exceeding StartToCloseTimeout.
+	activityTimeoutResult struct {
+		timeoutType enumspb.TimeoutType
+		details     *commonpb.Payloads // last heartbeat details (for heartbeat timeout)
+	}
+
 	activityExecutorWrapper struct {
 		*activityExecutor
 		env *testWorkflowEnvironmentImpl
@@ -120,21 +141,27 @@ type (
 		env *testWorkflowEnvironmentImpl
 	}
 
+	testWorkflowDefinitionWrapper struct {
+		WorkflowDefinition
+		env     *testWorkflowEnvironmentImpl
+		started bool
+	}
+
 	mockWrapper struct {
 		env           *testWorkflowEnvironmentImpl
 		name          string
-		fn            interface{}
+		fn            any
 		isWorkflow    bool
 		dataConverter converter.DataConverter
 	}
 
 	taskQueueSpecificActivity struct {
-		fn         interface{}
+		fn         any
 		taskQueues map[string]struct{}
 	}
 
 	updateResult struct {
-		success   interface{}
+		success   any
 		err       error
 		update_id string
 		callbacks []updateCallbacksWrapper
@@ -161,12 +188,13 @@ type (
 		mockClock *clock.Mock
 		wallClock clock.Clock
 
-		callbackChannel chan testCallbackHandle
-		testTimeout     time.Duration
-		header          *commonpb.Header
+		callbackChannel            chan testCallbackHandle
+		testTimeout                time.Duration
+		activityTimeoutGracePeriod time.Duration // grace period for activities to react to context deadline
+		header                     *commonpb.Header
 
 		counterID              int64
-		activities             map[string]*testActivityHandle
+		activities             map[testActivityToken]*testActivityHandle
 		localActivities        map[string]*localActivityTask
 		timers                 map[string]*testTimerHandle
 		runningWorkflows       map[string]*testWorkflowHandle
@@ -183,7 +211,7 @@ type (
 		onActivityStartedListener         func(activityInfo *ActivityInfo, ctx context.Context, args converter.EncodedValues)
 		onActivityCompletedListener       func(activityInfo *ActivityInfo, result converter.EncodedValue, err error)
 		onActivityCanceledListener        func(activityInfo *ActivityInfo)
-		onLocalActivityStartedListener    func(activityInfo *ActivityInfo, ctx context.Context, args []interface{})
+		onLocalActivityStartedListener    func(activityInfo *ActivityInfo, ctx context.Context, args []any)
 		onLocalActivityCompletedListener  func(activityInfo *ActivityInfo, result converter.EncodedValue, err error)
 		onLocalActivityCanceledListener   func(activityInfo *ActivityInfo)
 		onActivityHeartbeatListener       func(activityInfo *ActivityInfo, details converter.EncodedValues)
@@ -208,6 +236,12 @@ type (
 		workflowDef    WorkflowDefinition
 		changeVersions map[string]Version
 		openSessions   map[string]*SessionInfo
+		randoms        map[string]*workflowRandomStream
+
+		// mutableSideEffect holds the last recorded value per MutableSideEffect id
+		// so the test environment can honor the user-supplied equals function the
+		// same way the real worker does (only update when the value changed).
+		mutableSideEffect map[string]*commonpb.Payloads
 
 		workflowCancelHandler func()
 		signalHandler         func(name string, input *commonpb.Payloads, header *commonpb.Header) error
@@ -220,18 +254,28 @@ type (
 		testResult          converter.EncodedValue
 		testError           error
 		doneChannel         chan struct{}
+		doneChannelOnce     sync.Once
 		workerOptions       WorkerOptions
 		dataConverter       converter.DataConverter
 		failureConverter    converter.FailureConverter
 		runTimeout          time.Duration
+
+		rootDataConverter    converter.DataConverter
+		rootFailureConverter converter.FailureConverter
 
 		heartbeatDetails *commonpb.Payloads
 
 		workerStopChannel  chan struct{}
 		sessionEnvironment *testSessionEnvironmentImpl
 
+		workerInstanceKey     string
+		plugins               []WorkerPlugin
+		pluginRegistryOptions WorkerPluginConfigureWorkerRegistryOptions
+		restoreRegistry       func()
+
 		// True if this was created only for testing activities not workflows.
-		activityEnvOnly bool
+		activityEnvOnly             bool
+		executeActivitiesInWorkflow bool
 
 		workflowFunctionExecuting bool
 		bufferedUpdateRequests    map[string][]func()
@@ -249,6 +293,11 @@ type (
 		uc       UpdateCallbacks
 		env      *testWorkflowEnvironmentImpl
 		updateID string
+	}
+
+	testActivityToken struct {
+		activityID string
+		runID      string
 	}
 )
 
@@ -270,7 +319,7 @@ func newTestWorkflowEnvironmentImpl(s *WorkflowTestSuite, parentRegistry *regist
 			mockClock:                 clock.NewMock(),
 			wallClock:                 clock.New(),
 			timers:                    make(map[string]*testTimerHandle),
-			activities:                make(map[string]*testActivityHandle),
+			activities:                make(map[testActivityToken]*testActivityHandle),
 			localActivities:           make(map[string]*localActivityTask),
 			runningWorkflows:          make(map[string]*testWorkflowHandle),
 			runningNexusOperations:    make(map[int64]*testNexusOperationHandle),
@@ -296,18 +345,22 @@ func newTestWorkflowEnvironmentImpl(s *WorkflowTestSuite, parentRegistry *regist
 			WorkflowTaskTimeout:      1 * time.Second,
 			Attempt:                  1,
 		},
-		registry: r,
+		registry:          r,
+		workerInstanceKey: uuid.NewString(),
 
-		changeVersions: make(map[string]Version),
-		openSessions:   make(map[string]*SessionInfo),
+		changeVersions:    make(map[string]Version),
+		openSessions:      make(map[string]*SessionInfo),
+		randoms:           make(map[string]*workflowRandomStream),
+		mutableSideEffect: make(map[string]*commonpb.Payloads),
 
-		doneChannel:            make(chan struct{}),
-		workerStopChannel:      make(chan struct{}),
-		dataConverter:          converter.GetDefaultDataConverter(),
-		failureConverter:       GetDefaultFailureConverter(),
-		runTimeout:             maxWorkflowTimeout,
-		bufferedUpdateRequests: make(map[string][]func()),
-		sdkFlags:               newSDKFlags(&workflowservice.GetSystemInfoResponse_Capabilities{SdkMetadata: true}),
+		doneChannel:                 make(chan struct{}),
+		workerStopChannel:           make(chan struct{}),
+		dataConverter:               converter.GetDefaultDataConverter(),
+		failureConverter:            GetDefaultFailureConverter(),
+		runTimeout:                  maxWorkflowTimeout,
+		bufferedUpdateRequests:      make(map[string][]func()),
+		sdkFlags:                    newSDKFlagSet(&workflowservice.GetSystemInfoResponse_Capabilities{SdkMetadata: true}),
+		executeActivitiesInWorkflow: true,
 	}
 
 	if debugMode {
@@ -335,17 +388,23 @@ func newTestWorkflowEnvironmentImpl(s *WorkflowTestSuite, parentRegistry *regist
 	mockService := workflowservicemock.NewMockWorkflowServiceClient(mockCtrl)
 
 	mockHeartbeatFn := func(c context.Context, r *workflowservice.RecordActivityTaskHeartbeatRequest, opts ...grpc.CallOption) error {
-		activityID := ActivityID{id: string(r.TaskToken)}
-		env.locker.Lock() // need lock as this is running in activity worker's goroutinue
-		activityHandle, ok := env.getActivityHandle(activityID.id, GetActivityInfo(c).WorkflowExecution.RunID)
-		env.locker.Unlock()
+		token, ok := activityTokenFromBytes(r.TaskToken)
 		if !ok {
-			env.logger.Debug("RecordActivityTaskHeartbeat: ActivityID not found, could be already completed or canceled.",
-				tagActivityID, activityID)
+			env.logger.Debug("RecordActivityTaskHeartbeat: Invalid activity token.")
+			return serviceerror.NewNotFound("")
+		}
+		env.locker.Lock() // need lock as this is running in activity worker's goroutinue
+		activityHandle, ok := env.getActivityHandle(token)
+		if !ok {
+			env.locker.Unlock()
+			env.logger.Debug("RecordActivityTaskHeartbeat: Activity token not found, could be already completed or canceled.",
+				tagActivityID, token.activityID)
 			return serviceerror.NewNotFound("")
 		}
 		activityHandle.heartbeatDetails = r.Details
-		activityInfo := env.getActivityInfo(activityID, activityHandle.activityType)
+		activityHandle.lastHeartbeatTime = time.Now()
+		env.locker.Unlock()
+		activityInfo := activityHandle.getActivityInfo()
 		if env.onActivityHeartbeatListener != nil {
 			// If we're only in an activity environment, posted callbacks are not
 			// invoked
@@ -358,7 +417,7 @@ func newTestWorkflowEnvironmentImpl(s *WorkflowTestSuite, parentRegistry *regist
 			}
 		}
 
-		env.logger.Debug("RecordActivityTaskHeartbeat", tagActivityID, activityID)
+		env.logger.Debug("RecordActivityTaskHeartbeat", tagActivityID, token.activityID)
 		return nil
 	}
 
@@ -400,6 +459,14 @@ func (env *testWorkflowEnvironmentImpl) setContinueAsNewSuggested(suggest bool) 
 	env.workflowInfo.continueAsNewSuggested = suggest
 }
 
+func (env *testWorkflowEnvironmentImpl) setContinueAsNewSuggestedReasons(reasons []ContinueAsNewSuggestedReason) {
+	env.workflowInfo.continueAsNewSuggestedReasons = reasons
+}
+
+func (env *testWorkflowEnvironmentImpl) setTargetWorkerDeploymentVersionChanged(changed bool) {
+	env.workflowInfo.targetWorkerDeploymentVersionChanged = changed
+}
+
 func (env *testWorkflowEnvironmentImpl) setContinuedExecutionRunID(rid string) {
 	env.workflowInfo.ContinuedExecutionRunID = rid
 }
@@ -416,7 +483,15 @@ func (env *testWorkflowEnvironmentImpl) newTestWorkflowEnvironmentForChild(
 	childEnv.testWorkflowEnvironmentShared = env.testWorkflowEnvironmentShared
 	childEnv.workerOptions = env.workerOptions
 	childEnv.dataConverter = params.DataConverter
-	childEnv.failureConverter = env.failureConverter
+	if childEnv.dataConverter == nil {
+		childEnv.dataConverter = env.dataConverter
+	}
+	childEnv.failureConverter = params.failureConverter
+	if childEnv.failureConverter == nil {
+		childEnv.failureConverter = env.failureConverter
+	}
+	childEnv.rootDataConverter = env.GetRootDataConverter()
+	childEnv.rootFailureConverter = env.GetRootFailureConverter()
 	childEnv.registry = env.registry
 	childEnv.detachedChildWaitDisabled = env.detachedChildWaitDisabled
 
@@ -435,7 +510,7 @@ func (env *testWorkflowEnvironmentImpl) newTestWorkflowEnvironmentForChild(
 	childEnv.header = params.Header
 	childEnv.workflowInfo.Attempt = params.attempt
 	childEnv.workflowInfo.WorkflowExecution.ID = params.WorkflowID
-	childEnv.workflowInfo.WorkflowExecution.RunID = params.WorkflowID + "_RunID"
+	childEnv.workflowInfo.WorkflowExecution.RunID = getStringID(env.nextID()) + "_RunID"
 	childEnv.workflowInfo.Namespace = params.Namespace
 	childEnv.workflowInfo.TaskQueueName = params.TaskQueueName
 	childEnv.workflowInfo.WorkflowExecutionTimeout = params.WorkflowExecutionTimeout
@@ -448,10 +523,10 @@ func (env *testWorkflowEnvironmentImpl) newTestWorkflowEnvironmentForChild(
 	if env.workflowInfo.RootWorkflowExecution == nil {
 		childEnv.workflowInfo.RootWorkflowExecution = &env.workflowInfo.WorkflowExecution
 	} else {
-		childEnv.workflowInfo.ParentWorkflowExecution = env.workflowInfo.RootWorkflowExecution
+		childEnv.workflowInfo.RootWorkflowExecution = env.workflowInfo.RootWorkflowExecution
 	}
 
-	searchAttrs, err := serializeSearchAttributes(params.SearchAttributes, params.TypedSearchAttributes)
+	searchAttrs, err := SerializeSearchAttributes(params.SearchAttributes, params.TypedSearchAttributes)
 	if err != nil {
 		return nil, err
 	}
@@ -489,6 +564,24 @@ func (env *testWorkflowEnvironmentImpl) newTestWorkflowEnvironmentForChild(
 }
 
 func (env *testWorkflowEnvironmentImpl) setWorkerOptions(options WorkerOptions) {
+	// A second call would silently drop the plugins and the options they adjusted.
+	if len(env.plugins) > 0 {
+		panic("SetWorkerOptions may not be called again after Plugins were configured")
+	}
+	plugins := append([]WorkerPlugin(nil), options.Plugins...)
+	var pluginRegistryOptions WorkerPluginConfigureWorkerRegistryOptions
+	for _, plugin := range plugins {
+		if err := plugin.ConfigureWorker(context.Background(), WorkerPluginConfigureWorkerOptions{
+			WorkerInstanceKey:     env.workerInstanceKey,
+			TaskQueue:             env.workflowInfo.TaskQueueName,
+			WorkerOptions:         &options,
+			WorkerRegistryOptions: &pluginRegistryOptions,
+		}); err != nil {
+			panic(err)
+		}
+	}
+	env.plugins = plugins
+	env.pluginRegistryOptions = pluginRegistryOptions
 	env.workerOptions = options
 	env.registry.interceptors = options.Interceptors
 	if env.workerOptions.EnableSessionWorker && env.sessionEnvironment == nil {
@@ -501,6 +594,107 @@ func (env *testWorkflowEnvironmentImpl) setWorkerOptions(options WorkerOptions) 
 			DisableAlreadyRegisteredCheck: true,
 		})
 	}
+}
+
+// startPluginWorker runs the plugins' StartWorker chain the way
+// AggregatedWorker.Start does.
+func (env *testWorkflowEnvironmentImpl) startPluginWorker() error {
+	if len(env.plugins) == 0 {
+		return nil
+	}
+	start := func(context.Context, WorkerPluginStartWorkerOptions) error { return nil }
+	for i := len(env.plugins) - 1; i >= 0; i-- {
+		plugin := env.plugins[i]
+		next := start
+		start = func(ctx context.Context, options WorkerPluginStartWorkerOptions) error {
+			return plugin.StartWorker(ctx, options, next)
+		}
+	}
+	// Every start registers afresh: StopWorker puts the registry back to this state.
+	restore := env.snapshotRegistry()
+	if err := start(context.Background(), WorkerPluginStartWorkerOptions{
+		WorkerInstanceKey: env.workerInstanceKey,
+		WorkerRegistry:    testPluginRegistry{env: env},
+	}); err != nil {
+		restore()
+		return err
+	}
+	env.restoreRegistry = restore
+	return nil
+}
+
+// testPluginRegistry is the registry handed to plugins in StartWorker. Unlike
+// the environment's own Register* methods it keeps the registry's duplicate
+// checks, so a conflicting registration panics as on a real worker.
+type testPluginRegistry struct {
+	env *testWorkflowEnvironmentImpl
+}
+
+func (r testPluginRegistry) RegisterWorkflowWithOptions(w any, options RegisterWorkflowOptions) {
+	r.env.RegisterWorkflowWithOptions(w, options)
+}
+
+func (r testPluginRegistry) RegisterDynamicWorkflow(w any, options DynamicRegisterWorkflowOptions) {
+	r.env.RegisterDynamicWorkflow(w, options)
+}
+
+func (r testPluginRegistry) RegisterActivityWithOptions(a any, options RegisterActivityOptions) {
+	if r.env.pluginRegistryOptions.OnRegisterActivity != nil {
+		r.env.pluginRegistryOptions.OnRegisterActivity(a, options)
+	}
+	r.env.registry.RegisterActivityWithOptions(a, options)
+}
+
+func (r testPluginRegistry) RegisterDynamicActivity(a any, options DynamicRegisterActivityOptions) {
+	r.env.RegisterDynamicActivity(a, options)
+}
+
+func (r testPluginRegistry) RegisterNexusService(s *nexus.Service) {
+	r.env.RegisterNexusService(s)
+}
+
+// snapshotRegistry returns a function that puts the registry back to its
+// current contents.
+func (env *testWorkflowEnvironmentImpl) snapshotRegistry() func() {
+	r := env.registry
+	r.Lock()
+	defer r.Unlock()
+	nexusServices := maps.Clone(r.nexusServices)
+	workflowFuncMap := maps.Clone(r.workflowFuncMap)
+	workflowAliasMap := maps.Clone(r.workflowAliasMap)
+	workflowVersioningBehaviorMap := maps.Clone(r.workflowVersioningBehaviorMap)
+	activityFuncMap := maps.Clone(r.activityFuncMap)
+	activityAliasMap := maps.Clone(r.activityAliasMap)
+	dynamicWorkflow, dynamicWorkflowOptions, dynamicActivity := r.dynamicWorkflow, r.dynamicWorkflowOptions, r.dynamicActivity
+	return func() {
+		r.Lock()
+		defer r.Unlock()
+		r.nexusServices = nexusServices
+		r.workflowFuncMap = workflowFuncMap
+		r.workflowAliasMap = workflowAliasMap
+		r.workflowVersioningBehaviorMap = workflowVersioningBehaviorMap
+		r.activityFuncMap = activityFuncMap
+		r.activityAliasMap = activityAliasMap
+		r.dynamicWorkflow, r.dynamicWorkflowOptions, r.dynamicActivity = dynamicWorkflow, dynamicWorkflowOptions, dynamicActivity
+	}
+}
+
+// stopPluginWorker runs the plugins' StopWorker chain the way
+// AggregatedWorker.Stop does.
+func (env *testWorkflowEnvironmentImpl) stopPluginWorker() {
+	if len(env.plugins) == 0 {
+		return
+	}
+	stop := func(context.Context, WorkerPluginStopWorkerOptions) {}
+	for i := len(env.plugins) - 1; i >= 0; i-- {
+		plugin := env.plugins[i]
+		next := stop
+		stop = func(ctx context.Context, options WorkerPluginStopWorkerOptions) {
+			plugin.StopWorker(ctx, options, next)
+		}
+	}
+	stop(context.Background(), WorkerPluginStopWorkerOptions{WorkerInstanceKey: env.workerInstanceKey})
+	env.restoreRegistry()
 }
 
 func (env *testWorkflowEnvironmentImpl) setIdentity(identity string) {
@@ -527,7 +721,7 @@ func (env *testWorkflowEnvironmentImpl) setDetachedChildWaitDisabled(detachedChi
 	env.detachedChildWaitDisabled = detachedChildWaitDisabled
 }
 
-func (env *testWorkflowEnvironmentImpl) setActivityTaskQueue(taskqueue string, activityFns ...interface{}) {
+func (env *testWorkflowEnvironmentImpl) setActivityTaskQueue(taskqueue string, activityFns ...any) {
 	for _, activityFn := range activityFns {
 		fnName := getActivityFunctionName(env.registry, activityFn)
 		taskQueueActivity, ok := env.taskQueueSpecificActivities[fnName]
@@ -539,12 +733,30 @@ func (env *testWorkflowEnvironmentImpl) setActivityTaskQueue(taskqueue string, a
 	}
 }
 
-func (env *testWorkflowEnvironmentImpl) executeWorkflow(workflowFn interface{}, args ...interface{}) {
+func (env *testWorkflowEnvironmentImpl) executeWorkflow(workflowFn any, args ...any) {
 	fType := reflect.TypeOf(workflowFn)
 	if getKind(fType) == reflect.Func {
-		env.RegisterWorkflowWithOptions(workflowFn, RegisterWorkflowOptions{DisableAlreadyRegisteredCheck: true})
+		// A convenience, not a worker registration: bypasses plugin registry callbacks.
+		env.registry.RegisterWorkflowWithOptions(workflowFn, RegisterWorkflowOptions{DisableAlreadyRegisteredCheck: true})
 	}
-	workflowType, input, err := getValidatedWorkflowFunction(workflowFn, args, env.GetDataConverter(), env.GetRegistry())
+
+	// If a workflow already ran here, executeWorkflowInternal panics; do not run
+	// a spurious plugin start/stop pair around that.
+	env.locker.Lock()
+	alreadyExecuted := env.workflowInfo.WorkflowType.Name != workflowTypeNotSpecified
+	env.locker.Unlock()
+	if !alreadyExecuted {
+		if err := env.startPluginWorker(); err != nil {
+			panic(err)
+		}
+		defer env.stopPluginWorker()
+	}
+
+	dc := converter.WithDataConverterSerializationContext(env.GetDataConverter(), converter.WorkflowSerializationContext{
+		Namespace:  env.workflowInfo.Namespace,
+		WorkflowID: env.workflowInfo.WorkflowExecution.ID,
+	})
+	workflowType, input, err := getValidatedWorkflowFunction(workflowFn, args, dc, env.GetRegistry())
 	if err != nil {
 		panic(err)
 	}
@@ -569,6 +781,22 @@ func (env *testWorkflowEnvironmentImpl) executeWorkflowInternal(delayStart time.
 	}
 	if wInfo.WorkflowTaskTimeout == 0 {
 		wInfo.WorkflowTaskTimeout = 1 * time.Second
+	}
+	if wInfo.currentRunID == "" {
+		wInfo.currentRunID = wInfo.WorkflowExecution.RunID
+	}
+	// For child workflows, the interceptor already wraps converters with the
+	// child's WorkflowSerializationContext before setting them on the child env.
+	// Only wrap for the root workflow to avoid double-wrapping.
+	if env.parentEnv == nil {
+		wfCtx := converter.WorkflowSerializationContext{
+			Namespace:  wInfo.Namespace,
+			WorkflowID: wInfo.WorkflowExecution.ID,
+		}
+		env.rootDataConverter = env.dataConverter
+		env.rootFailureConverter = env.failureConverter
+		env.dataConverter = converter.WithDataConverterSerializationContext(env.dataConverter, wfCtx)
+		env.failureConverter = converter.WithFailureConverterSerializationContext(env.failureConverter, wfCtx)
 	}
 	env.locker.Unlock()
 
@@ -615,8 +843,20 @@ func (env *testWorkflowEnvironmentImpl) getWorkflowDefinition(wt WorkflowType) (
 	}
 	var dynamic bool
 	if d, ok := wf.(string); ok && d == "dynamic" {
+		env.registry.Lock()
 		wf = env.registry.dynamicWorkflow
+		env.registry.Unlock()
 		dynamic = true
+	}
+	// A dynamic workflow may itself be a WorkflowDefinitionFactory (e.g. the
+	// RoadRunner PHP host process registers one shared factory). Honor it rather
+	// than treating it as a plain function, which would panic when the executor
+	// reflects on the factory value.
+	if wdf, ok := wf.(WorkflowDefinitionFactory); ok {
+		return &testWorkflowDefinitionWrapper{
+			WorkflowDefinition: wdf.NewWorkflowDefinition(),
+			env:                env,
+		}, nil
 	}
 	wd := &workflowExecutorWrapper{
 		workflowExecutor: &workflowExecutor{workflowType: wt.Name, fn: wf, interceptors: env.registry.interceptors, dynamic: dynamic},
@@ -625,12 +865,37 @@ func (env *testWorkflowEnvironmentImpl) getWorkflowDefinition(wt WorkflowType) (
 	return newSyncWorkflowDefinition(wd), nil
 }
 
+func (w *testWorkflowDefinitionWrapper) OnWorkflowTaskStarted(timeout time.Duration) {
+	if !w.started {
+		w.started = true
+		w.env.workflowFunctionExecuting = true
+
+		if w.env.isChildWorkflow() {
+			// Balance ExecuteChildWorkflow's increment, including delayed starts.
+			w.env.runningCount--
+
+			if handler := w.env.startedHandler; handler != nil {
+				execution := w.env.workflowInfo.WorkflowExecution
+				w.env.parentEnv.postCallback(func() {
+					handler(execution, nil)
+				}, true)
+			}
+		}
+	}
+
+	w.WorkflowDefinition.OnWorkflowTaskStarted(timeout)
+}
+
 func (env *testWorkflowEnvironmentImpl) TryUse(flag sdkFlag) bool {
 	return env.sdkFlags.tryUse(flag, true)
 }
 
-func (env *testWorkflowEnvironmentImpl) GetFlag(flag sdkFlag) bool {
-	return env.sdkFlags.getFlag(flag)
+func (env *testWorkflowEnvironmentImpl) GenerateSequence() int64 {
+	return env.nextID()
+}
+
+func (env *testWorkflowEnvironmentImpl) GetRandomStream(name string) WorkflowRandomStream {
+	return getRandomStream(env.randoms, env.workflowInfo.currentRunID, name)
 }
 
 func (env *testWorkflowEnvironmentImpl) QueueUpdate(name string, f func()) {
@@ -668,9 +933,14 @@ func (env *testWorkflowEnvironmentImpl) DrainUnhandledUpdates() bool {
 }
 
 func (env *testWorkflowEnvironmentImpl) executeActivity(
-	activityFn interface{},
-	args ...interface{},
+	activityFn any,
+	args ...any,
 ) (converter.EncodedValue, error) {
+	if err := env.startPluginWorker(); err != nil {
+		return nil, err
+	}
+	defer env.stopPluginWorker()
+
 	activityType, err := getValidatedActivityFunction(activityFn, args, env.registry)
 	if err != nil {
 		panic(err)
@@ -683,8 +953,8 @@ func (env *testWorkflowEnvironmentImpl) executeActivity(
 
 	parameters := ExecuteActivityParams{
 		ExecuteActivityOptions: ExecuteActivityOptions{
-			ScheduleToCloseTimeout: 600 * time.Second,
-			StartToCloseTimeout:    600 * time.Second,
+			ScheduleToCloseTimeout: 10 * time.Minute,
+			StartToCloseTimeout:    10 * time.Minute,
 		},
 		ActivityType: *activityType,
 		Input:        input,
@@ -711,23 +981,25 @@ func (env *testWorkflowEnvironmentImpl) executeActivity(
 	if workflowType == workflowTypeNotSpecified {
 		workflowType = "0"
 	}
-	task := newTestActivityTask(
-		env.workflowInfo.WorkflowExecution.ID,
-		env.workflowInfo.WorkflowExecution.RunID,
-		workflowType,
-		env.workflowInfo.Namespace,
-		scheduleTaskAttr,
-	)
-
+	task := newTestActivityTask(env.workflowInfo.Namespace, scheduleTaskAttr)
+	if env.executeActivitiesInWorkflow {
+		task.WorkflowExecution = &commonpb.WorkflowExecution{
+			WorkflowId: env.workflowInfo.WorkflowExecution.ID,
+			RunId:      env.workflowInfo.WorkflowExecution.RunID,
+		}
+		task.WorkflowType = &commonpb.WorkflowType{Name: workflowType}
+	} else {
+		task.ActivityRunId = getStringID(env.nextID())
+	}
 	task.HeartbeatDetails = env.heartbeatDetails
 
 	// ensure activityFn is registered to defaultTestTaskQueue
 	taskHandler := env.newTestActivityTaskHandler(defaultTestTaskQueue, env.GetDataConverter())
-	activityHandle := &testActivityHandle{callback: func(result *commonpb.Payloads, err error) {}, activityType: parameters.ActivityType.Name}
-	activityID := ActivityID{id: scheduleTaskAttr.GetActivityId()}
-	env.setActivityHandle(activityID.id, env.workflowInfo.WorkflowExecution.RunID, activityHandle)
+	env.addNewActivityHandle(task, func(result *commonpb.Payloads, err error) {}, env.GetDataConverter(), env.GetFailureConverter())
+	activityID := ActivityID{id: task.ActivityId}
 
-	result, err := taskHandler.Execute(defaultTestTaskQueue, task)
+	taskResult, err := taskHandler.Execute(defaultTestTaskQueue, task)
+	result := taskResult.response
 	if err != nil {
 		if err == context.DeadlineExceeded {
 			env.logger.Debug(fmt.Sprintf("Activity %v timed out", task.ActivityType.Name))
@@ -757,17 +1029,37 @@ func (env *testWorkflowEnvironmentImpl) executeActivity(
 }
 
 func (env *testWorkflowEnvironmentImpl) executeLocalActivity(
-	activityFn interface{},
-	args ...interface{},
+	activityFn any,
+	args ...any,
 ) (val converter.EncodedValue, err error) {
+	if err = env.startPluginWorker(); err != nil {
+		return nil, err
+	}
+	defer env.stopPluginWorker()
+
+	activityType, err := getValidatedActivityFunction(activityFn, args, env.registry)
+	if err != nil {
+		return nil, err
+	}
+	actCtx := converter.ActivitySerializationContext{
+		Namespace:    env.workflowInfo.Namespace,
+		WorkflowID:   env.workflowInfo.WorkflowExecution.ID,
+		WorkflowType: env.workflowInfo.WorkflowType.Name,
+		ActivityType: activityType.Name,
+		TaskQueue:    env.workflowInfo.TaskQueueName,
+		IsLocal:      true,
+	}
 	params := ExecuteLocalActivityParams{
 		ExecuteLocalActivityOptions: ExecuteLocalActivityOptions{
 			ScheduleToCloseTimeout: env.testTimeout,
 		},
-		ActivityFn:   activityFn,
-		InputArgs:    args,
-		WorkflowInfo: env.workflowInfo,
-		Header:       env.header,
+		ActivityFn:       activityFn,
+		ActivityType:     activityType.Name,
+		InputArgs:        args,
+		WorkflowInfo:     env.workflowInfo,
+		DataConverter:    converter.WithDataConverterSerializationContext(env.GetRootDataConverter(), actCtx),
+		FailureConverter: converter.WithFailureConverterSerializationContext(env.GetRootFailureConverter(), actCtx),
+		Header:           env.header,
 	}
 	task := &localActivityTask{
 		activityID: "test-local-activity",
@@ -782,6 +1074,7 @@ func (env *testWorkflowEnvironmentImpl) executeLocalActivity(
 		backgroundContext:  env.workerOptions.BackgroundActivityContext,
 		metricsHandler:     env.metricsHandler,
 		logger:             env.logger,
+		dataConverter:      env.dataConverter,
 		interceptors:       env.registry.interceptors,
 		contextPropagators: env.contextPropagators,
 		workerStopChannel:  env.workerStopChannel,
@@ -789,10 +1082,9 @@ func (env *testWorkflowEnvironmentImpl) executeLocalActivity(
 
 	result := taskHandler.executeLocalActivityTask(task)
 	if result.err != nil {
-		activityType, _ := getValidatedActivityFunction(activityFn, args, env.registry)
 		return nil, env.wrapActivityError(ActivityID{id: task.activityID}, activityType.Name, enumspb.RETRY_STATE_UNSPECIFIED, result.err)
 	}
-	return newEncodedValue(result.result, env.GetDataConverter()), nil
+	return newEncodedValue(result.result, params.DataConverter), nil
 }
 
 func (env *testWorkflowEnvironmentImpl) startWorkflowTask() {
@@ -804,7 +1096,11 @@ func (env *testWorkflowEnvironmentImpl) startWorkflowTask() {
 func (env *testWorkflowEnvironmentImpl) isChildWorkflow() bool {
 	return env.parentEnv != nil
 }
-
+func (env *testWorkflowEnvironmentImpl) closeDoneChannel() {
+	env.doneChannelOnce.Do(func() {
+		close(env.doneChannel)
+	})
+}
 func (env *testWorkflowEnvironmentImpl) startMainLoop() {
 	if env.isChildWorkflow() {
 		// child workflow rely on parent workflow's main loop to process events
@@ -813,7 +1109,7 @@ func (env *testWorkflowEnvironmentImpl) startMainLoop() {
 	}
 
 	// notify all child workflows to exit their main loop
-	defer close(env.doneChannel)
+	defer env.closeDoneChannel()
 
 	for !env.shouldStopEventLoop() {
 		// use non-blocking-select to check if there is anything pending in the main thread.
@@ -962,14 +1258,15 @@ func (env *testWorkflowEnvironmentImpl) postCallback(cb func(), startWorkflowTas
 }
 
 func (env *testWorkflowEnvironmentImpl) RequestCancelActivity(activityID ActivityID) {
-	handle, ok := env.getActivityHandle(activityID.id, env.workflowInfo.WorkflowExecution.RunID)
+	token := testActivityToken{activityID: activityID.id, runID: env.workflowInfo.WorkflowExecution.RunID}
+	handle, ok := env.getActivityHandle(token)
 	if !ok {
 		env.logger.Debug("RequestCancelActivity failed, Activity not exists or already completed.", tagActivityID, activityID)
 		return
 	}
-	activityInfo := env.getActivityInfo(activityID, handle.activityType)
+	activityInfo := handle.getActivityInfo()
 	env.logger.Debug("RequestCancelActivity", tagActivityID, activityID)
-	env.deleteHandle(activityID.id, env.workflowInfo.WorkflowExecution.RunID)
+	env.deleteHandle(token)
 	env.postCallback(func() {
 		handle.callback(nil, NewCanceledError())
 		if env.onActivityCanceledListener != nil {
@@ -997,6 +1294,11 @@ func (env *testWorkflowEnvironmentImpl) RequestCancelTimer(timerID TimerID) {
 	}, true)
 }
 
+func (env *testWorkflowEnvironmentImpl) roundTripFailure(err error) (converted error) {
+	defer recoverCodecWorkflowTaskFailure(&converted)
+	return env.failureConverter.FailureToError(env.failureConverter.ErrorToFailure(err))
+}
+
 func (env *testWorkflowEnvironmentImpl) Complete(result *commonpb.Payloads, err error) {
 	if env.isWorkflowCompleted {
 		env.logger.Debug("Workflow already completed.")
@@ -1014,13 +1316,14 @@ func (env *testWorkflowEnvironmentImpl) Complete(result *commonpb.Payloads, err 
 		var workflowPanicErr *workflowPanicError
 		var workflowExecutionAlreadyStartedErr *serviceerror.WorkflowExecutionAlreadyStarted
 		var childWorkflowExecutionAlreadyStartedErr *ChildWorkflowExecutionAlreadyStartedError
-		if errors.As(err, &canceledErr) || errors.As(err, &continueAsNewErr) || errors.As(err, &timeoutErr) || errors.As(err, &workflowExecutionAlreadyStartedErr) || errors.As(err, &childWorkflowExecutionAlreadyStartedErr) {
+		if codecErr, ok := codecWorkflowTaskFailureFrom(err); ok {
+			env.testError = codecErr
+		} else if errors.As(err, &canceledErr) || errors.As(err, &continueAsNewErr) || errors.As(err, &timeoutErr) || errors.As(err, &workflowExecutionAlreadyStartedErr) || errors.As(err, &childWorkflowExecutionAlreadyStartedErr) {
 			env.testError = err
 		} else if errors.As(err, &workflowPanicErr) {
 			env.testError = newPanicError(workflowPanicErr.value, workflowPanicErr.stackTrace)
 		} else {
-			failure := env.failureConverter.ErrorToFailure(err)
-			env.testError = env.failureConverter.FailureToError(failure)
+			env.testError = env.roundTripFailure(err)
 		}
 
 		if !env.isChildWorkflow() {
@@ -1073,6 +1376,7 @@ func (env *testWorkflowEnvironmentImpl) Complete(result *commonpb.Payloads, err 
 
 	// properly handle child workflows based on their ParentClosePolicy
 	env.handleParentClosePolicy()
+	env.closeDoneChannel()
 }
 
 func (env *testWorkflowEnvironmentImpl) handleParentClosePolicy() {
@@ -1102,7 +1406,7 @@ func (h *testWorkflowHandle) rerunAsChild() bool {
 	if errors.As(env.testError, &continueAsNewErr) {
 		params.Input = continueAsNewErr.Input
 		params.Header = continueAsNewErr.Header
-		params.RetryPolicy = convertToPBRetryPolicy(continueAsNewErr.RetryPolicy)
+		params.RetryPolicy = ConvertToPBRetryPolicy(continueAsNewErr.RetryPolicy)
 		params.WorkflowType = continueAsNewErr.WorkflowType
 		params.TaskQueueName = continueAsNewErr.TaskQueueName
 		params.VersioningIntent = continueAsNewErr.VersioningIntent
@@ -1162,10 +1466,15 @@ func (h *testWorkflowHandle) rerunAsChild() bool {
 	return false
 }
 
-func (env *testWorkflowEnvironmentImpl) CompleteActivity(taskToken []byte, result interface{}, err error) error {
+func (env *testWorkflowEnvironmentImpl) CompleteActivity(taskToken []byte, result any, err error) error {
 	if taskToken == nil {
 		return errors.New("nil task token provided")
 	}
+	activityToken, ok := activityTokenFromBytes(taskToken)
+	if !ok {
+		return errors.New("invalid task token provided")
+	}
+
 	var data *commonpb.Payloads
 	if result != nil {
 		var encodeErr error
@@ -1175,19 +1484,19 @@ func (env *testWorkflowEnvironmentImpl) CompleteActivity(taskToken []byte, resul
 		}
 	}
 
-	activityID := ActivityID{id: string(taskToken)}
 	env.postCallback(func() {
-		activityHandle, ok := env.getActivityHandle(activityID.id, env.workflowInfo.WorkflowExecution.RunID)
+		activityHandle, ok := env.getActivityHandle(activityToken)
 		if !ok {
 			env.logger.Debug("CompleteActivity: ActivityID not found, could be already completed or canceled.",
-				tagActivityID, activityID)
+				tagActivityID, activityToken.activityID)
 			return
 		}
 		// We do allow canceled error to be passed here
 		cancelAllowed := true
 		request := convertActivityResultToRespondRequest("test-identity", taskToken, data, err,
-			env.GetDataConverter(), env.GetFailureConverter(), defaultTestNamespace, cancelAllowed, nil, nil, nil)
-		env.handleActivityResult(activityID, request, activityHandle.activityType, env.GetDataConverter())
+			activityHandle.dataConverter, activityHandle.failureConverter, defaultTestNamespace, cancelAllowed, nil, nil, nil,
+			activityHandle.task.WorkflowExecution.GetWorkflowId(), activityHandle.task.ActivityId)
+		env.handleActivityResult(activityHandle, request, activityHandle.dataConverter)
 	}, false /* do not auto schedule workflow task, because activity might be still pending */)
 
 	return nil
@@ -1209,19 +1518,35 @@ func (env *testWorkflowEnvironmentImpl) GetFailureConverter() converter.FailureC
 	return env.failureConverter
 }
 
+func (env *testWorkflowEnvironmentImpl) GetRootDataConverter() converter.DataConverter {
+	if env.rootDataConverter != nil {
+		return env.rootDataConverter
+	}
+	return env.dataConverter
+}
+
+func (env *testWorkflowEnvironmentImpl) GetRootFailureConverter() converter.FailureConverter {
+	if env.rootFailureConverter != nil {
+		return env.rootFailureConverter
+	}
+	return env.failureConverter
+}
+
 func (env *testWorkflowEnvironmentImpl) GetContextPropagators() []ContextPropagator {
 	return env.contextPropagators
 }
 
 func (env *testWorkflowEnvironmentImpl) ExecuteActivity(parameters ExecuteActivityParams, callback ResultHandler) ActivityID {
 	ensureDefaultRetryPolicy(&parameters)
-	scheduleTaskAttr := &commandpb.ScheduleActivityTaskCommandAttributes{}
-	scheduleID := env.nextID()
-	if parameters.ActivityID == "" {
-		scheduleTaskAttr.ActivityId = getStringID(scheduleID)
-	} else {
-		scheduleTaskAttr.ActivityId = parameters.ActivityID
+	// Backward compatibility: generate ScheduleID/ActivityID if not set by caller.
+	if parameters.ScheduleID == 0 {
+		parameters.ScheduleID = env.GenerateSequence()
 	}
+	if parameters.ActivityID == "" {
+		parameters.ActivityID = getStringID(parameters.ScheduleID)
+	}
+	scheduleTaskAttr := &commandpb.ScheduleActivityTaskCommandAttributes{}
+	scheduleTaskAttr.ActivityId = parameters.ActivityID
 	activityID := ActivityID{id: scheduleTaskAttr.GetActivityId()}
 	scheduleTaskAttr.ActivityType = &commonpb.ActivityType{Name: parameters.ActivityType.Name}
 	scheduleTaskAttr.TaskQueue = &taskqueuepb.TaskQueue{Name: parameters.TaskQueueName, Kind: enumspb.TASK_QUEUE_KIND_NORMAL}
@@ -1237,39 +1562,139 @@ func (env *testWorkflowEnvironmentImpl) ExecuteActivity(parameters ExecuteActivi
 		callback(nil, err)
 		return activityID
 	}
-	task := newTestActivityTask(
-		env.workflowInfo.WorkflowExecution.ID,
-		env.workflowInfo.WorkflowExecution.RunID,
-		env.workflowInfo.WorkflowType.Name,
-		env.workflowInfo.Namespace,
-		scheduleTaskAttr,
-	)
+
+	task := newTestActivityTask(env.workflowInfo.Namespace, scheduleTaskAttr)
+	task.WorkflowExecution = &commonpb.WorkflowExecution{
+		WorkflowId: env.workflowInfo.WorkflowExecution.ID,
+		RunId:      env.workflowInfo.WorkflowExecution.RunID,
+	}
+	task.WorkflowType = &commonpb.WorkflowType{Name: env.workflowInfo.WorkflowType.Name}
 
 	taskHandler := env.newTestActivityTaskHandler(parameters.TaskQueueName, parameters.DataConverter)
-	activityHandle := &testActivityHandle{callback: callback, activityType: parameters.ActivityType.Name}
-
-	env.setActivityHandle(activityID.id, env.workflowInfo.WorkflowExecution.RunID, activityHandle)
+	activityHandle := env.addNewActivityHandle(task, callback, parameters.DataConverter, parameters.FailureConverter)
 	env.runningCount++
+	activityToken := activityHandle.token
+
+	// Start timeout monitoring if any timeout is configured
+	var timeoutWatchDone chan struct{}
+	needsTimeoutWatch := parameters.HeartbeatTimeout > 0 || parameters.StartToCloseTimeout > 0
+	if needsTimeoutWatch {
+		timeoutWatchDone = make(chan struct{})
+		activityHandle.cancelTimeoutWatch = func() { close(timeoutWatchDone) }
+
+		// Determine check interval - use the smallest configured timeout divided by 2
+		checkInterval := parameters.StartToCloseTimeout
+		if parameters.HeartbeatTimeout > 0 && (checkInterval == 0 || parameters.HeartbeatTimeout < checkInterval) {
+			checkInterval = parameters.HeartbeatTimeout
+		}
+		checkInterval = max(checkInterval/2, time.Millisecond)
+
+		go func() {
+			ticker := time.NewTicker(checkInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-timeoutWatchDone:
+					return
+				case <-ticker.C:
+					env.locker.Lock()
+					handle, ok := env.getActivityHandle(activityToken)
+					if !ok {
+						env.locker.Unlock()
+						return // activity already completed
+					}
+
+					// Check StartToCloseTimeout first (it's more severe)
+					// Add grace period to give well-behaved activities time to react to context deadline
+					if parameters.StartToCloseTimeout > 0 {
+						elapsed := time.Since(handle.startTime)
+						effectiveTimeout := parameters.StartToCloseTimeout + env.activityTimeoutGracePeriod
+						if elapsed > effectiveTimeout {
+							handle.timedOut = true
+							handle.timeoutType = enumspb.TIMEOUT_TYPE_START_TO_CLOSE
+							env.locker.Unlock()
+							env.logger.Debug("Activity start-to-close timeout",
+								tagActivityID, activityID,
+								"elapsed", elapsed,
+								"startToCloseTimeout", parameters.StartToCloseTimeout,
+								"gracePeriod", env.activityTimeoutGracePeriod)
+							return
+						}
+					}
+
+					// Check HeartbeatTimeout
+					if parameters.HeartbeatTimeout > 0 {
+						timeSinceLastHeartbeat := time.Since(handle.lastHeartbeatTime)
+						if timeSinceLastHeartbeat > parameters.HeartbeatTimeout {
+							handle.timedOut = true
+							handle.timeoutType = enumspb.TIMEOUT_TYPE_HEARTBEAT
+							env.locker.Unlock()
+							env.logger.Debug("Activity heartbeat timeout",
+								tagActivityID, activityID,
+								"timeSinceLastHeartbeat", timeSinceLastHeartbeat,
+								"heartbeatTimeout", parameters.HeartbeatTimeout)
+							return
+						}
+					}
+
+					env.locker.Unlock()
+				}
+			}
+		}()
+	}
+
 	// activity runs in separate goroutinue outside of workflow dispatcher
 	// do callback in a defer to handle calls to runtime.Goexit inside the activity (which is done by t.FailNow)
 	go func() {
-		var result interface{}
+		var result any
 		defer func() {
+			// Stop timeout monitoring
+			if timeoutWatchDone != nil {
+				select {
+				case <-timeoutWatchDone:
+					// already closed
+				default:
+					close(timeoutWatchDone)
+				}
+			}
+
 			panicErr := recover()
+			fc := parameters.FailureConverter
+			if fc == nil {
+				fc = env.failureConverter
+			}
 			if result == nil && panicErr == nil {
 				failureErr := errors.New("activity called runtime.Goexit")
 				result = &workflowservice.RespondActivityTaskFailedRequest{
-					Failure: env.failureConverter.ErrorToFailure(failureErr),
+					Failure: fc.ErrorToFailure(failureErr),
 				}
 			} else if panicErr != nil {
 				failureErr := newPanicError(fmt.Sprintf("%v", panicErr), "")
 				result = &workflowservice.RespondActivityTaskFailedRequest{
-					Failure: env.failureConverter.ErrorToFailure(failureErr),
+					Failure: fc.ErrorToFailure(failureErr),
 				}
 			}
+
+			// Check if any timeout occurred
+			env.locker.Lock()
+			handle, ok := env.getActivityHandle(activityToken)
+			activityTimedOut := ok && handle.timedOut
+			var timeoutType enumspb.TimeoutType
+			var heartbeatDetails *commonpb.Payloads
+			if activityTimedOut {
+				timeoutType = handle.timeoutType
+				heartbeatDetails = handle.heartbeatDetails
+			}
+			env.locker.Unlock()
+
+			if activityTimedOut {
+				// Override result with timeout error
+				result = &activityTimeoutResult{timeoutType: timeoutType, details: heartbeatDetails}
+			}
+
 			// post activity result to workflow dispatcher
 			env.postCallback(func() {
-				env.handleActivityResult(activityID, result, parameters.ActivityType.Name, parameters.DataConverter)
+				env.handleActivityResult(activityHandle, result, parameters.DataConverter)
 				env.runningCount--
 			}, false /* do not auto schedule workflow task, because activity might be still pending */)
 		}()
@@ -1432,30 +1857,58 @@ func (env *testWorkflowEnvironmentImpl) validateRetryPolicy(policy *commonpb.Ret
 	return nil
 }
 
-func (env *testWorkflowEnvironmentImpl) getActivityHandle(activityID, runID string) (*testActivityHandle, bool) {
-	handle, ok := env.activities[env.makeUniqueActivityID(activityID, runID)]
+func (env *testWorkflowEnvironmentImpl) addNewActivityHandle(task *workflowservice.PollActivityTaskQueueResponse, callback func(result *commonpb.Payloads, err error), dc converter.DataConverter, fc converter.FailureConverter) *testActivityHandle {
+	token := testActivityToken{activityID: task.ActivityId}
+	if task.WorkflowExecution.GetWorkflowId() == "" {
+		token.runID = task.ActivityRunId
+	} else {
+		token.runID = task.WorkflowExecution.GetRunId()
+	}
+	task.TaskToken = token.toBytes()
+
+	now := time.Now()
+	handle := &testActivityHandle{
+		callback:          callback,
+		heartbeatDetails:  nil,
+		token:             token,
+		task:              task,
+		dataConverter:     dc,
+		failureConverter:  fc,
+		startTime:         now,
+		lastHeartbeatTime: now,
+	}
+
+	env.activities[token] = handle
+	return handle
+}
+
+func (env *testWorkflowEnvironmentImpl) getActivityHandle(token testActivityToken) (*testActivityHandle, bool) {
+	handle, ok := env.activities[token]
 	return handle, ok
 }
 
-func (env *testWorkflowEnvironmentImpl) setActivityHandle(activityID, runID string, handle *testActivityHandle) {
-	env.activities[env.makeUniqueActivityID(activityID, runID)] = handle
+func (env *testWorkflowEnvironmentImpl) deleteHandle(token testActivityToken) {
+	delete(env.activities, token)
 }
 
-func (env *testWorkflowEnvironmentImpl) deleteHandle(activityID, runID string) {
-	delete(env.activities, env.makeUniqueActivityID(activityID, runID))
+func (t *testActivityToken) toBytes() []byte {
+	// we don't entirely control activity ID, so runID goes first to make reconstructing from bytes easier
+	return fmt.Appendf(nil, "%v#%v", t.runID, t.activityID)
 }
 
-func (env *testWorkflowEnvironmentImpl) makeUniqueActivityID(activityID, runID string) string {
-	// ActivityID is unique per workflow, but different workflow could have same activityID.
-	// Make the key unique globally as we share the same collection for all running workflows in test.
-	return fmt.Sprintf("%v_%v", runID, activityID)
+func activityTokenFromBytes(token []byte) (testActivityToken, bool) {
+	split := strings.SplitN(string(token), "#", 2)
+	if len(split) != 2 {
+		return testActivityToken{}, false
+	}
+	return testActivityToken{activityID: split[1], runID: split[0]}, true
 }
 
 func (env *testWorkflowEnvironmentImpl) executeActivityWithRetryForTest(
 	taskHandler ActivityTaskHandler,
 	parameters ExecuteActivityParams,
 	task *workflowservice.PollActivityTaskQueueResponse,
-) (result interface{}) {
+) (result any) {
 	var expireTime time.Time
 	if parameters.ScheduleToCloseTimeout > 0 {
 		expireTime = env.Now().Add(parameters.ScheduleToCloseTimeout)
@@ -1463,7 +1916,9 @@ func (env *testWorkflowEnvironmentImpl) executeActivityWithRetryForTest(
 
 	for {
 		var err error
-		result, err = taskHandler.Execute(parameters.TaskQueueName, task)
+		var taskResult activityTaskResult
+		taskResult, err = taskHandler.Execute(parameters.TaskQueueName, task)
+		result = taskResult.response
 		if err != nil {
 			if err == context.DeadlineExceeded {
 				return err
@@ -1480,7 +1935,11 @@ func (env *testWorkflowEnvironmentImpl) executeActivityWithRetryForTest(
 			}
 
 			p := fromProtoRetryPolicy(parameters.RetryPolicy)
-			backoff := getRetryBackoffWithNowTime(p, task.GetAttempt(), env.failureConverter.FailureToError(failure), env.Now(), expireTime)
+			retryFC := parameters.FailureConverter
+			if retryFC == nil {
+				retryFC = env.failureConverter
+			}
+			backoff := getRetryBackoffWithNowTime(p, task.GetAttempt(), retryFC.FailureToError(failure), env.Now(), expireTime)
 			if backoff > 0 {
 				// need a retry
 				waitCh := make(chan struct{})
@@ -1490,9 +1949,10 @@ func (env *testWorkflowEnvironmentImpl) executeActivityWithRetryForTest(
 				env.registerDelayedCallback(func() {
 					env.runningCount++
 					task.Attempt = task.GetAttempt() + 1
-					activityID := ActivityID{id: string(task.TaskToken)}
-					if ah, ok := env.getActivityHandle(activityID.id, task.WorkflowExecution.RunId); ok {
-						task.HeartbeatDetails = ah.heartbeatDetails
+					if token, ok := activityTokenFromBytes(task.TaskToken); ok {
+						if ah, ok := env.getActivityHandle(token); ok {
+							task.HeartbeatDetails = ah.heartbeatDetails
+						}
 					}
 					close(waitCh)
 				}, backoff)
@@ -1555,11 +2015,7 @@ func ensureDefaultRetryPolicy(parameters *ExecuteActivityParams) {
 
 func (env *testWorkflowEnvironmentImpl) ExecuteLocalActivity(params ExecuteLocalActivityParams, callback LocalActivityResultHandler) LocalActivityID {
 	activityID := getStringID(env.nextID())
-	ae := &activityExecutor{name: getActivityFunctionName(env.registry, params.ActivityFn), fn: params.ActivityFn}
-	if at, _ := getValidatedActivityFunction(params.ActivityFn, params.InputArgs, env.registry); at != nil {
-		// local activity could be registered, if so use the registered name. This name is only used to find a mock.
-		ae.name = at.Name
-	}
+	ae := &activityExecutor{name: params.ActivityType, fn: params.ActivityFn}
 	// We have to skip the interceptors on the first call because
 	// ExecuteWithActualArgs is actually invoked twice to support a mock activity
 	// function result
@@ -1567,7 +2023,7 @@ func (env *testWorkflowEnvironmentImpl) ExecuteLocalActivity(params ExecuteLocal
 	aew := &activityExecutorWrapper{activityExecutor: ae, env: env}
 
 	// substitute the local activity function so we could replace with mock if it is supplied.
-	params.ActivityFn = func(ctx context.Context, inputArgs ...interface{}) (*commonpb.Payloads, error) {
+	params.ActivityFn = func(ctx context.Context, inputArgs ...any) (*commonpb.Payloads, error) {
 		return aew.ExecuteWithActualArgs(ctx, params.InputArgs)
 	}
 
@@ -1606,11 +2062,13 @@ func (env *testWorkflowEnvironmentImpl) RequestCancelLocalActivity(activityID Lo
 	task.cancel()
 }
 
-func (env *testWorkflowEnvironmentImpl) handleActivityResult(activityID ActivityID, result interface{}, activityType string,
+func (env *testWorkflowEnvironmentImpl) handleActivityResult(activityHandle *testActivityHandle, result any,
 	dataConverter converter.DataConverter) {
+	activityID := ActivityID{id: activityHandle.task.ActivityId}
+	activityType := activityHandle.task.ActivityType.Name
 	env.logger.Debug(fmt.Sprintf("handleActivityResult: %T.", result),
-		tagActivityID, activityID, tagActivityType, activityType)
-	activityInfo := env.getActivityInfo(activityID, activityType)
+		tagActivityID, activityID.id, tagActivityType, activityType)
+	activityInfo := activityHandle.getActivityInfo()
 	if result == ErrActivityResultPending {
 		// In case activity returns ErrActivityResultPending, the respond will be nil, and we don't need to do anything.
 		// Activity will need to complete asynchronously using CompleteActivity().
@@ -1621,14 +2079,12 @@ func (env *testWorkflowEnvironmentImpl) handleActivityResult(activityID Activity
 	}
 
 	// this is running in dispatcher
-	activityHandle, ok := env.getActivityHandle(activityID.id, activityInfo.WorkflowExecution.RunID)
-	if !ok {
-		env.logger.Debug("handleActivityResult: ActivityID not exists, could be already completed or canceled.",
+	if _, ok := env.getActivityHandle(activityHandle.token); !ok {
+		env.logger.Debug("handleActivityResult: Activity not found, could be already completed or canceled.",
 			tagActivityID, activityID)
 		return
 	}
-
-	env.deleteHandle(activityID.id, activityInfo.WorkflowExecution.RunID)
+	env.deleteHandle(activityHandle.token)
 
 	var blob *commonpb.Payloads
 	var err error
@@ -1648,12 +2104,29 @@ func (env *testWorkflowEnvironmentImpl) handleActivityResult(activityID Activity
 			activityID,
 			activityType,
 			enumspb.RETRY_STATE_UNSPECIFIED,
-			env.failureConverter.FailureToError(request.GetFailure()),
+			activityHandle.failureConverter.FailureToError(request.GetFailure()),
 		)
 		activityHandle.callback(nil, err)
 	case *workflowservice.RespondActivityTaskCompletedRequest:
 		blob = request.Result
 		activityHandle.callback(blob, nil)
+	case *activityTimeoutResult:
+		// Activity timed out due to missing heartbeats or exceeding StartToCloseTimeout
+		var timeoutErr error
+		if request.timeoutType == enumspb.TIMEOUT_TYPE_HEARTBEAT {
+			timeoutErr = NewHeartbeatTimeoutError(newEncodedValues(request.details, dataConverter))
+		} else {
+			// For StartToCloseTimeout, the cause is context.DeadlineExceeded since
+			// we set up the context deadline to match the timeout
+			timeoutErr = NewTimeoutError("Activity timeout", request.timeoutType, context.DeadlineExceeded)
+		}
+		err = env.wrapActivityError(
+			activityID,
+			activityType,
+			enumspb.RETRY_STATE_TIMEOUT,
+			timeoutErr,
+		)
+		activityHandle.callback(nil, err)
 	default:
 		if result == context.DeadlineExceeded {
 			err = env.wrapActivityError(
@@ -1701,7 +2174,14 @@ func (env *testWorkflowEnvironmentImpl) handleLocalActivityResult(result *localA
 	env.logger.Debug(fmt.Sprintf("handleLocalActivityResult: Err: %v, Result: %v.", result.err, result.result),
 		tagActivityID, activityID, tagActivityType, activityType)
 
-	activityInfo := env.getActivityInfo(activityID, activityType)
+	activityInfo := &ActivityInfo{
+		ActivityID:        activityID.id,
+		ActivityType:      ActivityType{Name: activityType},
+		TaskToken:         []byte(activityID.id),
+		WorkflowExecution: env.workflowInfo.WorkflowExecution,
+		Attempt:           1,
+	}
+
 	task, ok := env.localActivities[activityID.id]
 	if !ok {
 		env.logger.Debug("handleLocalActivityResult: ActivityID not exists, could be already completed or canceled.",
@@ -1738,7 +2218,11 @@ func (env *testWorkflowEnvironmentImpl) handleLocalActivityResult(result *localA
 			env.onLocalActivityCanceledListener(activityInfo)
 		}
 	} else if env.onLocalActivityCompletedListener != nil {
-		env.onLocalActivityCompletedListener(activityInfo, newEncodedValue(result.result, env.GetDataConverter()), nil)
+		dataConverter := result.task.params.DataConverter
+		if dataConverter == nil {
+			dataConverter = env.GetDataConverter()
+		}
+		env.onLocalActivityCompletedListener(activityInfo, newEncodedValue(result.result, dataConverter), nil)
 	}
 	env.startWorkflowTask()
 }
@@ -1774,12 +2258,14 @@ func (env *testWorkflowEnvironmentImpl) runBeforeMockCallReturns(call *MockCallW
 // Execute executes the activity code.
 func (a *activityExecutorWrapper) Execute(ctx context.Context, input *commonpb.Payloads) (*commonpb.Payloads, error) {
 	activityInfo := GetActivityInfo(ctx)
-	// If the activity was cancelled before it starts here, we do not execute and
-	// instead return cancelled
-	a.env.locker.Lock()
-	_, handleExists := a.env.getActivityHandle(activityInfo.ActivityID, activityInfo.WorkflowExecution.RunID)
-	a.env.locker.Unlock()
-	if !handleExists {
+	token, ok := activityTokenFromBytes(activityInfo.TaskToken)
+	// If activity handle cannot be found, we assume it was cancelled
+	if ok {
+		a.env.locker.Lock()
+		_, ok = a.env.getActivityHandle(token)
+		a.env.locker.Unlock()
+	}
+	if !ok {
 		return nil, NewCanceledError()
 	}
 
@@ -1802,7 +2288,7 @@ func (a *activityExecutorWrapper) Execute(ctx context.Context, input *commonpb.P
 }
 
 // ExecuteWithActualArgs executes the activity code.
-func (a *activityExecutorWrapper) ExecuteWithActualArgs(ctx context.Context, inputArgs []interface{}) (*commonpb.Payloads, error) {
+func (a *activityExecutorWrapper) ExecuteWithActualArgs(ctx context.Context, inputArgs []any) (*commonpb.Payloads, error) {
 	activityInfo := GetActivityInfo(ctx)
 	if a.env.onLocalActivityStartedListener != nil {
 		waitCh := make(chan struct{})
@@ -1813,7 +2299,7 @@ func (a *activityExecutorWrapper) ExecuteWithActualArgs(ctx context.Context, inp
 		<-waitCh
 	}
 
-	m := &mockWrapper{env: a.env, name: a.name, fn: a.fn, isWorkflow: false}
+	m := &mockWrapper{env: a.env, name: a.name, fn: a.fn, isWorkflow: false, dataConverter: getDataConverterFromActivityCtx(ctx)}
 	if mockRet := m.getActivityMockReturnWithActualArgs(ctx, inputArgs); mockRet != nil {
 		// check if mock returns function which must match to the actual function.
 		if mockFn := m.getMockFn(mockRet); mockFn != nil {
@@ -1847,6 +2333,11 @@ func (w *workflowExecutorWrapper) Execute(ctx Context, input *commonpb.Payloads)
 	mockReadyChannel := NewChannel(ctx)
 	// make a copy of the context for getWorkflowMockReturn() call to avoid race condition
 	_, ctxCopy, err := newWorkflowContext(w.env, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Ensure ctxCopy matches real execution: apply header propagation to the context
+	ctxCopy, err = workflowContextWithHeaderPropagated(ctxCopy, w.env.header, w.env.GetContextPropagators())
 	if err != nil {
 		return nil, err
 	}
@@ -1895,7 +2386,7 @@ func (w *workflowExecutorWrapper) Execute(ctx Context, input *commonpb.Payloads)
 	return w.workflowExecutor.Execute(ctx, input)
 }
 
-func (m *mockWrapper) getCtxArg(ctx interface{}) []interface{} {
+func (m *mockWrapper) getCtxArg(ctx any) []any {
 	if m.fn == nil {
 		return nil
 	}
@@ -1903,13 +2394,13 @@ func (m *mockWrapper) getCtxArg(ctx interface{}) []interface{} {
 	if fnType.NumIn() > 0 {
 		if (!m.isWorkflow && isActivityContext(fnType.In(0))) ||
 			(m.isWorkflow && isWorkflowContext(fnType.In(0))) {
-			return []interface{}{ctx}
+			return []any{ctx}
 		}
 	}
 	return nil
 }
 
-func (m *mockWrapper) getActivityMockReturn(ctx interface{}, input *commonpb.Payloads) (retArgs mock.Arguments) {
+func (m *mockWrapper) getActivityMockReturn(ctx any, input *commonpb.Payloads) (retArgs mock.Arguments) {
 	if _, ok := m.env.expectedActivityMockCalls[m.name]; !ok {
 		// no mock
 		return nil
@@ -1918,7 +2409,7 @@ func (m *mockWrapper) getActivityMockReturn(ctx interface{}, input *commonpb.Pay
 	return m.getMockReturn(ctx, input, m.env.activityMock)
 }
 
-func (m *mockWrapper) getWorkflowMockReturn(ctx interface{}, input *commonpb.Payloads) (retArgs mock.Arguments) {
+func (m *mockWrapper) getWorkflowMockReturn(ctx any, input *commonpb.Payloads) (retArgs mock.Arguments) {
 	if _, ok := m.env.expectedWorkflowMockCalls[m.name]; !ok {
 		// no mock
 		return nil
@@ -1928,10 +2419,10 @@ func (m *mockWrapper) getWorkflowMockReturn(ctx interface{}, input *commonpb.Pay
 }
 
 func (m *mockWrapper) getNexusMockReturn(
-	ctx interface{},
+	ctx any,
 	operation string,
-	input interface{},
-	options interface{},
+	input any,
+	options any,
 ) (retArgs mock.Arguments) {
 	if _, ok := m.env.expectedNexusMockCalls[m.name]; !ok {
 		// no mock
@@ -1939,12 +2430,12 @@ func (m *mockWrapper) getNexusMockReturn(
 	}
 	return m.getMockReturnWithActualArgs(
 		ctx,
-		[]interface{}{operation, input, options},
+		[]any{operation, input, options},
 		m.env.nexusMock,
 	)
 }
 
-func (m *mockWrapper) getMockReturn(ctx interface{}, input *commonpb.Payloads, envMock *mock.Mock) (retArgs mock.Arguments) {
+func (m *mockWrapper) getMockReturn(ctx any, input *commonpb.Payloads, envMock *mock.Mock) (retArgs mock.Arguments) {
 	fnType := reflect.TypeOf(m.fn)
 	reflectArgs, err := decodeArgs(m.dataConverter, fnType, input)
 	if err != nil {
@@ -1958,7 +2449,7 @@ func (m *mockWrapper) getMockReturn(ctx interface{}, input *commonpb.Payloads, e
 	return envMock.MethodCalled(m.name, realArgs...)
 }
 
-func (m *mockWrapper) getActivityMockReturnWithActualArgs(ctx interface{}, inputArgs []interface{}) (retArgs mock.Arguments) {
+func (m *mockWrapper) getActivityMockReturnWithActualArgs(ctx any, inputArgs []any) (retArgs mock.Arguments) {
 	if _, ok := m.env.expectedActivityMockCalls[m.name]; !ok {
 		// no mock
 		return nil
@@ -1967,13 +2458,13 @@ func (m *mockWrapper) getActivityMockReturnWithActualArgs(ctx interface{}, input
 	return m.getMockReturnWithActualArgs(ctx, inputArgs, m.env.activityMock)
 }
 
-func (m *mockWrapper) getMockReturnWithActualArgs(ctx interface{}, inputArgs []interface{}, envMock *mock.Mock) (retArgs mock.Arguments) {
+func (m *mockWrapper) getMockReturnWithActualArgs(ctx any, inputArgs []any, envMock *mock.Mock) (retArgs mock.Arguments) {
 	realArgs := m.getCtxArg(ctx)
 	realArgs = append(realArgs, inputArgs...)
 	return envMock.MethodCalled(m.name, realArgs...)
 }
 
-func (m *mockWrapper) getMockFn(mockRet mock.Arguments) interface{} {
+func (m *mockWrapper) getMockFn(mockRet mock.Arguments) any {
 	fnName := m.name
 	mockRetLen := len(mockRet)
 	if mockRetLen == 0 {
@@ -1996,6 +2487,13 @@ func (m *mockWrapper) getMockFn(mockRet mock.Arguments) interface{} {
 		return mockFn
 	}
 	return nil
+}
+
+func (m *mockWrapper) getDataConverter() converter.DataConverter {
+	if m.dataConverter != nil {
+		return m.dataConverter
+	}
+	return m.env.GetDataConverter()
 }
 
 func (m *mockWrapper) getMockValue(mockRet mock.Arguments) (*commonpb.Payloads, error) {
@@ -2027,7 +2525,7 @@ func (m *mockWrapper) getMockValue(mockRet mock.Arguments) (*commonpb.Payloads, 
 		mockResult := mockRet[0]
 		if mockResult == nil {
 			switch expectedType.Kind() {
-			case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Array:
+			case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Array:
 				// these are supported nil-able types. (reflect.Chan, reflect.Func are nil-able, but not supported)
 				return nil, retErr
 			default:
@@ -2039,7 +2537,7 @@ func (m *mockWrapper) getMockValue(mockRet mock.Arguments) (*commonpb.Payloads, 
 				panic(fmt.Sprintf("mock of %v has incorrect return type, expected %v, but actual is %T (%v)",
 					fnName, expectedType, mockResult, mockResult))
 			}
-			result, encodeErr := encodeArg(m.env.GetDataConverter(), mockResult)
+			result, encodeErr := encodeArg(m.getDataConverter(), mockResult)
 			if encodeErr != nil {
 				panic(fmt.Sprintf("encode result from mock of %v failed: %v", fnName, encodeErr))
 			}
@@ -2051,7 +2549,7 @@ func (m *mockWrapper) getMockValue(mockRet mock.Arguments) (*commonpb.Payloads, 
 	}
 }
 
-func (m *mockWrapper) executeMock(ctx interface{}, input *commonpb.Payloads, mockRet mock.Arguments) (result *commonpb.Payloads, err error) {
+func (m *mockWrapper) executeMock(ctx any, input *commonpb.Payloads, mockRet mock.Arguments) (result *commonpb.Payloads, err error) {
 	// have to handle panics here to support calling ExecuteChildWorkflow(...).GetChildWorkflowExecution().Get(...)
 	// when a child is mocked.
 	defer func() {
@@ -2138,18 +2636,11 @@ func (env *testWorkflowEnvironmentImpl) newTestActivityTaskHandler(taskQueue str
 	return taskHandler
 }
 
-func newTestActivityTask(workflowID, runID, workflowTypeName, namespace string,
-	attr *commandpb.ScheduleActivityTaskCommandAttributes) *workflowservice.PollActivityTaskQueueResponse {
-	activityID := attr.GetActivityId()
+func newTestActivityTask(namespace string, attr *commandpb.ScheduleActivityTaskCommandAttributes) *workflowservice.PollActivityTaskQueueResponse {
 	now := time.Now()
-	task := &workflowservice.PollActivityTaskQueueResponse{
-		Attempt: 1,
-		WorkflowExecution: &commonpb.WorkflowExecution{
-			WorkflowId: workflowID,
-			RunId:      runID,
-		},
-		ActivityId:             activityID,
-		TaskToken:              []byte(activityID), // use activityID as TaskToken so we can map TaskToken in heartbeat calls.
+	return &workflowservice.PollActivityTaskQueueResponse{
+		Attempt:                1,
+		ActivityId:             attr.GetActivityId(),
 		ActivityType:           &commonpb.ActivityType{Name: attr.GetActivityType().GetName()},
 		Input:                  attr.GetInput(),
 		ScheduledTime:          timestamppb.New(now),
@@ -2157,14 +2648,10 @@ func newTestActivityTask(workflowID, runID, workflowTypeName, namespace string,
 		StartedTime:            timestamppb.New(now),
 		StartToCloseTimeout:    attr.GetStartToCloseTimeout(),
 		HeartbeatTimeout:       attr.GetHeartbeatTimeout(),
-		WorkflowType: &commonpb.WorkflowType{
-			Name: workflowTypeName,
-		},
-		WorkflowNamespace: namespace,
-		Header:            attr.GetHeader(),
-		Priority:          attr.Priority,
+		WorkflowNamespace:      namespace,
+		Header:                 attr.GetHeader(),
+		Priority:               attr.Priority,
 	}
-	return task
 }
 
 func (env *testWorkflowEnvironmentImpl) newTimer(
@@ -2202,6 +2689,7 @@ func (env *testWorkflowEnvironmentImpl) newTimer(
 func (env *testWorkflowEnvironmentImpl) NewTimer(
 	d time.Duration,
 	options TimerOptions,
+	_ []*sdk.EventGroupMarker,
 	callback ResultHandler,
 ) *TimerID {
 	return env.newTimer(d, options, callback, true)
@@ -2219,32 +2707,50 @@ func (env *testWorkflowEnvironmentImpl) TypedSearchAttributes() SearchAttributes
 	return convertToTypedSearchAttributes(env.logger, env.workflowInfo.SearchAttributes.GetIndexedFields())
 }
 
-func (env *testWorkflowEnvironmentImpl) RegisterWorkflow(w interface{}) {
+func (env *testWorkflowEnvironmentImpl) RegisterWorkflow(w any) {
+	if env.pluginRegistryOptions.OnRegisterWorkflow != nil {
+		env.pluginRegistryOptions.OnRegisterWorkflow(w, RegisterWorkflowOptions{})
+	}
 	env.registry.RegisterWorkflow(w)
 }
 
-func (env *testWorkflowEnvironmentImpl) RegisterWorkflowWithOptions(w interface{}, options RegisterWorkflowOptions) {
+func (env *testWorkflowEnvironmentImpl) RegisterWorkflowWithOptions(w any, options RegisterWorkflowOptions) {
+	if env.pluginRegistryOptions.OnRegisterWorkflow != nil {
+		env.pluginRegistryOptions.OnRegisterWorkflow(w, options)
+	}
 	env.registry.RegisterWorkflowWithOptions(w, options)
 }
 
-func (env *testWorkflowEnvironmentImpl) RegisterDynamicWorkflow(w interface{}, options DynamicRegisterWorkflowOptions) {
+func (env *testWorkflowEnvironmentImpl) RegisterDynamicWorkflow(w any, options DynamicRegisterWorkflowOptions) {
+	if env.pluginRegistryOptions.OnRegisterDynamicWorkflow != nil {
+		env.pluginRegistryOptions.OnRegisterDynamicWorkflow(w, options)
+	}
 	env.registry.RegisterDynamicWorkflow(w, options)
 }
 
-func (env *testWorkflowEnvironmentImpl) RegisterActivity(a interface{}) {
-	env.registry.RegisterActivityWithOptions(a, RegisterActivityOptions{DisableAlreadyRegisteredCheck: true})
+func (env *testWorkflowEnvironmentImpl) RegisterActivity(a any) {
+	env.RegisterActivityWithOptions(a, RegisterActivityOptions{})
 }
 
-func (env *testWorkflowEnvironmentImpl) RegisterActivityWithOptions(a interface{}, options RegisterActivityOptions) {
+func (env *testWorkflowEnvironmentImpl) RegisterActivityWithOptions(a any, options RegisterActivityOptions) {
+	if env.pluginRegistryOptions.OnRegisterActivity != nil {
+		env.pluginRegistryOptions.OnRegisterActivity(a, options)
+	}
 	options.DisableAlreadyRegisteredCheck = true
 	env.registry.RegisterActivityWithOptions(a, options)
 }
 
-func (env *testWorkflowEnvironmentImpl) RegisterDynamicActivity(w interface{}, options DynamicRegisterActivityOptions) {
+func (env *testWorkflowEnvironmentImpl) RegisterDynamicActivity(w any, options DynamicRegisterActivityOptions) {
+	if env.pluginRegistryOptions.OnRegisterDynamicActivity != nil {
+		env.pluginRegistryOptions.OnRegisterDynamicActivity(w, options)
+	}
 	env.registry.RegisterDynamicActivity(w, options)
 }
 
 func (env *testWorkflowEnvironmentImpl) RegisterNexusService(s *nexus.Service) {
+	if env.pluginRegistryOptions.OnRegisterNexusService != nil {
+		env.pluginRegistryOptions.OnRegisterNexusService(s)
+	}
 	env.registry.RegisterNexusService(s)
 }
 
@@ -2279,15 +2785,28 @@ func (env *testWorkflowEnvironmentImpl) RequestCancelChildWorkflow(_, workflowID
 	}
 }
 
-func (env *testWorkflowEnvironmentImpl) RequestCancelExternalWorkflow(namespace, workflowID, runID string, callback ResultHandler) {
+func (env *testWorkflowEnvironmentImpl) RequestCancelExternalWorkflow(namespace, workflowID, runID string, _ []*sdk.EventGroupMarker, callback ResultHandler) {
 	if env.workflowInfo.WorkflowExecution.ID == workflowID {
-		// cancel current workflow
-		env.workflowCancelHandler()
-		// check if current workflow is a child workflow
-		if env.isChildWorkflow() && env.onChildWorkflowCanceledListener != nil {
-			env.postCallback(func() {
-				env.onChildWorkflowCanceledListener(env.workflowInfo)
-			}, false)
+		cancelFunc := func() {
+			env.workflowCancelHandler()
+
+			if env.isChildWorkflow() && env.onChildWorkflowCanceledListener != nil {
+				env.postCallback(func() {
+					env.onChildWorkflowCanceledListener(env.workflowInfo)
+				}, false)
+			}
+		}
+		// The way testWorkflowEnvironment is setup today, we close the child workflow dispatcher before calling
+		// the workflowCancelHandler. A larger refactor would be needed to handle this similar to non-test code.
+		// Maybe worth doing when https://github.com/temporalio/go-sdk/issues/50 is tackled.
+		if sd, ok := env.workflowDef.(*syncWorkflowDefinition); ok && env.isChildWorkflow() {
+			if !sd.dispatcher.IsClosed() {
+				sd.dispatcher.NewCoroutine(sd.rootCtx, "cancel-self", true, func(ctx Context) {
+					cancelFunc()
+				})
+			}
+		} else {
+			cancelFunc()
 		}
 		return
 	} else if childHandle, ok := env.runningWorkflows[workflowID]; ok && !childHandle.handled {
@@ -2308,7 +2827,7 @@ func (env *testWorkflowEnvironmentImpl) RequestCancelExternalWorkflow(namespace,
 	// configured to delay, it will block the main loop which stops the world.
 	env.runningCount++
 	go func() {
-		args := []interface{}{namespace, workflowID, runID}
+		args := []any{namespace, workflowID, runID}
 		// below call will panic if mock is not properly setup.
 		mockRet := env.workflowMock.MethodCalled(mockMethodForRequestCancelExternalWorkflow, args...)
 		m := &mockWrapper{name: mockMethodForRequestCancelExternalWorkflow, fn: mockFnRequestCancelExternalWorkflow}
@@ -2336,9 +2855,10 @@ func (env *testWorkflowEnvironmentImpl) SignalExternalWorkflow(
 	runID string,
 	signalName string,
 	input *commonpb.Payloads,
-	arg interface{},
+	arg any,
 	header *commonpb.Header,
 	childWorkflowOnly bool,
+	_ []*sdk.EventGroupMarker,
 	callback ResultHandler,
 ) {
 	// check if target workflow is a known workflow
@@ -2369,7 +2889,7 @@ func (env *testWorkflowEnvironmentImpl) SignalExternalWorkflow(
 	// configured to delay, it will block the main loop which stops the world.
 	env.runningCount++
 	go func() {
-		args := []interface{}{namespace, workflowID, runID, signalName, arg}
+		args := []any{namespace, workflowID, runID, signalName, arg}
 		// below call will panic if mock is not properly setup.
 		mockRet := env.workflowMock.MethodCalled(mockMethodForSignalExternalWorkflow, args...)
 		m := &mockWrapper{name: mockMethodForSignalExternalWorkflow, fn: mockFnSignalExternalWorkflow}
@@ -2433,10 +2953,11 @@ func (env *testWorkflowEnvironmentImpl) newTestNexusTaskHandler(
 }
 
 func (env *testWorkflowEnvironmentImpl) ExecuteNexusOperation(
-	params executeNexusOperationParams,
+	params ExecuteNexusOperationParams,
 	callback func(*commonpb.Payload, error),
 	startedHandler func(opID string, e error),
 ) int64 {
+	failureConverter := cmp.Or(params.failureConverter, env.failureConverter)
 	seq := env.nextID()
 	// Use lower case header values to simulate how the Nexus SDK (used internally by the "real" server) would transmit
 	// these headers over the wire.
@@ -2468,8 +2989,9 @@ func (env *testWorkflowEnvironmentImpl) ExecuteNexusOperation(
 		env.NewTimer(
 			params.options.ScheduleToCloseTimeout,
 			TimerOptions{},
+			nil,
 			func(result *commonpb.Payloads, err error) {
-				timeoutErr := env.failureConverter.FailureToError(nexusOperationFailure(
+				timeoutErr := failureConverter.FailureToError(nexusOperationFailure(
 					params,
 					token,
 					&failurepb.Failure{
@@ -2493,25 +3015,67 @@ func (env *testWorkflowEnvironmentImpl) ExecuteNexusOperation(
 		)
 	}
 
+	if params.options.ScheduleToStartTimeout > 0 {
+		// Timer to fail the nexus operation due to schedule to start timeout.
+		env.NewTimer(
+			params.options.ScheduleToStartTimeout,
+			TimerOptions{},
+			nil,
+			func(result *commonpb.Payloads, err error) {
+				env.postCallback(func() {
+					// Only timeout if operation hasn't started yet
+					if !handle.started {
+						timeoutErr := failureConverter.FailureToError(nexusOperationFailure(
+							params,
+							"",
+							&failurepb.Failure{
+								Message: "operation timed out before starting",
+								FailureInfo: &failurepb.Failure_TimeoutFailureInfo{
+									TimeoutFailureInfo: &failurepb.TimeoutFailureInfo{
+										TimeoutType: enumspb.TIMEOUT_TYPE_SCHEDULE_TO_START,
+									},
+								},
+							},
+						))
+						handle.startedCallback("", timeoutErr)
+						handle.completedCallback(nil, timeoutErr)
+					}
+				}, true)
+			},
+		)
+	}
+
 	task := handle.newStartTask()
 	env.runningCount++
 	go func() {
 		response, failure, err := taskHandler.Execute(task)
 		if err != nil {
 			// No retries for operations, fail the operation immediately.
-			failure = taskHandler.fillInFailure(task.TaskToken, nexusHandlerError(nexus.HandlerErrorTypeInternal, err.Error()))
+			//lint:ignore SA4006 fillInFailure cannot fail for a handler error without a cause.
+			failure, err = taskHandler.fillInFailure(
+				task.TaskToken,
+				nexus.NewHandlerErrorf(nexus.HandlerErrorTypeInternal, "%s", err.Error()),
+				false,
+				taskHandler.failureConverter,
+				task.GetPollerGroupId(),
+			)
 		}
 		if failure != nil {
 			// Convert to a nexus HandlerError first to simulate the flow in the server.
 			var handlerErr error
-			handlerErr, err = apiHandlerErrorToNexusHandlerError(failure.GetError(), env.failureConverter)
-			if err != nil {
-				handlerErr = fmt.Errorf("unexpected error while trying to reconstruct Nexus handler error: %w", err)
+			if failure.GetFailure() != nil {
+				handlerErr = env.failureConverter.FailureToError(failure.GetFailure())
+			} else {
+				//lint:ignore SA1019 handle legacy operation error format for backward compatibility.
+				handlerErr, err = apiHandlerErrorToNexusHandlerError(failure.GetError(), env.failureConverter)
+				if err != nil {
+					handlerErr = fmt.Errorf("unexpected error while trying to reconstruct Nexus handler error: %w", err)
+				}
 			}
 
 			// To simulate the server flow, convert to failure and then back to a Go error.
 			// This ensures that the error's `Failure` is set, the same way as it would outside of the test env.
-			err = env.failureConverter.FailureToError(
+			err = failureConverter.FailureToError(
 				nexusOperationFailure(params, "", env.failureConverter.ErrorToFailure(handlerErr)),
 			)
 
@@ -2538,7 +3102,16 @@ func (env *testWorkflowEnvironmentImpl) ExecuteNexusOperation(
 					env.scheduleNexusAsyncOperationCompletion(handle)
 				}
 			}, true)
+		case *nexuspb.StartOperationResponse_Failure:
+			err := failureConverter.FailureToError(
+				nexusOperationFailure(params, "", v.Failure),
+			)
+			env.postCallback(func() {
+				handle.startedCallback("", err)
+				handle.completedCallback(nil, err)
+			}, true)
 		case *nexuspb.StartOperationResponse_OperationError:
+			//lint:ignore SA1019 handle legacy operation error format for backward compatibility.
 			failure, err := operationErrorToTemporalFailure(apiOperationErrorToNexusOperationError(v.OperationError))
 			if err != nil {
 				err = fmt.Errorf("unexpected error while trying to reconstruct Nexus operation error: %w", err)
@@ -2548,7 +3121,7 @@ func (env *testWorkflowEnvironmentImpl) ExecuteNexusOperation(
 				}, true)
 				return
 			}
-			err = env.failureConverter.FailureToError(
+			err = failureConverter.FailureToError(
 				nexusOperationFailure(params, "", failure),
 			)
 			env.postCallback(func() {
@@ -2581,6 +3154,15 @@ func (env *testWorkflowEnvironmentImpl) RequestCancelNexusOperation(seq int64) {
 	if handle.started {
 		handle.cancel()
 	}
+}
+
+func (env *testWorkflowEnvironmentImpl) AbandonNexusOperation(seq int64) {
+	handle, ok := env.getNexusOperationHandle(seq)
+	if !ok {
+		return
+	}
+	handle.onStarted = func(string, error) {}
+	handle.onCompleted = func(*commonpb.Payload, error) {}
 }
 
 func (env *testWorkflowEnvironmentImpl) RegisterNexusAsyncOperationCompletion(
@@ -2677,7 +3259,11 @@ func (env *testWorkflowEnvironmentImpl) scheduleNexusAsyncOperationCompletion(
 	)
 	var nexusErr error
 	if completionHandle.err != nil {
-		nexusErr = env.failureConverter.FailureToError(nexusOperationFailure(
+		failureConverter := handle.params.failureConverter
+		if failureConverter == nil {
+			failureConverter = env.failureConverter
+		}
+		nexusErr = failureConverter.FailureToError(nexusOperationFailure(
 			handle.params,
 			handle.operationToken,
 			&failurepb.Failure{
@@ -2704,8 +3290,13 @@ func (env *testWorkflowEnvironmentImpl) resolveNexusOperation(seq int64, token s
 			panic(fmt.Errorf("no running operation found for sequence: %d", seq))
 		}
 		if err != nil {
+			// Encode as the handler, then decode with the caller's operation converter.
 			failure := env.failureConverter.ErrorToFailure(err)
-			err = env.failureConverter.FailureToError(nexusOperationFailure(handle.params, handle.operationToken, failure.GetCause()))
+			failureConverter := handle.params.failureConverter
+			if failureConverter == nil {
+				failureConverter = env.failureConverter
+			}
+			err = failureConverter.FailureToError(nexusOperationFailure(handle.params, handle.operationToken, failure))
 		}
 		// Populate the token in case the operation completes before it marked as started.
 		// startedCallback is idempotent and will be a noop in case the operation has already been marked as started.
@@ -2740,7 +3331,7 @@ func (env *testWorkflowEnvironmentImpl) makeUniqueNexusOperationToken(
 	return fmt.Sprintf("%s_%s_%s", service, operation, token)
 }
 
-func (env *testWorkflowEnvironmentImpl) SideEffect(f func() (*commonpb.Payloads, error), callback ResultHandler, _ string) {
+func (env *testWorkflowEnvironmentImpl) SideEffect(f func() (*commonpb.Payloads, error), callback ResultHandler, _ string, _ []*sdk.EventGroupMarker) {
 	mockMethod := mockMethodForSideEffect
 	if _, ok := env.expectedWorkflowMockCalls[mockMethod]; !ok {
 		callback(f())
@@ -2750,7 +3341,7 @@ func (env *testWorkflowEnvironmentImpl) SideEffect(f func() (*commonpb.Payloads,
 	mockRet := env.workflowMock.MethodCalled(mockMethod)
 	m := &mockWrapper{env: env, name: mockMethod, fn: mockFnSideEffect}
 	if mockFn := m.getMockFn(mockRet); mockFn != nil {
-		result := mockFn.(func() interface{})()
+		result := mockFn.(func() any)()
 		encoded, encodeErr := encodeArg(env.GetDataConverter(), result)
 		if encodeErr != nil {
 			panic(fmt.Sprintf("encode result from mock of %v failed: %v", mockMethod, encodeErr))
@@ -2771,16 +3362,16 @@ func (env *testWorkflowEnvironmentImpl) SideEffect(f func() (*commonpb.Payloads,
 	callback(encoded, nil)
 }
 
-func (env *testWorkflowEnvironmentImpl) GetVersion(changeID string, minSupported, maxSupported Version) (retVersion Version) {
+func (env *testWorkflowEnvironmentImpl) GetVersion(changeID string, minSupported, maxSupported Version, _ []*sdk.EventGroupMarker) (retVersion Version) {
 	if mockVersion, ok := env.getMockedVersion(changeID, changeID, minSupported, maxSupported); ok {
 		// GetVersion for changeID is mocked
-		_ = env.UpsertSearchAttributes(createSearchAttributesForChangeVersion(changeID, mockVersion, env.changeVersions))
+		_ = env.UpsertSearchAttributes(createSearchAttributesForChangeVersion(changeID, mockVersion, env.changeVersions), nil)
 		env.changeVersions[changeID] = mockVersion
 		return mockVersion
 	}
 	if mockVersion, ok := env.getMockedVersion(mock.Anything, changeID, minSupported, maxSupported); ok {
 		// GetVersion is mocked with any changeID.
-		_ = env.UpsertSearchAttributes(createSearchAttributesForChangeVersion(changeID, mockVersion, env.changeVersions))
+		_ = env.UpsertSearchAttributes(createSearchAttributesForChangeVersion(changeID, mockVersion, env.changeVersions), nil)
 		env.changeVersions[changeID] = mockVersion
 		return mockVersion
 	}
@@ -2790,9 +3381,18 @@ func (env *testWorkflowEnvironmentImpl) GetVersion(changeID string, minSupported
 		validateVersion(changeID, version, minSupported, maxSupported)
 		return version
 	}
-	_ = env.UpsertSearchAttributes(createSearchAttributesForChangeVersion(changeID, maxSupported, env.changeVersions))
-	env.changeVersions[changeID] = maxSupported
-	return maxSupported
+	version := resolvePreferredVersion(
+		env.workerOptions.PreferredVersionProvider,
+		PreferredVersionProviderInput{
+			WorkflowInfo: env.workflowInfo,
+			ChangeID:     changeID,
+			MinSupported: minSupported,
+			MaxSupported: maxSupported,
+		},
+	)
+	_ = env.UpsertSearchAttributes(createSearchAttributesForChangeVersion(changeID, version, env.changeVersions), nil)
+	env.changeVersions[changeID] = version
+	return version
 }
 
 func (env *testWorkflowEnvironmentImpl) getMockedVersion(mockedChangeID, changeID string, minSupported, maxSupported Version) (Version, bool) {
@@ -2802,7 +3402,7 @@ func (env *testWorkflowEnvironmentImpl) getMockedVersion(mockedChangeID, changeI
 		return DefaultVersion, false
 	}
 
-	args := []interface{}{changeID, minSupported, maxSupported}
+	args := []any{changeID, minSupported, maxSupported}
 	// below call will panic if mock is not properly setup.
 	mockRet := env.workflowMock.MethodCalled(mockMethod, args...)
 	m := &mockWrapper{name: mockMethodForGetVersion, fn: mockFnGetVersion}
@@ -2816,14 +3416,14 @@ func (env *testWorkflowEnvironmentImpl) getMockedVersion(mockedChangeID, changeI
 			reflectArgs = append(reflectArgs, reflect.ValueOf(arg))
 		}
 		reflectValues := reflect.ValueOf(mockFn).Call(reflectArgs)
-		if len(reflectValues) != 1 || !reflect.TypeOf(reflectValues[0].Interface()).AssignableTo(reflect.TypeOf(DefaultVersion)) {
+		if len(reflectValues) != 1 || !reflect.TypeOf(reflectValues[0].Interface()).AssignableTo(reflect.TypeFor[Version]()) {
 			panic(fmt.Sprintf("mock of GetVersion has incorrect return type, expected workflow.Version, but actual is %T (%v)",
 				reflectValues[0].Interface(), reflectValues[0].Interface()))
 		}
 		return reflectValues[0].Interface().(Version), true
 	}
 
-	if len(mockRet) != 1 || !reflect.TypeOf(mockRet[0]).AssignableTo(reflect.TypeOf(DefaultVersion)) {
+	if len(mockRet) != 1 || !reflect.TypeOf(mockRet[0]).AssignableTo(reflect.TypeFor[Version]()) {
 		panic(fmt.Sprintf("mock of GetVersion has incorrect return type, expected workflow.Version, but actual is %T (%v)",
 			mockRet[0], mockRet[0]))
 	}
@@ -2834,7 +3434,7 @@ func getMockMethodForGetVersion(changeID string) string {
 	return fmt.Sprintf("%v_%v", mockMethodForGetVersion, changeID)
 }
 
-func (env *testWorkflowEnvironmentImpl) UpsertSearchAttributes(attributes map[string]interface{}) error {
+func (env *testWorkflowEnvironmentImpl) UpsertSearchAttributes(attributes map[string]any, _ []*sdk.EventGroupMarker) error {
 	attr, err := validateAndSerializeSearchAttributes(attributes)
 
 	env.workflowInfo.SearchAttributes = mergeSearchAttributes(env.workflowInfo.SearchAttributes, attr)
@@ -2845,13 +3445,13 @@ func (env *testWorkflowEnvironmentImpl) UpsertSearchAttributes(attributes map[st
 		return err
 	}
 
-	args := []interface{}{attributes}
+	args := []any{attributes}
 	env.workflowMock.MethodCalled(mockMethod, args...)
 
 	return err
 }
 
-func validateAndSerializeTypedSearchAttributes(searchAttributes map[SearchAttributeKey]interface{}) (*commonpb.SearchAttributes, error) {
+func validateAndSerializeTypedSearchAttributes(searchAttributes map[SearchAttributeKey]any) (*commonpb.SearchAttributes, error) {
 	if len(searchAttributes) == 0 {
 		return nil, errSearchAttributesNotSet
 	}
@@ -2864,7 +3464,7 @@ func validateAndSerializeTypedSearchAttributes(searchAttributes map[SearchAttrib
 	return rawSearchAttributes, nil
 }
 
-func (env *testWorkflowEnvironmentImpl) UpsertTypedSearchAttributes(attributes SearchAttributes) error {
+func (env *testWorkflowEnvironmentImpl) UpsertTypedSearchAttributes(attributes SearchAttributes, _ []*sdk.EventGroupMarker) error {
 	// Don't immediately return the error from validateAndSerializeTypedSearchAttributes, as we may need to call the mock
 	rawSearchAttributes, err := validateAndSerializeTypedSearchAttributes(attributes.untypedValue)
 
@@ -2876,14 +3476,14 @@ func (env *testWorkflowEnvironmentImpl) UpsertTypedSearchAttributes(attributes S
 		return err
 	}
 
-	args := []interface{}{attributes}
+	args := []any{attributes}
 	env.workflowMock.MethodCalled(mockMethod, args...)
 
 	return err
 }
 
-func (env *testWorkflowEnvironmentImpl) UpsertMemo(memoMap map[string]interface{}) error {
-	memo, err := validateAndSerializeMemo(memoMap, env.dataConverter)
+func (env *testWorkflowEnvironmentImpl) UpsertMemo(memoMap map[string]any, _ []*sdk.EventGroupMarker) error {
+	memo, err := validateAndSerializeMemo(memoMap, env.dataConverter, env.TryUse(SDKFlagMemoUserDCEncode))
 
 	env.workflowInfo.Memo = mergeMemo(env.workflowInfo.Memo, memo)
 
@@ -2893,22 +3493,36 @@ func (env *testWorkflowEnvironmentImpl) UpsertMemo(memoMap map[string]interface{
 		return err
 	}
 
-	args := []interface{}{memoMap}
+	args := []any{memoMap}
 	env.workflowMock.MethodCalled(mockMethod, args...)
 
 	return err
 }
 
-func (env *testWorkflowEnvironmentImpl) MutableSideEffect(id string, f func() interface{}, _ func(a, b interface{}) bool, _ string) converter.EncodedValue {
+func (env *testWorkflowEnvironmentImpl) MutableSideEffect(id string, f func() any, equals func(a, b any) bool, _ string, _ []*sdk.EventGroupMarker) converter.EncodedValue {
 	mockMethod := mockMethodForMutableSideEffect
 	if _, ok := env.expectedWorkflowMockCalls[mockMethod]; !ok {
-		return newEncodedValue(env.encodeValue(f()), env.GetDataConverter())
+		// Mirror the real worker's semantics: only record a new value when the
+		// user-supplied equals function reports that the value changed; otherwise
+		// return the previously recorded value.
+		if oldValue, ok := env.mutableSideEffect[id]; ok {
+			newValue := f()
+			if isEqualMutableSideEffectValue(env.GetDataConverter(), newValue, oldValue, equals) {
+				return newEncodedValue(oldValue, env.GetDataConverter())
+			}
+			encoded := env.encodeValue(newValue)
+			env.mutableSideEffect[id] = encoded
+			return newEncodedValue(encoded, env.GetDataConverter())
+		}
+		encoded := env.encodeValue(f())
+		env.mutableSideEffect[id] = encoded
+		return newEncodedValue(encoded, env.GetDataConverter())
 	}
 
 	mockRet := env.workflowMock.MethodCalled(mockMethod, id)
 	m := &mockWrapper{env: env, name: mockMethod, fn: mockFnMutableSideEffect}
 	if mockFn := m.getMockFn(mockRet); mockFn != nil {
-		result := mockFn.(func(string) interface{})(id)
+		result := mockFn.(func(string) any)(id)
 		encoded, encodeErr := encodeArg(env.GetDataConverter(), result)
 		if encodeErr != nil {
 			panic(fmt.Sprintf("encode result from mock of %v failed: %v", mockMethod, encodeErr))
@@ -2936,7 +3550,7 @@ func (env *testWorkflowEnvironmentImpl) RemoveSession(sessionID string) {
 	delete(env.openSessions, sessionID)
 }
 
-func (env *testWorkflowEnvironmentImpl) encodeValue(value interface{}) *commonpb.Payloads {
+func (env *testWorkflowEnvironmentImpl) encodeValue(value any) *commonpb.Payloads {
 	blob, err := env.GetDataConverter().ToPayloads(value)
 	if err != nil {
 		panic(err)
@@ -2950,13 +3564,17 @@ func (env *testWorkflowEnvironmentImpl) nextID() int64 {
 	return activityID
 }
 
-func (env *testWorkflowEnvironmentImpl) getActivityInfo(activityID ActivityID, activityType string) *ActivityInfo {
+func (a *testActivityHandle) getActivityInfo() *ActivityInfo {
 	return &ActivityInfo{
-		ActivityID:        activityID.id,
-		ActivityType:      ActivityType{Name: activityType},
-		TaskToken:         []byte(activityID.id),
-		WorkflowExecution: env.workflowInfo.WorkflowExecution,
-		Attempt:           1,
+		ActivityID:   a.task.ActivityId,
+		ActivityType: ActivityType{Name: a.task.ActivityType.GetName()},
+		TaskToken:    a.token.toBytes(),
+		WorkflowExecution: WorkflowExecution{
+			ID:    a.task.WorkflowExecution.GetWorkflowId(),
+			RunID: a.task.WorkflowExecution.GetRunId(),
+		},
+		Attempt:       a.task.Attempt,
+		ActivityRunID: a.task.ActivityRunId,
 	}
 }
 
@@ -2971,12 +3589,13 @@ func (env *testWorkflowEnvironmentImpl) cancelWorkflowByID(workflowID string, ru
 			env.workflowInfo.Namespace,
 			workflowID,
 			runID,
+			nil,
 			callback,
 		)
 	}, true)
 }
 
-func (env *testWorkflowEnvironmentImpl) signalWorkflow(name string, input interface{}, startWorkflowTask bool) {
+func (env *testWorkflowEnvironmentImpl) signalWorkflow(name string, input any, startWorkflowTask bool) {
 	data, err := encodeArg(env.GetDataConverter(), input)
 	if err != nil {
 		panic(err)
@@ -2987,7 +3606,7 @@ func (env *testWorkflowEnvironmentImpl) signalWorkflow(name string, input interf
 	}, startWorkflowTask)
 }
 
-func (env *testWorkflowEnvironmentImpl) signalWorkflowByID(workflowID, signalName string, input interface{}) error {
+func (env *testWorkflowEnvironmentImpl) signalWorkflowByID(workflowID, signalName string, input any) error {
 	data, err := encodeArg(env.GetDataConverter(), input)
 	if err != nil {
 		panic(err)
@@ -3007,7 +3626,7 @@ func (env *testWorkflowEnvironmentImpl) signalWorkflowByID(workflowID, signalNam
 	return serviceerror.NewNotFound(fmt.Sprintf("Workflow %v not exists", workflowID))
 }
 
-func (env *testWorkflowEnvironmentImpl) queryWorkflow(queryType string, args ...interface{}) (converter.EncodedValue, error) {
+func (env *testWorkflowEnvironmentImpl) queryWorkflow(queryType string, args ...any) (converter.EncodedValue, error) {
 	data, err := encodeArgs(env.GetDataConverter(), args)
 	if err != nil {
 		return nil, err
@@ -3020,7 +3639,7 @@ func (env *testWorkflowEnvironmentImpl) queryWorkflow(queryType string, args ...
 	return newEncodedValue(blob, env.GetDataConverter()), nil
 }
 
-func (env *testWorkflowEnvironmentImpl) updateWorkflow(name string, id string, uc UpdateCallbacks, args ...interface{}) {
+func (env *testWorkflowEnvironmentImpl) updateWorkflow(name string, id string, uc UpdateCallbacks, args ...any) {
 	data, err := encodeArgs(env.GetDataConverter(), args)
 	if err != nil {
 		panic(err)
@@ -3056,7 +3675,7 @@ func (env *testWorkflowEnvironmentImpl) updateWorkflow(name string, id string, u
 
 }
 
-func (env *testWorkflowEnvironmentImpl) updateWorkflowByID(workflowID, name, id string, uc UpdateCallbacks, args ...interface{}) error {
+func (env *testWorkflowEnvironmentImpl) updateWorkflowByID(workflowID, name, id string, uc UpdateCallbacks, args ...any) error {
 	if workflowHandle, ok := env.runningWorkflows[workflowID]; ok {
 		if workflowHandle.handled {
 			return serviceerror.NewNotFound(fmt.Sprintf("Workflow %v already completed", workflowID))
@@ -3096,7 +3715,7 @@ func (env *testWorkflowEnvironmentImpl) updateWorkflowByID(workflowID, name, id 
 	return serviceerror.NewNotFound(fmt.Sprintf("Workflow %v not exists", workflowID))
 }
 
-func (env *testWorkflowEnvironmentImpl) queryWorkflowByID(workflowID, queryType string, args ...interface{}) (converter.EncodedValue, error) {
+func (env *testWorkflowEnvironmentImpl) queryWorkflowByID(workflowID, queryType string, args ...any) (converter.EncodedValue, error) {
 	if workflowHandle, ok := env.runningWorkflows[workflowID]; ok {
 		data, err := encodeArgs(workflowHandle.env.GetDataConverter(), args)
 		if err != nil {
@@ -3144,7 +3763,7 @@ func (env *testWorkflowEnvironmentImpl) getNexusOperationMockRunFn(
 	}
 }
 
-func (env *testWorkflowEnvironmentImpl) setLastCompletionResult(result interface{}) {
+func (env *testWorkflowEnvironmentImpl) setLastCompletionResult(result any) {
 	data, err := encodeArg(env.GetDataConverter(), result)
 	if err != nil {
 		panic(err)
@@ -3156,7 +3775,7 @@ func (env *testWorkflowEnvironmentImpl) setLastError(err error) {
 	env.workflowInfo.lastFailure = env.failureConverter.ErrorToFailure(err)
 }
 
-func (env *testWorkflowEnvironmentImpl) setHeartbeatDetails(details interface{}) {
+func (env *testWorkflowEnvironmentImpl) setHeartbeatDetails(details any) {
 	data, err := encodeArg(env.GetDataConverter(), details)
 	if err != nil {
 		panic(err)
@@ -3213,7 +3832,7 @@ func (t *testSessionEnvironmentImpl) SignalCreationResponse(_ context.Context, s
 }
 
 // function signature for mock SignalExternalWorkflow
-func mockFnSignalExternalWorkflow(string, string, string, string, interface{}) error {
+func mockFnSignalExternalWorkflow(string, string, string, string, any) error {
 	return nil
 }
 
@@ -3228,12 +3847,12 @@ func mockFnGetVersion(string, Version, Version) Version {
 }
 
 // function signature for mock SideEffect
-func mockFnSideEffect() interface{} {
+func mockFnSideEffect() any {
 	return nil
 }
 
 // function signature for mock MutableSideEffect
-func mockFnMutableSideEffect(string) interface{} {
+func mockFnMutableSideEffect(string) any {
 	return nil
 }
 
@@ -3248,7 +3867,7 @@ func (uc updateCallbacksWrapper) Reject(err error) {
 	uc.uc.Reject(err)
 }
 
-func (uc updateCallbacksWrapper) Complete(success interface{}, err error) {
+func (uc updateCallbacksWrapper) Complete(success any, err error) {
 	// cache update result so we can dedup duplicate update IDs
 	if uc.env == nil {
 		panic("env is needed in updateCallback to cache update results for deduping purposes")
@@ -3274,6 +3893,10 @@ func (h *testNexusOperationHandle) newStartTask() *workflowservice.PollNexusTask
 		Request: &nexuspb.Request{
 			ScheduledTime: timestamppb.Now(),
 			Header:        h.params.nexusHeader,
+			Endpoint:      h.params.client.Endpoint(),
+			Capabilities: &nexuspb.Request_Capabilities{
+				TemporalFailureResponses: true,
+			},
 			Variant: &nexuspb.Request_StartOperation{
 				StartOperation: &nexuspb.StartOperationRequest{
 					Service:   h.params.client.Service(),
@@ -3298,6 +3921,10 @@ func (h *testNexusOperationHandle) newCancelTask() *workflowservice.PollNexusTas
 		Request: &nexuspb.Request{
 			ScheduledTime: timestamppb.Now(),
 			Header:        h.params.nexusHeader,
+			Endpoint:      h.params.client.Endpoint(),
+			Capabilities: &nexuspb.Request_Capabilities{
+				TemporalFailureResponses: true,
+			},
 			Variant: &nexuspb.Request_CancelOperation{
 				CancelOperation: &nexuspb.CancelOperationRequest{
 					Service:        h.params.client.Service(),
@@ -3343,6 +3970,39 @@ func (h *testNexusOperationHandle) startedCallback(token string, e error) {
 	h.started = true
 	h.onStarted(token, e)
 	h.env.runningCount--
+
+	// Start the StartToCloseTimeout timer if configured and operation started successfully
+	if e == nil && h.params.options.StartToCloseTimeout > 0 {
+		h.env.NewTimer(
+			h.params.options.StartToCloseTimeout,
+			TimerOptions{},
+			nil,
+			func(result *commonpb.Payloads, err error) {
+				h.env.postCallback(func() {
+					// Only timeout if operation hasn't completed yet
+					if !h.done {
+						failureConverter := h.params.failureConverter
+						if failureConverter == nil {
+							failureConverter = h.env.failureConverter
+						}
+						timeoutErr := failureConverter.FailureToError(nexusOperationFailure(
+							h.params,
+							h.operationToken,
+							&failurepb.Failure{
+								Message: "operation timed out after starting",
+								FailureInfo: &failurepb.Failure_TimeoutFailureInfo{
+									TimeoutFailureInfo: &failurepb.TimeoutFailureInfo{
+										TimeoutType: enumspb.TIMEOUT_TYPE_START_TO_CLOSE,
+									},
+								},
+							},
+						))
+						h.completedCallback(nil, timeoutErr)
+					}
+				}, true)
+			},
+		)
+	}
 }
 
 func (h *testNexusOperationHandle) cancel() {
@@ -3365,7 +4025,12 @@ func (h *testNexusOperationHandle) cancel() {
 				h.completedCallback(nil, fmt.Errorf("operation cancelation handler failed: %w", err))
 			} else if failure != nil {
 				// No retries in the test env, fail the operation immediately.
-				h.completedCallback(nil, fmt.Errorf("operation cancelation handler failed: %v", failure.GetError().GetFailure().GetMessage()))
+				if failure.GetFailure() != nil {
+					h.completedCallback(nil, fmt.Errorf("operation cancelation handler failed: %v", failure.GetFailure().GetMessage()))
+				} else {
+					//lint:ignore SA1019 handle legacy operation error format for backward compatibility.
+					h.completedCallback(nil, fmt.Errorf("operation cancelation handler failed: %v", failure.GetError().GetFailure().GetMessage()))
+				}
 			}
 			h.env.runningCount--
 			if h.env.onNexusOperationCanceledListener != nil {
@@ -3445,13 +4110,19 @@ func (r *testNexusHandler) StartOperation(
 	}
 
 	// rebuild the input as *nexus.LazyValue
-	payload, err := r.env.dataConverter.ToPayload(inputPtr.Elem().Interface())
+	var dataConverter converter.DataConverter
+	if r.opHandle.params.client.Endpoint() == systemNexusEndpoint {
+		dataConverter = converter.NewCompositeDataConverter(converter.NewProtoPayloadConverter())
+	} else {
+		dataConverter = r.env.dataConverter
+	}
+	payload, err := dataConverter.ToPayload(inputPtr.Elem().Interface())
 	if err != nil {
 		// this should not be possible
 		panic("mock of ExecuteNexusOperation failed to convert input to payload")
 	}
 	serializer := &payloadSerializer{
-		converter: r.env.dataConverter,
+		converter: dataConverter,
 		payload:   payload,
 	}
 	input = nexus.NewLazyValue(
@@ -3469,7 +4140,7 @@ func (r *testNexusHandler) StartOperation(
 				operation,
 				newEncodedValue(
 					&commonpb.Payloads{Payloads: []*commonpb.Payload{payload}},
-					r.env.GetDataConverter(),
+					dataConverter,
 				),
 			)
 			close(waitCh)
