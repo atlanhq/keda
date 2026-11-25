@@ -75,6 +75,14 @@ func hasNestedDict(data arrow.ArrayData) bool {
 }
 
 // Writer is an Arrow stream writer.
+//
+// Writer is not safe for concurrent use. It writes to the underlying io.Writer
+// without any synchronization, so concurrent calls to Write or Close can
+// interleave output and corrupt the stream (for example by emitting the schema
+// header more than once). Because an arbitrary io.Writer cannot be assumed to
+// be safe for concurrent use, callers that produce records from multiple
+// goroutines must serialize writes themselves, for example by sending records
+// over a channel to a single goroutine that owns the Writer.
 type Writer struct {
 	w io.Writer
 
@@ -1035,11 +1043,16 @@ func (w *recordEncoder) Encode(p *Payload, rec arrow.RecordBatch) error {
 	if err := w.encode(p, rec); err != nil {
 		return err
 	}
-	return w.encodeMetadata(p, rec.NumRows())
+
+	var customMeta arrow.Metadata
+	if rm, ok := rec.(arrow.RecordBatchWithMetadata); ok {
+		customMeta = rm.Metadata()
+	}
+	return w.encodeMetadata(p, rec.NumRows(), customMeta)
 }
 
-func (w *recordEncoder) encodeMetadata(p *Payload, nrows int64) error {
-	p.meta = writeRecordMessage(w.mem, nrows, p.size, w.fields, w.meta, w.codec, w.variadicCounts)
+func (w *recordEncoder) encodeMetadata(p *Payload, nrows int64, customMetadata arrow.Metadata) error {
+	p.meta = writeRecordMessage(w.mem, nrows, p.size, w.fields, w.meta, w.codec, w.variadicCounts, customMetadata)
 	return nil
 }
 
