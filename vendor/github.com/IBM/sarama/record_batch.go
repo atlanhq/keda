@@ -30,6 +30,33 @@ func (e recordsArray) decode(pd packetDecoder) error {
 	return nil
 }
 
+// recordsChunk caps how many records are allocated at once while decoding.
+const recordsChunk = 1024
+
+// lazyRecords decodes up to n records, allocating them in chunks as they
+// decode so memory follows the records present rather than the claimed count.
+type lazyRecords struct {
+	n       int
+	records []*Record
+}
+
+func (l *lazyRecords) decode(pd packetDecoder) error {
+	l.records = make([]*Record, 0, min(l.n, recordsChunk))
+	var chunk []Record
+	for range l.n {
+		if len(chunk) == 0 {
+			chunk = make([]Record, min(l.n-len(l.records), recordsChunk))
+		}
+		r := &chunk[0]
+		chunk = chunk[1:]
+		if err := r.decode(pd); err != nil {
+			return err
+		}
+		l.records = append(l.records, r)
+	}
+	return nil
+}
+
 type RecordBatch struct {
 	FirstOffset           int64
 	PartitionLeaderEpoch  int32
@@ -50,6 +77,10 @@ type RecordBatch struct {
 
 	compressedRecords []byte
 	recordsLen        int // uncompressed records size
+	// partialSize is the total on-wire size of this batch (FirstOffset + length
+	// field + body) when PartialTrailingRecord is true and the partial state was
+	// caused by truncated bytes. Zero otherwise.
+	partialSize int32
 }
 
 func (b *RecordBatch) LastOffset() int64 {
@@ -157,12 +188,16 @@ func (b *RecordBatch) decode(pd packetDecoder) (err error) {
 		return err
 	}
 
-	numRecs, err := pd.getArrayLength()
+	// The record count describes the records after decompression, so it
+	// can't be checked against the remaining wire bytes here: a well
+	// compressed batch holds more records than it has bytes. It is checked
+	// against the decompressed records below instead.
+	numRecs, err := pd.getInt32()
 	if err != nil {
 		return err
 	}
-	if numRecs >= 0 {
-		b.Records = make([]*Record, numRecs)
+	if numRecs < -1 || numRecs > MaxResponseSize {
+		return errInvalidArrayLength
 	}
 
 	bufSize := int(batchLen) - recordBatchOverhead
@@ -170,6 +205,8 @@ func (b *RecordBatch) decode(pd packetDecoder) (err error) {
 	if err != nil {
 		if errors.Is(err, ErrInsufficientData) {
 			b.PartialTrailingRecord = true
+			// 8 (FirstOffset) + 4 (length field) + batchLen body
+			b.partialSize = batchLen + 12
 			b.Records = nil
 			return nil
 		}
@@ -186,13 +223,23 @@ func (b *RecordBatch) decode(pd packetDecoder) (err error) {
 	}
 
 	b.recordsLen = len(recBuffer)
-	err = decode(recBuffer, recordsArray(b.Records), nil)
+	if numRecs < 0 {
+		b.Records = nil
+		return decode(recBuffer, recordsArray(nil), nil)
+	}
+	records := &lazyRecords{n: int(numRecs)}
+	err = decode(recBuffer, records, nil)
 	if errors.Is(err, ErrInsufficientData) {
 		b.PartialTrailingRecord = true
 		b.Records = nil
 		return nil
 	}
-	return err
+	if err != nil {
+		b.Records = nil
+		return err
+	}
+	b.Records = records.records
+	return nil
 }
 
 func (b *RecordBatch) encodeRecords(pe packetEncoder) error {

@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"sync"
 
-	snappy "github.com/eapache/go-xerial-snappy"
 	"github.com/klauspost/compress/gzip"
+	snappy "github.com/klauspost/compress/snappy/xerial"
 	"github.com/pierrec/lz4/v4"
 )
 
 var (
 	lz4WriterPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			lz := lz4.NewWriter(nil)
 			if err := lz.Apply(lz4.BlockSizeOption(lz4.Block64Kb)); err != nil {
 				panic(err)
@@ -22,12 +22,12 @@ var (
 	}
 
 	gzipWriterPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return gzip.NewWriter(nil)
 		},
 	}
 	gzipWriterPoolForCompressionLevel1 = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			gz, err := gzip.NewWriterLevel(nil, 1)
 			if err != nil {
 				panic(err)
@@ -36,7 +36,7 @@ var (
 		},
 	}
 	gzipWriterPoolForCompressionLevel2 = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			gz, err := gzip.NewWriterLevel(nil, 2)
 			if err != nil {
 				panic(err)
@@ -45,7 +45,7 @@ var (
 		},
 	}
 	gzipWriterPoolForCompressionLevel3 = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			gz, err := gzip.NewWriterLevel(nil, 3)
 			if err != nil {
 				panic(err)
@@ -54,7 +54,7 @@ var (
 		},
 	}
 	gzipWriterPoolForCompressionLevel4 = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			gz, err := gzip.NewWriterLevel(nil, 4)
 			if err != nil {
 				panic(err)
@@ -63,7 +63,7 @@ var (
 		},
 	}
 	gzipWriterPoolForCompressionLevel5 = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			gz, err := gzip.NewWriterLevel(nil, 5)
 			if err != nil {
 				panic(err)
@@ -72,7 +72,7 @@ var (
 		},
 	}
 	gzipWriterPoolForCompressionLevel6 = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			gz, err := gzip.NewWriterLevel(nil, 6)
 			if err != nil {
 				panic(err)
@@ -81,7 +81,7 @@ var (
 		},
 	}
 	gzipWriterPoolForCompressionLevel7 = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			gz, err := gzip.NewWriterLevel(nil, 7)
 			if err != nil {
 				panic(err)
@@ -90,7 +90,7 @@ var (
 		},
 	}
 	gzipWriterPoolForCompressionLevel8 = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			gz, err := gzip.NewWriterLevel(nil, 8)
 			if err != nil {
 				panic(err)
@@ -99,7 +99,7 @@ var (
 		},
 	}
 	gzipWriterPoolForCompressionLevel9 = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			gz, err := gzip.NewWriterLevel(nil, 9)
 			if err != nil {
 				panic(err)
@@ -116,7 +116,7 @@ func compress(cc CompressionCodec, level int, data []byte) ([]byte, error) {
 	case CompressionGZIP:
 		return gzipCompress(level, data)
 	case CompressionSnappy:
-		return snappy.Encode(data), nil
+		return snappy.Encode(nil, data), nil
 	case CompressionLZ4:
 		return lz4Compress(data)
 	case CompressionZSTD:

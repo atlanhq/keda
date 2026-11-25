@@ -1,10 +1,67 @@
 package sarama
 
 import (
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
 	"sync"
 )
 
 type metadataRefresh func(topics []string) error
+
+type refreshError map[string]error
+
+// addError adds an error for a topic to the set. The wrap preserves
+// the underlying error for errors.Is/As.
+func (e refreshError) addError(topic string, err error) {
+	e[topic] = fmt.Errorf("%s: %w", topic, err)
+}
+
+func (e refreshError) Error() string {
+	err := errors.Join(e.errors()...)
+	if err == nil {
+		return "metadata refresh failed"
+	}
+	return err.Error()
+}
+
+func (e refreshError) Unwrap() []error {
+	return e.errors()
+}
+
+func (e refreshError) forTopics(topics []string) error {
+	if len(topics) == 0 {
+		return errors.Join(e.errors()...)
+	}
+	errs := make([]error, 0, len(topics))
+	for _, topic := range topics {
+		if err, ok := e[topic]; ok {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// errors returns the per-topic errors in deterministic (sorted by topic) order.
+func (e refreshError) errors() []error {
+	topics := slices.Sorted(maps.Keys(e))
+	errs := make([]error, len(topics))
+	for i, topic := range topics {
+		errs[i] = e[topic]
+	}
+	return errs
+}
+
+func errorForTopics(topics []string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if re, ok := errors.AsType[refreshError](err); ok {
+		return re.forTopics(topics)
+	}
+	return err
+}
 
 // currentRefresh makes sure sarama does not issue metadata requests
 // in parallel. If we need to refresh the metadata for a list of topics,
@@ -88,7 +145,10 @@ func (r *currentRefresh) hasTopics(topics []string) bool {
 		return r.allTopics
 	}
 	if r.allTopics {
-		return true
+		// a request for all topics names none: the broker does not create
+		// a missing topic for it, and the refresh does not retry a topic
+		// the broker does not know yet
+		return false
 	}
 	for _, topic := range topics {
 		if _, ok := r.topicsMap[topic]; !ok {
@@ -174,15 +234,17 @@ func newMetadataRefresh(f func(topics []string) error) *singleFlightMetadataRefr
 // the metadata. This function blocks until a refresh is issued, and its
 // result is received, for the list of topics the caller provided.
 // If a refresh was already ongoing for this list of topics, the function
-// waits on that refresh to complete, and returns its result.
+// waits on that refresh to complete, and returns its result. A refresh for
+// all topics does not count as one for a list of named topics.
 // If a refresh was already ongoing for a different list of topics, the function
 // accumulates the list of topics to refresh in the next refresh, and queues that refresh.
 // If no refresh is ongoing, it will start a new refresh, and return its result.
+// Per-topic errors from a shared refresh are filtered to the topics the caller requested.
 func (m *singleFlightMetadataRefresher) Refresh(topics []string) error {
 	for {
 		ch, queued := m.refreshOrQueue(topics)
 		if !queued {
-			return <-ch
+			return errorForTopics(topics, <-ch)
 		}
 		<-ch
 	}
@@ -195,7 +257,9 @@ func (m *singleFlightMetadataRefresher) Refresh(topics []string) error {
 // When calling refreshOrQueue, three things can happen:
 //  1. either no refresh is ongoing.
 //     In this case, a new refresh is started, and the channel that's returned will
-//     contain the result of that refresh, so it returns "false" as the second return value.
+//     contain the result of that refresh, so it returns "false" as the second return value,
+//     unless the new refresh is for all topics and the caller named topics: then the
+//     caller is queued as in case 3.
 //  2. a refresh is ongoing, and it contains the topics we need.
 //     In this case, the channel that's returned will contain the result of that refresh,
 //     so it returns "false" as the second return value.
@@ -216,10 +280,18 @@ func (m *singleFlightMetadataRefresher) refreshOrQueue(topics []string) (chan er
 		m.next.mu.Lock()
 		m.current.addTopicsFrom(m.next)
 		m.next.clear()
+		// a caller naming topics waits for its own refresh after the
+		// all-topics one, as hasTopics explains
+		queued := m.current.allTopics && len(topics) > 0
+		if queued {
+			m.next.addTopics(topics)
+		}
 		m.next.mu.Unlock()
-		m.current.addTopics(topics)
+		if !queued {
+			m.current.addTopics(topics)
+		}
 		ch := m.current.start()
-		return ch, false
+		return ch, queued
 	}
 	if m.current.hasTopics(topics) {
 		// A refresh is ongoing, and we were lucky: it is refreshing the topics we need already:

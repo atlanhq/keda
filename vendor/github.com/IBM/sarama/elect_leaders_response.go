@@ -86,9 +86,12 @@ func (r *ElectLeadersResponse) decode(pd packetDecoder, version int16) (err erro
 	if err != nil {
 		return err
 	}
+	if numTopics < 0 {
+		return errInvalidArrayLength
+	}
 
 	r.ReplicaElectionResults = make(map[string]map[int32]*PartitionResult, numTopics)
-	for i := 0; i < numTopics; i++ {
+	for range numTopics {
 		topic, err := pd.getString()
 		if err != nil {
 			return err
@@ -98,8 +101,11 @@ func (r *ElectLeadersResponse) decode(pd packetDecoder, version int16) (err erro
 		if err != nil {
 			return err
 		}
+		if numPartitions < 0 {
+			return errInvalidArrayLength
+		}
 		r.ReplicaElectionResults[topic] = make(map[int32]*PartitionResult, numPartitions)
-		for j := 0; j < numPartitions; j++ {
+		for range numPartitions {
 			partition, err := pd.getInt32()
 			if err != nil {
 				return err
@@ -128,7 +134,10 @@ func (r *ElectLeadersResponse) version() int16 {
 }
 
 func (r *ElectLeadersResponse) headerVersion() int16 {
-	return 1
+	if r.isFlexible() {
+		return 1
+	}
+	return 0
 }
 
 func (r *ElectLeadersResponse) isValidVersion() bool {
@@ -145,12 +154,10 @@ func (r *ElectLeadersResponse) isFlexibleVersion(version int16) bool {
 
 func (r *ElectLeadersResponse) requiredVersion() KafkaVersion {
 	switch r.Version {
-	case 2:
+	case 1, 2:
 		return V2_4_0_0
-	case 1:
-		return V0_11_0_0
 	case 0:
-		return V0_10_0_0
+		return V2_2_0_0
 	default:
 		return V2_4_0_0
 	}
