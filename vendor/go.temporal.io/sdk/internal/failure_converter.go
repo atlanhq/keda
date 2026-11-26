@@ -2,6 +2,8 @@ package internal
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
@@ -29,6 +31,7 @@ func GetDefaultFailureConverter() converter.FailureConverter {
 // Exposed as: [go.temporal.io/sdk/temporal.DefaultFailureConverterOptions]
 type DefaultFailureConverterOptions struct {
 	// Optional: Sets DataConverter to customize serialization/deserialization of fields.
+	// This converter is wrapped to support transfer type conversion.
 	//
 	// default: Default data converter
 	DataConverter converter.DataConverter
@@ -51,9 +54,7 @@ type DefaultFailureConverter struct {
 //
 // Exposed as: [go.temporal.io/sdk/temporal.NewDefaultFailureConverter]
 func NewDefaultFailureConverter(opt DefaultFailureConverterOptions) *DefaultFailureConverter {
-	if opt.DataConverter == nil {
-		opt.DataConverter = converter.GetDefaultDataConverter()
-	}
+	opt.DataConverter = MakeTransferAware(opt.DataConverter)
 	return &DefaultFailureConverter{
 		dataConverter:          opt.DataConverter,
 		encodeCommonAttributes: opt.EncodeCommonAttributes,
@@ -158,11 +159,20 @@ func (dfc *DefaultFailureConverter) ErrorToFailure(err error) *failurepb.Failure
 			Endpoint:         err.Endpoint,
 			Service:          err.Service,
 			Operation:        err.Operation,
-			OperationId:      token,
-			OperationToken:   token,
+			//lint:ignore SA1019 populate the legacy operation ID for backwards-compatible failure decoding
+			OperationId:    token,
+			OperationToken: token,
 		}
 		failure.FailureInfo = &failurepb.Failure_NexusOperationExecutionFailureInfo{NexusOperationExecutionFailureInfo: failureInfo}
 	case *nexus.HandlerError:
+		if err.OriginalFailure != nil {
+			f, err := nexusFailureToTemporalFailure(*err.OriginalFailure, true)
+			// If there was an error converting the original failure, we will ignore it
+			// since we don't want to fail the entire conversion just because we couldn't convert the original failure.
+			if err == nil {
+				return f
+			}
+		}
 		var retryBehavior enumspb.NexusHandlerErrorRetryBehavior
 		switch err.RetryBehavior {
 		case nexus.HandlerErrorRetryBehaviorRetryable:
@@ -175,6 +185,11 @@ func (dfc *DefaultFailureConverter) ErrorToFailure(err error) *failurepb.Failure
 			RetryBehavior: retryBehavior,
 		}
 		failure.FailureInfo = &failurepb.Failure_NexusHandlerFailureInfo{NexusHandlerFailureInfo: failureInfo}
+		failure.StackTrace = err.StackTrace
+		// Copy the message if present, if not we will keep the default message set above
+		if len(err.Message) > 0 {
+			failure.Message = err.Message
+		}
 	default: // All unknown errors are considered to be retryable ApplicationFailureInfo.
 		failureInfo := &failurepb.ApplicationFailureInfo{
 			Type:         getErrType(err),
@@ -224,7 +239,7 @@ func (dfc *DefaultFailureConverter) FailureToError(failure *failurepb.Failure) e
 				ApplicationErrorOptions{
 					NonRetryable:   applicationFailureInfo.GetNonRetryable(),
 					Cause:          dfc.FailureToError(failure.GetCause()),
-					Details:        []interface{}{details},
+					Details:        []any{details},
 					NextRetryDelay: nextRetryDelay,
 					Category:       ApplicationErrorCategory(applicationFailureInfo.GetCategory()),
 				},
@@ -232,7 +247,13 @@ func (dfc *DefaultFailureConverter) FailureToError(failure *failurepb.Failure) e
 		}
 	} else if failure.GetCanceledFailureInfo() != nil {
 		details := newEncodedValues(failure.GetCanceledFailureInfo().GetDetails(), dfc.dataConverter)
-		err = NewCanceledError(details)
+		err = NewCanceledErrorWithOptions(
+			CanceledErrorOptions{
+				Message: message,
+				Details: []any{details},
+				Cause:   dfc.FailureToError(failure.GetCause()),
+			},
+		)
 	} else if failure.GetTimeoutFailureInfo() != nil {
 		timeoutFailureInfo := failure.GetTimeoutFailureInfo()
 		lastHeartbeatDetails := newEncodedValues(timeoutFailureInfo.GetLastHeartbeatDetails(), dfc.dataConverter)
@@ -246,7 +267,9 @@ func (dfc *DefaultFailureConverter) FailureToError(failure *failurepb.Failure) e
 	} else if failure.GetServerFailureInfo() != nil {
 		err = NewServerError(message, failure.GetServerFailureInfo().GetNonRetryable(), dfc.FailureToError(failure.GetCause()))
 	} else if failure.GetResetWorkflowFailureInfo() != nil {
-		err = NewApplicationError(message, "", true, dfc.FailureToError(failure.GetCause()), failure.GetResetWorkflowFailureInfo().GetLastHeartbeatDetails())
+		resetWorkflowFailureInfo := failure.GetResetWorkflowFailureInfo()
+		lastHeartbeatDetails := newEncodedValues(resetWorkflowFailureInfo.GetLastHeartbeatDetails(), dfc.dataConverter)
+		err = NewApplicationError(message, "", true, dfc.FailureToError(failure.GetCause()), lastHeartbeatDetails)
 	} else if failure.GetActivityFailureInfo() != nil {
 		activityTaskInfoFailure := failure.GetActivityFailureInfo()
 		err = NewActivityError(
@@ -294,10 +317,24 @@ func (dfc *DefaultFailureConverter) FailureToError(failure *failurepb.Failure) e
 		case enumspb.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_NON_RETRYABLE:
 			retryBehavior = nexus.HandlerErrorRetryBehaviorNonRetryable
 		}
+		// Check if the message is the default message or if it was set by the user. If it's the default message,
+		// we will replace it with an empty string to avoid confusion.
+		cause := dfc.FailureToError(failure.GetCause())
+		typ := nexus.HandlerErrorType(info.Type)
+		if strings.HasPrefix(message, fmt.Sprintf("handler error (%s)", typ)) {
+			message = ""
+		}
+		originalFailure, terr := temporalFailureToNexusFailure(failure)
+		if terr != nil {
+			originalFailure = nil
+		}
 		err = &nexus.HandlerError{
-			Type:          nexus.HandlerErrorType(info.Type),
-			Cause:         dfc.FailureToError(failure.GetCause()),
-			RetryBehavior: retryBehavior,
+			Type:            typ,
+			Message:         message,
+			StackTrace:      stackTrace,
+			Cause:           cause,
+			RetryBehavior:   retryBehavior,
+			OriginalFailure: originalFailure,
 		}
 	}
 

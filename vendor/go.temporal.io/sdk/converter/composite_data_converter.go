@@ -33,23 +33,23 @@ func NewCompositeDataConverter(payloadConverters ...PayloadConverter) DataConver
 }
 
 // ToPayloads converts a list of values.
-func (dc *CompositeDataConverter) ToPayloads(values ...interface{}) (*commonpb.Payloads, error) {
+func (dc *CompositeDataConverter) ToPayloads(values ...any) (*commonpb.Payloads, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
 
-	result := &commonpb.Payloads{}
+	result := &commonpb.Payloads{Payloads: make([]*commonpb.Payload, len(values))}
 	for i, value := range values {
 		rawValue, ok := value.(RawValue)
 		if ok {
-			result.Payloads = append(result.Payloads, rawValue.Payload())
+			result.Payloads[i] = rawValue.Payload()
 		} else {
 			payload, err := dc.ToPayload(value)
 			if err != nil {
 				return nil, fmt.Errorf("values[%d]: %w", i, err)
 			}
 
-			result.Payloads = append(result.Payloads, payload)
+			result.Payloads[i] = payload
 		}
 	}
 
@@ -57,7 +57,7 @@ func (dc *CompositeDataConverter) ToPayloads(values ...interface{}) (*commonpb.P
 }
 
 // FromPayloads converts to a list of values of different types.
-func (dc *CompositeDataConverter) FromPayloads(payloads *commonpb.Payloads, valuePtrs ...interface{}) error {
+func (dc *CompositeDataConverter) FromPayloads(payloads *commonpb.Payloads, valuePtrs ...any) error {
 	if payloads == nil {
 		return nil
 	}
@@ -81,7 +81,7 @@ func (dc *CompositeDataConverter) FromPayloads(payloads *commonpb.Payloads, valu
 }
 
 // ToPayload converts single value to payload.
-func (dc *CompositeDataConverter) ToPayload(value interface{}) (*commonpb.Payload, error) {
+func (dc *CompositeDataConverter) ToPayload(value any) (*commonpb.Payload, error) {
 	rawValue, ok := value.(RawValue)
 	if ok {
 		return rawValue.Payload(), nil
@@ -102,7 +102,7 @@ func (dc *CompositeDataConverter) ToPayload(value interface{}) (*commonpb.Payloa
 }
 
 // FromPayload converts single value from payload.
-func (dc *CompositeDataConverter) FromPayload(payload *commonpb.Payload, valuePtr interface{}) error {
+func (dc *CompositeDataConverter) FromPayload(payload *commonpb.Payload, valuePtr any) error {
 	if payload == nil {
 		return nil
 	}

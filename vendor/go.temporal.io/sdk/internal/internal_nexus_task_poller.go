@@ -2,8 +2,10 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/nexus-rpc/sdk-go/nexus"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
@@ -14,13 +16,17 @@ import (
 
 type nexusTaskPoller struct {
 	basePoller
-	namespace       string
-	taskQueueName   string
-	identity        string
-	service         workflowservice.WorkflowServiceClient
-	taskHandler     *nexusTaskHandler
-	logger          log.Logger
-	numPollerMetric *numPollerMetric
+	namespace              string
+	taskQueueName          string
+	identity               string
+	service                workflowservice.WorkflowServiceClient
+	taskHandler            *nexusTaskHandler
+	logger                 log.Logger
+	numPollerMetric        *numPollerMetric
+	inboundPayloadVisitor  PayloadVisitor
+	outboundPayloadVisitor PayloadVisitor
+	backgroundContext      context.Context
+	pollerGroups           *pollerGroupManager
 }
 
 type nexusTask struct {
@@ -33,15 +39,25 @@ func newNexusTaskPoller(
 	taskHandler *nexusTaskHandler,
 	service workflowservice.WorkflowServiceClient,
 	params workerExecutionParameters,
+	pollerGroups *pollerGroupManager,
 ) *nexusTaskPoller {
+	backgroundContext := params.BackgroundContext
+	if backgroundContext == nil {
+		backgroundContext = context.Background()
+	}
 	return &nexusTaskPoller{
 		basePoller: basePoller{
-			metricsHandler:          params.MetricsHandler,
-			stopC:                   params.WorkerStopChannel,
-			workerBuildID:           params.getBuildID(),
-			useBuildIDVersioning:    params.UseBuildIDForVersioning,
-			workerDeploymentVersion: params.DeploymentOptions.Version,
-			capabilities:            params.capabilities,
+			metricsHandler:               params.MetricsHandler,
+			rpcTimeout:                   params.RPCTimeout,
+			stopC:                        params.WorkerStopChannel,
+			workerBuildID:                params.getBuildID(),
+			useBuildIDVersioning:         params.UseBuildIDForVersioning,
+			workerDeploymentVersion:      params.DeploymentOptions.Version,
+			capabilities:                 params.capabilities,
+			pollTimeTracker:              params.pollTimeTracker,
+			workerInstanceKey:            params.workerInstanceKey,
+			pollerGroupSnapshotStore:     params.pollerGroupSnapshotStore,
+			workerPollCompleteOnShutdown: params.workerPollCompleteOnShutdown,
 		},
 		taskHandler:     taskHandler,
 		service:         service,
@@ -50,6 +66,11 @@ func newNexusTaskPoller(
 		identity:        params.Identity,
 		logger:          params.Logger,
 		numPollerMetric: newNumPollerMetric(params.MetricsHandler, metrics.PollerTypeNexusTask),
+
+		inboundPayloadVisitor:  params.inboundPayloadVisitor,
+		outboundPayloadVisitor: params.outboundPayloadVisitor,
+		backgroundContext:      backgroundContext,
+		pollerGroups:           pollerGroups,
 	}
 }
 
@@ -61,7 +82,14 @@ func (ntp *nexusTaskPoller) pollNexusTaskQueue(ctx context.Context, request *wor
 	return ntp.service.PollNexusTaskQueue(ctx, request)
 }
 
-func (ntp *nexusTaskPoller) poll(ctx context.Context) (taskForWorker, error) {
+func (ntp *nexusTaskPoller) poll(
+	ctx context.Context,
+	lease pollerGroupLease,
+) (taskForWorker, error) {
+	if lease.owner != nil && lease.owner != ntp.pollerGroups {
+		return nil, errors.New("nexus poller-group lease belongs to a different manager")
+	}
+
 	traceLog(func() {
 		ntp.logger.Debug("nexusTaskPoller::Poll")
 	})
@@ -69,6 +97,7 @@ func (ntp *nexusTaskPoller) poll(ctx context.Context) (taskForWorker, error) {
 		Namespace: ntp.namespace,
 		TaskQueue: &taskqueuepb.TaskQueue{Name: ntp.taskQueueName, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
 		Identity:  ntp.identity,
+		//lint:ignore SA1019 retain legacy Build ID versioning metadata for older servers
 		WorkerVersionCapabilities: &commonpb.WorkerVersionCapabilities{
 			BuildId:              ntp.workerBuildID,
 			UseVersioning:        ntp.useBuildIDVersioning,
@@ -78,11 +107,18 @@ func (ntp *nexusTaskPoller) poll(ctx context.Context) (taskForWorker, error) {
 			ntp.useBuildIDVersioning,
 			ntp.workerDeploymentVersion,
 		),
+		WorkerInstanceKey: ntp.workerInstanceKey,
+		PollerPoolInfo:    ntp.getPollerPoolInfo(),
 	}
+
+	request.PollerGroupId = lease.groupIDOrEmpty()
 
 	response, err := ntp.pollNexusTaskQueue(ctx, request)
 	if err != nil {
 		return nil, err
+	}
+	if response != nil && response.GetPollerGroupsInfo() != nil {
+		ntp.updatePollerGroups(response.GetPollerGroupsInfo())
 	}
 	if response == nil || len(response.TaskToken) == 0 {
 		// No operation info is available on empty poll. Emit using base scope.
@@ -90,21 +126,21 @@ func (ntp *nexusTaskPoller) poll(ctx context.Context) (taskForWorker, error) {
 		return nil, nil
 	}
 
+	ntp.pollTimeTracker.recordPollSuccess(metrics.PollerTypeNexusTask)
+
 	return &nexusTask{task: response}, nil
 }
 
-func (ntp *nexusTaskPoller) Cleanup() error {
-	return nil
-}
-
 // PollTask polls a new task
-func (ntp *nexusTaskPoller) PollTask() (taskForWorker, error) {
-	return ntp.doPoll(ntp.poll)
+func (ntp *nexusTaskPoller) PollTask(lease pollerGroupLease) (taskForWorker, error) {
+	return ntp.doPoll(func(ctx context.Context) (taskForWorker, error) {
+		return ntp.poll(ctx, lease)
+	})
 }
 
 // ProcessTask processes a new task
-func (ntp *nexusTaskPoller) ProcessTask(task interface{}) error {
-	if ntp.stopping() {
+func (ntp *nexusTaskPoller) ProcessTask(task any) error {
+	if !ntp.shouldDrainOnShutdown() && ntp.stopping() {
 		return errStop
 	}
 
@@ -128,9 +164,27 @@ func (ntp *nexusTaskPoller) ProcessTask(task interface{}) error {
 	nctx, handlerErr := ntp.taskHandler.newNexusOperationContext(response)
 	if handlerErr != nil {
 		// context wasn't propagated to us, use a background context.
-		_, err := ntp.taskHandler.client.WorkflowService().RespondNexusTaskFailed(
-			context.Background(), ntp.taskHandler.fillInFailure(response.TaskToken, handlerErr))
+		failedRequest, err := ntp.taskHandler.fillInFailure(
+			response.TaskToken,
+			handlerErr,
+			getEffectiveTemporalFailureResponses(response.GetRequest().GetCapabilities().GetTemporalFailureResponses()),
+			ntp.taskHandler.failureConverter,
+			response.GetPollerGroupId(),
+		)
+		if err != nil {
+			return err
+		}
+		_, err = ntp.taskHandler.client.WorkflowService().RespondNexusTaskFailed(
+			context.Background(), failedRequest)
 		return err
+	}
+
+	// Retrieve any operation input payloads that were offloaded to external storage
+	// before the handler consumes them. A Nexus task carries at most one input and
+	// one result payload, so payload visits are unconcurrent (the configurable
+	// visit concurrency is scoped to workflow tasks).
+	if visitErr := visitProtoPayloads(ntp.backgroundContext, ntp.inboundPayloadVisitor, response, 0); visitErr != nil {
+		return ntp.reportExternalStorageFailure(response, "retrieve Nexus operation input from external storage", visitErr)
 	}
 
 	// Process the nexus task.
@@ -156,21 +210,55 @@ func (ntp *nexusTaskPoller) ProcessTask(task interface{}) error {
 			Counter(metrics.NexusTaskExecutionFailedCounter).
 			Inc(1)
 	} else if failure != nil {
-		nctx.metricsHandler.
-			WithTags(metrics.NexusTaskFailureTags("handler_error_" + failure.GetError().GetErrorType())).
-			Counter(metrics.NexusTaskExecutionFailedCounter).
-			Inc(1)
+		//lint:ignore SA1019 handle legacy operation error format for backward compatibility.
+		taskErr := failure.GetError()
+		if taskErr != nil {
+			nctx.metricsHandler.
+				WithTags(metrics.NexusTaskFailureTags("handler_error_" + taskErr.GetErrorType())).
+				Counter(metrics.NexusTaskExecutionFailedCounter).
+				Inc(1)
+		} else if failure.GetFailure() != nil {
+			// Failure must contain a NexusHandlerFailureInfo
+			nctx.metricsHandler.
+				WithTags(metrics.NexusTaskFailureTags("handler_error_" + failure.GetFailure().GetNexusHandlerFailureInfo().GetType())).
+				Counter(metrics.NexusTaskExecutionFailedCounter).
+				Inc(1)
+		}
+		//lint:ignore SA1019 handle legacy operation error format for backward compatibility.
 	} else if e := res.Response.GetStartOperation().GetOperationError(); e != nil {
 		nctx.metricsHandler.
 			WithTags(metrics.NexusTaskFailureTags("operation_" + e.GetOperationState())).
 			Counter(metrics.NexusTaskExecutionFailedCounter).
 			Inc(1)
+	} else if f := res.Response.GetStartOperation().GetFailure(); f != nil {
+		if sf := f.GetApplicationFailureInfo(); sf != nil {
+			nctx.metricsHandler.
+				WithTags(metrics.NexusTaskFailureTags("operation_" + string(nexus.OperationStateFailed))).
+				Counter(metrics.NexusTaskExecutionFailedCounter).
+				Inc(1)
+		} else if cf := f.GetCanceledFailureInfo(); cf != nil {
+			nctx.metricsHandler.
+				WithTags(metrics.NexusTaskFailureTags("operation_" + string(nexus.OperationStateCanceled))).
+				Counter(metrics.NexusTaskExecutionFailedCounter).
+				Inc(1)
+		}
 	}
 
 	// Let the poller machinery drop the task, nothing to report back.
 	// This is only expected due to context deadline errors.
 	if err != nil {
 		return err
+	}
+
+	// Offload any large result or failure payloads to external storage before reporting.
+	if res != nil {
+		if visitErr := visitProtoPayloads(ntp.backgroundContext, ntp.outboundPayloadVisitor, res, 0); visitErr != nil {
+			return ntp.reportExternalStorageFailure(response, "store Nexus operation result in external storage", visitErr)
+		}
+	} else if failure != nil {
+		if visitErr := visitProtoPayloads(ntp.backgroundContext, ntp.outboundPayloadVisitor, failure, 0); visitErr != nil {
+			return ntp.reportExternalStorageFailure(response, "store Nexus operation failure in external storage", visitErr)
+		}
 	}
 
 	if err := ntp.reportCompletion(res, failure); err != nil {
@@ -195,7 +283,7 @@ func (ntp *nexusTaskPoller) reportCompletion(
 	// No workflow or activity tags to report.
 	// Task queue expected to be empty for Respond*Task... requests.
 	rpcMetricsHandler := ntp.metricsHandler.WithTags(metrics.RPCTags(metrics.NoneTagValue, metrics.NoneTagValue, metrics.NoneTagValue))
-	ctx, cancel := newGRPCContext(ctx, grpcMetricsHandler(rpcMetricsHandler),
+	ctx, cancel := newGRPCContext(ctx, ntp.rpcTimeout, grpcMetricsHandler(rpcMetricsHandler),
 		defaultGrpcRetryParameters(ctx))
 	defer cancel()
 
@@ -205,4 +293,25 @@ func (ntp *nexusTaskPoller) reportCompletion(
 	}
 	_, err := ntp.taskHandler.client.WorkflowService().RespondNexusTaskCompleted(ctx, completion)
 	return err
+}
+
+// reportExternalStorageFailure fails the task with a retryable internal error when
+// external storage retrieval or offload fails, so the server redelivers the task.
+func (ntp *nexusTaskPoller) reportExternalStorageFailure(
+	response *workflowservice.PollNexusTaskQueueResponse,
+	action string,
+	cause error,
+) error {
+	handlerErr := nexus.NewHandlerErrorf(nexus.HandlerErrorTypeInternal, "failed to %s: %v", action, cause)
+	failedRequest, err := ntp.taskHandler.fillInFailure(
+		response.TaskToken,
+		handlerErr,
+		getEffectiveTemporalFailureResponses(response.GetRequest().GetCapabilities().GetTemporalFailureResponses()),
+		ntp.taskHandler.failureConverter,
+		response.GetPollerGroupId(),
+	)
+	if err != nil {
+		return err
+	}
+	return ntp.reportCompletion(nil, failedRequest)
 }

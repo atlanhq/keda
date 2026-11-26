@@ -10,6 +10,8 @@ import (
 
 // A Reader is a container for a [Header] and an [io.Reader].
 // It is used to stream inputs and outputs in the various client and server APIs.
+//
+// NOTE: Experimental
 type Reader struct {
 	// ReaderCloser contains request or response data. May be nil for empty data.
 	io.ReadCloser
@@ -21,6 +23,8 @@ type Reader struct {
 
 // A Content is a container for a [Header] and a byte slice.
 // It is used by the SDK's [Serializer] interface implementations.
+//
+// NOTE: Experimental
 type Content struct {
 	// Header that should include information on how to deserialize this content.
 	// Headers constructed by the framework always have lower case keys.
@@ -37,12 +41,16 @@ type Content struct {
 // called.
 //
 // ⚠️ When a LazyValue is passed to a server handler, it must not be used after the returning from the handler method.
+//
+// NOTE: Experimental
 type LazyValue struct {
 	serializer Serializer
 	Reader     *Reader
 }
 
 // Create a new [LazyValue] from a given serializer and reader.
+//
+// NOTE: Experimental
 func NewLazyValue(serializer Serializer, reader *Reader) *LazyValue {
 	return &LazyValue{
 		serializer: serializer,
@@ -57,8 +65,11 @@ func NewLazyValue(serializer Serializer, reader *Reader) *LazyValue {
 //	err := lazyValue.Consume(&v)
 func (l *LazyValue) Consume(v any) (err error) {
 	defer func() {
-		closeErr := l.Reader.Close()
-		err = errors.Join(err, closeErr)
+		// Only join on failure to close, joining a nil error still wraps err and would hide its concrete type from
+		// callers that type assert on the serializer's error.
+		if closeErr := l.Reader.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
 	}()
 	data, err := io.ReadAll(l.Reader)
 	if err != nil {
@@ -88,24 +99,12 @@ type Serializer interface {
 	Deserialize(*Content, any) error
 }
 
-// FailureConverter is used by the framework to transform [error] instances to and from [Failure] instances.
-// To customize conversion logic, implement this interface and provide your implementation to framework methods such as
-// [NewClient] and [NewHTTPHandler].
-// By default the SDK translates only error messages, losing type information and struct fields.
-type FailureConverter interface {
-	// ErrorToFailure converts an [error] to a [Failure].
-	// Implementors should take a best-effort approach and never fail this method.
-	// Note that the provided error may be nil.
-	ErrorToFailure(error) Failure
-	// ErrorToFailure converts a [Failure] to an [error].
-	// Implementors should take a best-effort approach and never fail this method.
-	FailureToError(Failure) error
-}
-
 var anyType = reflect.TypeOf((*any)(nil)).Elem()
 
 // ErrSerializerIncompatible is a sentinel error emitted by [Serializer] implementations to signal that a serializer is
 // incompatible with a given value or [Content].
+//
+// NOTE: Experimental
 var ErrSerializerIncompatible = errors.New("incompatible serializer")
 
 // CompositeSerializer is a [Serializer] that composes multiple serializers together.
@@ -262,34 +261,4 @@ var defaultSerializer Serializer = CompositeSerializer([]Serializer{NilSerialize
 // NOTE: Experimental
 func DefaultSerializer() Serializer {
 	return defaultSerializer
-}
-
-type failureErrorFailureConverter struct{}
-
-// ErrorToFailure implements FailureConverter.
-func (e failureErrorFailureConverter) ErrorToFailure(err error) Failure {
-	if err == nil {
-		return Failure{}
-	}
-	if fe, ok := err.(*FailureError); ok {
-		return fe.Failure
-	}
-	return Failure{
-		Message: err.Error(),
-	}
-}
-
-// FailureToError implements FailureConverter.
-func (e failureErrorFailureConverter) FailureToError(f Failure) error {
-	return &FailureError{f}
-}
-
-var defaultFailureConverter FailureConverter = failureErrorFailureConverter{}
-
-// DefaultFailureConverter returns the SDK's default [FailureConverter] implementation. Arbitrary errors are converted
-// to a simple [Failure] object with just the Message popluated and [FailureError] instances to their underlying
-// [Failure] instance. [Failure] instances are converted to [FailureError] to allow access to the full failure metadata
-// and details if available.
-func DefaultFailureConverter() FailureConverter {
-	return defaultFailureConverter
 }

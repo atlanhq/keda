@@ -93,6 +93,8 @@ func FromStatus(st *status.Status) error {
 		switch errDetails.(type) {
 		case *failure.MultiOperationExecutionAborted:
 			return newMultiOperationAborted(st)
+		case *errordetails.WorkflowTaskCompletionBufferLostFailure:
+			return newWorkflowTaskCompletionBufferLost(st)
 		default:
 			return newAborted(st)
 		}
@@ -136,6 +138,8 @@ func FromStatus(st *status.Status) error {
 			return newActivityExecutionAlreadyStarted(st, errDetails)
 		case *errordetails.CancellationAlreadyRequestedFailure:
 			return newCancellationAlreadyRequested(st)
+		case *errordetails.NexusOperationExecutionAlreadyStartedFailure:
+			return newNexusOperationExecutionAlreadyStarted(st, errDetails)
 		default:
 			return newAlreadyExists(st)
 		}

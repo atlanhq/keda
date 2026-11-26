@@ -24,8 +24,8 @@ func NewGRPCInterceptor(defaultHandler Handler, suffix string, disableRequestFai
 	return func(
 		ctx context.Context,
 		method string,
-		req interface{},
-		reply interface{},
+		req any,
+		reply any,
 		cc *grpc.ClientConn,
 		invoker grpc.UnaryInvoker,
 		opts ...grpc.CallOption,
@@ -33,6 +33,9 @@ func NewGRPCInterceptor(defaultHandler Handler, suffix string, disableRequestFai
 		handler, _ := ctx.Value(HandlerContextKey{}).(Handler)
 		if handler == nil {
 			handler = defaultHandler
+		}
+		if _, ok := handler.(nopHandler); ok {
+			return invoker(ctx, method, req, reply, cc, opts...)
 		}
 		longPoll, ok := ctx.Value(LongPollContextKey{}).(bool)
 		if !ok {
