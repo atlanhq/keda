@@ -12,6 +12,14 @@ func (r *ElectLeadersRequest) setVersion(v int16) {
 }
 
 func (r *ElectLeadersRequest) encode(pe packetEncoder) error {
+	// Version 0 has no election type and always elects the preferred leader.
+	// Refuse other types rather than silently running a preferred election:
+	// this catches both a too-low Config.Version and a runtime downgrade by
+	// restrictApiVersion, which runs before encode.
+	if r.Version == 0 && r.Type != PreferredElection {
+		return PacketEncodingError{"only PreferredElection is supported by version 0. use version 1 or later"}
+	}
+
 	if r.Version > 0 {
 		pe.putInt8(int8(r.Type))
 	}
@@ -54,24 +62,14 @@ func (r *ElectLeadersRequest) decode(pd packetDecoder, version int16) (err error
 	}
 	if topicCount > 0 {
 		r.TopicPartitions = make(map[string][]int32)
-		for i := 0; i < topicCount; i++ {
+		for range topicCount {
 			topic, err := pd.getString()
 			if err != nil {
 				return err
 			}
-			partitionCount, err := pd.getArrayLength()
-			if err != nil {
+			if r.TopicPartitions[topic], err = pd.getInt32Array(); err != nil {
 				return err
 			}
-			partitions := make([]int32, partitionCount)
-			for j := 0; j < partitionCount; j++ {
-				partition, err := pd.getInt32()
-				if err != nil {
-					return err
-				}
-				partitions[j] = partition
-			}
-			r.TopicPartitions[topic] = partitions
 			if _, err := pd.getEmptyTaggedFieldArray(); err != nil {
 				return err
 			}
@@ -96,7 +94,10 @@ func (r *ElectLeadersRequest) version() int16 {
 }
 
 func (r *ElectLeadersRequest) headerVersion() int16 {
-	return 2
+	if r.isFlexible() {
+		return 2
+	}
+	return 1
 }
 
 func (r *ElectLeadersRequest) isValidVersion() bool {
@@ -113,12 +114,10 @@ func (r *ElectLeadersRequest) isFlexibleVersion(version int16) bool {
 
 func (r *ElectLeadersRequest) requiredVersion() KafkaVersion {
 	switch r.Version {
-	case 2:
+	case 1, 2:
 		return V2_4_0_0
-	case 1:
-		return V0_11_0_0
 	case 0:
-		return V0_10_0_0
+		return V2_2_0_0
 	default:
 		return V2_4_0_0
 	}
