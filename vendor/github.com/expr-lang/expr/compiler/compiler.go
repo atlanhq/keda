@@ -254,6 +254,8 @@ func (c *compiler) compile(node ast.Node) {
 		c.BoolNode(n)
 	case *ast.StringNode:
 		c.StringNode(n)
+	case *ast.BytesNode:
+		c.BytesNode(n)
 	case *ast.ConstantNode:
 		c.ConstantNode(n)
 	case *ast.UnaryNode:
@@ -300,7 +302,7 @@ func (c *compiler) IdentifierNode(node *ast.IdentifierNode) {
 		c.emit(OpLoadVar, index)
 		return
 	}
-	if node.Value == "$env" {
+	if node.Value == "$env" && (c.config == nil || !c.config.Disabled["$env"]) {
 		c.emit(OpLoadEnv)
 		return
 	}
@@ -407,6 +409,10 @@ func (c *compiler) BoolNode(node *ast.BoolNode) {
 }
 
 func (c *compiler) StringNode(node *ast.StringNode) {
+	c.emitPush(node.Value)
+}
+
+func (c *compiler) BytesNode(node *ast.BytesNode) {
 	c.emitPush(node.Value)
 }
 
@@ -754,6 +760,12 @@ func (c *compiler) MemberNode(node *ast.MemberNode) {
 
 func (c *compiler) SliceNode(node *ast.SliceNode) {
 	c.compile(node.Node)
+	// If the slice is optional, we need to jump over the slice operation.
+	// If no ChainNode (none c.chains) is used, do not compile the optional slice.
+	if node.Optional && len(c.chains) > 0 {
+		ph := c.emit(OpJumpIfNil, placeholder)
+		c.chains[len(c.chains)-1] = append(c.chains[len(c.chains)-1], ph)
+	}
 	if node.To != nil {
 		c.compile(node.To)
 		c.derefInNeeded(node.To)
@@ -931,6 +943,7 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
 		c.compile(node.Arguments[0])
 		c.derefInNeeded(node.Arguments[0])
 		c.emit(OpBegin)
+		var loopBreak int
 		c.emitLoop(func() {
 			if len(node.Arguments) == 2 {
 				c.compile(node.Arguments[1])
@@ -939,9 +952,25 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
 			}
 			c.emitCond(func() {
 				c.emit(OpIncrementCount)
+				// Early termination if threshold is set
+				if node.Threshold != nil {
+					c.emit(OpGetCount)
+					c.emit(OpInt, *node.Threshold)
+					c.emit(OpMoreOrEqual)
+					loopBreak = c.emit(OpJumpIfTrue, placeholder)
+					c.emit(OpPop)
+				}
 			})
 		})
 		c.emit(OpGetCount)
+		if node.Threshold != nil {
+			end := c.emit(OpJump, placeholder)
+			c.patchJump(loopBreak)
+			// Early exit path: pop the bool comparison result, push count
+			c.emit(OpPop)
+			c.emit(OpGetCount)
+			c.patchJump(end)
+		}
 		c.emit(OpEnd)
 		return
 
@@ -1076,10 +1105,15 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
 	case "sortBy":
 		c.compile(node.Arguments[0])
 		c.derefInNeeded(node.Arguments[0])
-		c.emit(OpBegin)
 		if len(node.Arguments) == 3 {
+			// Evaluate the order in the caller's scope, after the collection.
+			collection := c.addVariable("")
+			c.emit(OpStore, collection)
 			c.compile(node.Arguments[2])
+			c.emit(OpLoadVar, collection)
+			c.emit(OpBegin)
 		} else {
+			c.emit(OpBegin)
 			c.emit(OpPush, c.addConstant("asc"))
 		}
 		c.emit(OpCreate, 2)
@@ -1095,15 +1129,29 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
 	case "reduce":
 		c.compile(node.Arguments[0])
 		c.derefInNeeded(node.Arguments[0])
-		c.emit(OpBegin)
 		if len(node.Arguments) == 3 {
+			// Evaluate the initial value in the caller's scope, after the collection.
+			collection := c.addVariable("")
+			c.emit(OpStore, collection)
 			c.compile(node.Arguments[2])
 			c.derefInNeeded(node.Arguments[2])
+			c.emit(OpLoadVar, collection)
+			c.emit(OpBegin)
 			c.emit(OpSetAcc)
 		} else {
+			c.emit(OpBegin)
+			// When no initial value is provided, we use the first element as the
+			// accumulator. But first we must check if the array is empty to avoid
+			// an index out of range panic.
+			empty := c.emit(OpJumpIfEnd, placeholder)
 			c.emit(OpPointer)
 			c.emit(OpIncrementIndex)
 			c.emit(OpSetAcc)
+			jumpPastError := c.emit(OpJump, placeholder)
+			c.patchJump(empty)
+			c.emit(OpPush, c.addConstant(fmt.Errorf("reduce of empty array with no initial value")))
+			c.emit(OpThrow)
+			c.patchJump(jumpPastError)
 		}
 		c.emitLoop(func() {
 			c.compile(node.Arguments[1])
@@ -1135,10 +1183,14 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
 		if f.Fast != nil {
 			c.emit(OpCallBuiltin1, id)
 		} else if f.Safe != nil {
-			id := c.addConstant(f.Safe)
-			c.emit(OpPush, id)
-			c.debugInfo[fmt.Sprintf("const_%d", id)] = node.Name
-			c.emit(OpCallSafe, len(node.Arguments))
+			if arg, ok := EncodeBuiltinSafe(id, len(node.Arguments)); ok {
+				c.emit(OpCallBuiltinSafe, arg)
+			} else {
+				id := c.addConstant(f.Safe)
+				c.emit(OpPush, id)
+				c.debugInfo[fmt.Sprintf("const_%d", id)] = node.Name
+				c.emit(OpCallSafe, len(node.Arguments))
+			}
 		} else if f.Func != nil {
 			c.emitFunction(f, len(node.Arguments))
 		}
@@ -1181,12 +1233,14 @@ func (c *compiler) emitLoopBackwards(body func()) {
 	c.emit(OpInt, 0)
 	c.emit(OpMoreOrEqual)
 	end := c.emit(OpJumpIfFalse, placeholder)
+	c.emit(OpPop)
 
 	body()
 
 	c.emit(OpDecrementIndex)
 	c.emit(OpJumpBackward, c.calcBackwardJump(begin))
 	c.patchJump(end)
+	c.emit(OpPop)
 }
 
 func (c *compiler) PredicateNode(node *ast.PredicateNode) {

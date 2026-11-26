@@ -13,6 +13,7 @@ import (
 	"github.com/expr-lang/expr/builtin"
 	"github.com/expr-lang/expr/conf"
 	"github.com/expr-lang/expr/file"
+	"github.com/expr-lang/expr/internal/budget"
 	"github.com/expr-lang/expr/internal/deref"
 	"github.com/expr-lang/expr/vm/runtime"
 )
@@ -46,6 +47,9 @@ type VM struct {
 	debug        bool
 	step         chan struct{}
 	curr         chan int
+	scopePool    []Scope // Pre-allocated pool of Scope values; grows as needed but never shrinks
+	scopePoolIdx int     // Current index into scopePool for allocation
+	currScope    *Scope  // Cached pointer to the current scope (optimization)
 }
 
 func (vm *VM) Run(program *Program, env any) (_ any, err error) {
@@ -76,6 +80,8 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 		clearSlice(vm.Scopes)
 		vm.Scopes = vm.Scopes[0:0]
 	}
+	vm.scopePoolIdx = 0 // Reset pool index for reuse
+	vm.currScope = nil
 	if len(vm.Variables) < program.variables {
 		vm.Variables = make([]any, program.variables)
 	}
@@ -221,8 +227,7 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			if arg < 0 {
 				panic("negative jump offset is invalid")
 			}
-			scope := vm.scope()
-			if scope.Index >= scope.Len {
+			if vm.currScope.Index >= vm.currScope.Len {
 				vm.ip += arg
 			}
 
@@ -257,7 +262,26 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 		case OpAdd:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.Add(a, b))
+			var out any
+			switch x := a.(type) {
+			case int:
+				if y, ok := b.(int); ok {
+					out = x + y
+				}
+			case float64:
+				if y, ok := b.(float64); ok {
+					out = x + y
+				}
+			case string:
+				if y, ok := b.(string); ok {
+					vm.memGrow(budget.Concat(len(x), len(y)))
+					out = x + y
+				}
+			}
+			if out == nil {
+				out = runtime.Add(a, b)
+			}
+			vm.push(out)
 
 		case OpSubtract:
 			b := vm.pop()
@@ -372,9 +396,18 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			}
 			fnType := fn.Type()
 			size := arg
-			in := make([]reflect.Value, size)
 			isVariadic := fnType.IsVariadic()
 			numIn := fnType.NumIn()
+			if isVariadic {
+				if size < numIn-1 {
+					panic(fmt.Sprintf("invalid number of arguments: expected at least %d, got %d", numIn-1, size))
+				}
+			} else {
+				if size != numIn {
+					panic(fmt.Sprintf("invalid number of arguments: expected %d, got %d", numIn, size))
+				}
+			}
+			in := make([]reflect.Value, size)
 			for i := int(size) - 1; i >= 0; i-- {
 				param := vm.pop()
 				if param == nil {
@@ -449,7 +482,18 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			fn := vm.pop().(SafeFunction)
 			var args []any
 			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, arg)
-			out, mem, err := fn(args...)
+			out, mem, err := fn(vm.MemoryBudget-vm.memory, args...)
+			if err != nil {
+				panic(err)
+			}
+			vm.memGrow(mem)
+			vm.push(out)
+
+		case OpCallBuiltinSafe:
+			id, argc := DecodeBuiltinSafe(arg)
+			var args []any
+			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, argc)
+			out, mem, err := builtin.Builtins[id].Safe(vm.MemoryBudget-vm.memory, args...)
 			if err != nil {
 				panic(err)
 			}
@@ -460,7 +504,12 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			vm.push(vm.call(vm.pop(), arg))
 
 		case OpCallBuiltin1:
-			vm.push(builtin.Builtins[arg].Fast(vm.pop()))
+			in := vm.pop()
+			out := builtin.Builtins[arg].Fast(in)
+			if s, ok := out.(string); ok {
+				vm.memGrow(budget.StringGrowth(len(s), in))
+			}
+			vm.push(out)
 
 		case OpArray:
 			size := vm.pop().(int)
@@ -502,40 +551,34 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			vm.push(deref.Interface(a))
 
 		case OpIncrementIndex:
-			vm.scope().Index++
+			vm.currScope.Index++
 
 		case OpDecrementIndex:
-			scope := vm.scope()
-			scope.Index--
+			vm.currScope.Index--
 
 		case OpIncrementCount:
-			scope := vm.scope()
-			scope.Count++
+			vm.currScope.Count++
 
 		case OpGetIndex:
-			vm.push(vm.scope().Index)
+			vm.push(vm.currScope.Index)
 
 		case OpGetCount:
-			scope := vm.scope()
-			vm.push(scope.Count)
+			vm.push(vm.currScope.Count)
 
 		case OpGetLen:
-			scope := vm.scope()
-			vm.push(scope.Len)
+			vm.push(vm.currScope.Len)
 
 		case OpGetAcc:
-			vm.push(vm.scope().Acc)
+			vm.push(vm.currScope.Acc)
 
 		case OpSetAcc:
-			vm.scope().Acc = vm.pop()
+			vm.currScope.Acc = vm.pop()
 
 		case OpSetIndex:
-			scope := vm.scope()
-			scope.Index = vm.pop().(int)
+			vm.currScope.Index = vm.pop().(int)
 
 		case OpPointer:
-			scope := vm.scope()
-			vm.push(scope.Array.Index(scope.Index).Interface())
+			vm.push(vm.currScope.Item())
 
 		case OpThrow:
 			panic(vm.pop().(error))
@@ -545,9 +588,13 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			case 1:
 				vm.push(make(groupBy))
 			case 2:
-				scope := vm.scope()
+				scope := vm.currScope
 				var desc bool
-				switch vm.pop().(string) {
+				order, ok := vm.pop().(string)
+				if !ok {
+					panic("sortBy order argument must be a string")
+				}
+				switch order {
 				case "asc":
 					desc = false
 				case "desc":
@@ -565,21 +612,22 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			}
 
 		case OpGroupBy:
-			scope := vm.scope()
+			scope := vm.currScope
 			key := vm.pop()
-			item := scope.Array.Index(scope.Index).Interface()
-			scope.Acc.(groupBy)[key] = append(scope.Acc.(groupBy)[key], item)
+			if key != nil && !reflect.TypeOf(key).Comparable() {
+				panic(fmt.Sprintf("cannot use %T as a key for groupBy: type is not comparable", key))
+			}
+			scope.Acc.(groupBy)[key] = append(scope.Acc.(groupBy)[key], scope.Item())
 
 		case OpSortBy:
-			scope := vm.scope()
+			scope := vm.currScope
 			value := vm.pop()
-			item := scope.Array.Index(scope.Index).Interface()
 			sortable := scope.Acc.(*runtime.SortBy)
-			sortable.Array = append(sortable.Array, item)
+			sortable.Array = append(sortable.Array, scope.Item())
 			sortable.Values = append(sortable.Values, value)
 
 		case OpSort:
-			scope := vm.scope()
+			scope := vm.currScope
 			sortable := scope.Acc.(*runtime.SortBy)
 			sort.Sort(sortable)
 			vm.memGrow(uint(scope.Len))
@@ -595,11 +643,26 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 
 		case OpBegin:
 			a := vm.pop()
-			array := reflect.ValueOf(a)
-			vm.Scopes = append(vm.Scopes, &Scope{
-				Array: array,
-				Len:   array.Len(),
-			})
+			s := vm.allocScope()
+			switch v := a.(type) {
+			case []int:
+				s.Ints = v
+				s.Len = len(v)
+			case []float64:
+				s.Floats = v
+				s.Len = len(v)
+			case []string:
+				s.Strings = v
+				s.Len = len(v)
+			case []any:
+				s.Anys = v
+				s.Len = len(v)
+			default:
+				s.Array = reflect.ValueOf(a)
+				s.Len = s.Array.Len()
+			}
+			vm.Scopes = append(vm.Scopes, s)
+			vm.currScope = s
 
 		case OpAnd:
 			a := vm.pop()
@@ -613,6 +676,11 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 
 		case OpEnd:
 			vm.Scopes = vm.Scopes[:len(vm.Scopes)-1]
+			if len(vm.Scopes) > 0 {
+				vm.currScope = vm.Scopes[len(vm.Scopes)-1]
+			} else {
+				vm.currScope = nil
+			}
 
 		default:
 			panic(fmt.Sprintf("unknown bytecode %#x", op))
@@ -666,6 +734,28 @@ func (vm *VM) scope() *Scope {
 	return vm.Scopes[len(vm.Scopes)-1]
 }
 
+// allocScope returns a pointer to a Scope from the pool, growing the pool if needed.
+// Callers must set Len and exactly one of: Ints, Floats, Strings, Anys, or Array.
+func (vm *VM) allocScope() *Scope {
+	if vm.scopePoolIdx >= len(vm.scopePool) {
+		vm.scopePool = append(vm.scopePool, Scope{})
+	}
+	s := &vm.scopePool[vm.scopePoolIdx]
+	vm.scopePoolIdx++
+	// Reset iteration state
+	s.Index = 0
+	s.Count = 0
+	s.Acc = nil
+	// Clear typed slice pointers to avoid stale fast-path matches
+	s.Ints = nil
+	s.Floats = nil
+	s.Strings = nil
+	s.Anys = nil
+	// Clear Array to release reference for GC (only matters for fallback path)
+	s.Array = reflect.Value{}
+	return s
+}
+
 // getArgsForFunc lazily initializes the buffer the first time it is called for
 // a given program (thus, it also needs "program" to run). It will
 // take "needed" elements from the buffer and populate them with vm.pop() in
@@ -678,7 +768,10 @@ func (vm *VM) getArgsForFunc(argsBuf []any, program *Program, needed int) (args 
 
 	// Step 1: fix estimations and preallocate
 	if argsBuf == nil {
-		estimatedFnArgsCount := estimateFnArgsCount(program)
+		estimatedFnArgsCount := program.fnArgsCount
+		if !program.hasFnArgsCount {
+			estimatedFnArgsCount = estimateFnArgsCount(program)
+		}
 		if estimatedFnArgsCount > maxFnArgsBuf {
 			// put a practical limit to avoid excessive preallocation
 			estimatedFnArgsCount = maxFnArgsBuf
@@ -745,8 +838,14 @@ func estimateFnArgsCount(program *Program) int {
 	// Implementation note: a program will not necessarily go through all
 	// operations, but this is just an estimation
 	var count int
-	for _, op := range program.Bytecode {
-		if int(op) < len(opArgLenEstimation) {
+	for i, op := range program.Bytecode {
+		if op == OpCallSafe {
+			// The argument of OpCallSafe is the exact number of arguments.
+			count += program.Arguments[i]
+		} else if op == OpCallBuiltinSafe {
+			_, argc := DecodeBuiltinSafe(program.Arguments[i])
+			count += argc
+		} else if int(op) < len(opArgLenEstimation) {
 			count += opArgLenEstimation[op]
 		}
 	}
@@ -763,5 +862,4 @@ var opArgLenEstimation = [...]int{
 	// here we don't know either, but we can guess it could be common to receive
 	// up to 3 arguments in a function
 	OpCallFast: 3,
-	OpCallSafe: 3,
 }
