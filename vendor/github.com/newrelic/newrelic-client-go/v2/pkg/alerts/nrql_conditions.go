@@ -52,7 +52,7 @@ type AlertsNrqlConditionCreateSignal struct {
 type AlertsNrqlConditionUpdateSignal struct {
 	AggregationWindow *int                            `json:"aggregationWindow,omitempty"`
 	EvaluationOffset  *int                            `json:"evaluationOffset,omitempty"`
-	EvaluationDelay   *int                            `json:"evaluationDelay,omitempty"`
+	EvaluationDelay   *int                            `json:"evaluationDelay"`
 	FillOption        *AlertsFillOption               `json:"fillOption"`
 	FillValue         *float64                        `json:"fillValue"`
 	AggregationMethod *NrqlConditionAggregationMethod `json:"aggregationMethod"`
@@ -255,6 +255,7 @@ type NrqlConditionTerm struct {
 	ThresholdOccurrences         ThresholdOccurrence               `json:"thresholdOccurrences,omitempty"`
 	Prediction                   *NrqlConditionThresholdPrediction `json:"prediction,omitempty"`
 	DisableHealthStatusReporting *bool                             `json:"disableHealthStatusReporting,omitempty"`
+	DisableEventCreation         *bool                             `json:"disableEventCreation,omitempty"`
 }
 
 // NrqlConditionQuery represents the NRQL query object returned in a NerdGraph response object.
@@ -320,7 +321,7 @@ type NrqlConditionUpdateBase struct {
 	Name                      string                           `json:"name,omitempty"`
 	Nrql                      NrqlConditionUpdateQuery         `json:"nrql"`
 	RunbookURL                string                           `json:"runbookUrl"`
-	Terms                     []NrqlConditionTerm              `json:"terms,omitempty"`
+	Terms                     *[]NrqlConditionTerm             `json:"terms,omitempty"`
 	Type                      NrqlConditionType                `json:"type,omitempty"`
 	ViolationTimeLimit        NrqlConditionViolationTimeLimit  `json:"violationTimeLimit,omitempty"`
 	ViolationTimeLimitSeconds int                              `json:"violationTimeLimitSeconds,omitempty"`
@@ -863,6 +864,7 @@ const (
       thresholdDuration
       thresholdOccurrences
       disableHealthStatusReporting
+      disableEventCreation
     }
     type
     violationTimeLimit

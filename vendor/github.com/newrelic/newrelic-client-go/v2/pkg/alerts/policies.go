@@ -363,6 +363,7 @@ const (
 						name
 						incidentPreference
 						accountId
+						entityGuid
 	`
 	alertPolicyQueryPolicy = `query($accountID: Int!, $policyID: ID!) {
 		actor {
@@ -375,11 +376,11 @@ const (
 		}
 	}`
 
-	alertsPolicyQuerySearch = `query($accountID: Int!, $cursor: String, $criteria: AlertsPoliciesSearchCriteriaInput) {
+	alertsPolicyQuerySearch = `query($accountID: Int!, $cursor: String, $searchCriteria: AlertsPoliciesSearchCriteriaInput) {
 		actor {
 			account(id: $accountID) {
 				alerts {
-					policiesSearch(cursor: $cursor, searchCriteria: $criteria) {
+					policiesSearch(cursor: $cursor, searchCriteria: $searchCriteria) {
 						nextCursor
 						totalCount
 						policies {
@@ -387,6 +388,7 @@ const (
 							id
 							incidentPreference
 							name
+							entityGuid
 						}
 					}
 				}

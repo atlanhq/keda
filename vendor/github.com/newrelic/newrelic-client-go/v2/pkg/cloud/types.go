@@ -124,6 +124,12 @@ type CloudAccountMutationError struct {
 	Type string `json:"type"`
 }
 
+// CloudAuthenticateIntegrationPayload - Response payload for cloudAuthenticateIntegration mutation.
+type CloudAuthenticateIntegrationPayload struct {
+	// Short-lived reference ID (TTL ~30 minutes) used in subsequent CloudLinkAccount calls.
+	AuthReferenceId string `json:"authReferenceId"`
+}
+
 type CloudActorFields struct {
 	// Get all linked cloud provider accounts scoped to the Actor.
 	LinkedAccounts []CloudLinkedAccount `json:"linkedAccounts,omitempty"`
@@ -701,6 +707,176 @@ type CloudAwsGovCloudUpdateAccountInput struct {
 	Name string `json:"name,omitempty"`
 	// The secret key used to make requests to AWS service APIs
 	SecretAccessKey SecureValue `json:"secretAccessKey,omitempty"`
+}
+
+// CloudAwsEuSovereignLinkAccountInput - Information required to link an AWS EU Sovereign account to a NewRelic account.
+type CloudAwsEuSovereignLinkAccountInput struct {
+	// The AWS role ARN (used to fetch data).
+	Arn string `json:"arn"`
+	// How metrics will be collected.
+	MetricCollectionMode CloudMetricCollectionMode `json:"metricCollectionMode,omitempty"`
+	// The linked account name.
+	Name string `json:"name"`
+}
+
+// CloudAwsEuSovereignUpdateAccountInput - Information required to update an AWS EU Sovereign account to a NewRelic account.
+type CloudAwsEuSovereignUpdateAccountInput struct {
+	// The AWS role ARN (used to fetch data).
+	Arn string `json:"arn,omitempty"`
+	// Disable the linked account.
+	Disabled bool `json:"disabled,omitempty"`
+	// The linked account identifier.
+	LinkedAccountId int `json:"linkedAccountId"`
+	// The linked account new name.
+	Name string `json:"name,omitempty"`
+}
+
+// CloudAwsEuSovereignProvider - The Amazon Web Services cloud provider (EU Sovereign)
+type CloudAwsEuSovereignProvider struct {
+	// The object creation date, in epoch (Unix) time
+	CreatedAt nrtime.EpochSeconds `json:"createdAt"`
+	// The cloud provider identifier in NewRelic.
+	ID int `json:"id"`
+	// The cloud provider icon name.
+	Icon string `json:"icon"`
+	// The cloud provider name.
+	Name string `json:"name"`
+	// Get details of one cloud provider service.
+	Service CloudService `json:"service,omitempty"`
+	// Get details of all the cloud provider services available for integration.
+	Services []CloudService `json:"services"`
+	// The cloud provider short name.
+	Slug string `json:"slug"`
+	// Get template params of one cloud provider service.
+	TemplateParams []CloudTemplateParam `json:"templateParams"`
+	// The object last update date, in epoch (Unix) time
+	UpdatedAt nrtime.EpochSeconds `json:"updatedAt"`
+}
+
+func (x *CloudAwsEuSovereignProvider) ImplementsCloudProvider() {}
+
+// CloudAwsMetadataEuSovereignIntegration - Fetch Metadata for AWS EU Sovereign integrations Integration
+type CloudAwsMetadataEuSovereignIntegration struct {
+	// The object creation date, in epoch (Unix) time
+	CreatedAt nrtime.EpochSeconds `json:"createdAt"`
+	// The cloud service integration identifier.
+	ID int `json:"id,omitempty"`
+	// [DEPRECATED] Multiple polling interval is no longer supported, use only metrics_polling_interval
+	InventoryPollingInterval int `json:"inventoryPollingInterval,omitempty"`
+	// The parent linked account identifier.
+	LinkedAccount CloudLinkedAccount `json:"linkedAccount,omitempty"`
+	// The data polling interval in seconds.
+	MetricsPollingInterval int `json:"metricsPollingInterval,omitempty"`
+	// The cloud service integration name.
+	Name string `json:"name,omitempty"`
+	// The parent NewRelic account identifier.
+	NrAccountId int `json:"nrAccountId"`
+	// The cloud service used in the integration.
+	Service CloudService `json:"service,omitempty"`
+	// The object last update date, in epoch (Unix) time
+	UpdatedAt nrtime.EpochSeconds `json:"updatedAt"`
+}
+
+func (x *CloudAwsMetadataEuSovereignIntegration) ImplementsCloudIntegration() {}
+
+// CloudAwsMetadataEuSovereignIntegrationInput - Fetch Metadata for AWS EU Sovereign integrations
+type CloudAwsMetadataEuSovereignIntegrationInput struct {
+	// [DEPRECATED] Multiple polling interval is no longer supported, use only metrics_polling_interval
+	InventoryPollingInterval int `json:"inventoryPollingInterval,omitempty"`
+	// The linked account identifier.
+	LinkedAccountId int `json:"linkedAccountId"`
+	// The data polling interval in seconds.
+	MetricsPollingInterval int `json:"metricsPollingInterval,omitempty"`
+}
+
+// CloudAwsMsElasticacheEuSovereignIntegration - Fetch ElastiCache EU Sovereign entities Integration
+type CloudAwsMsElasticacheEuSovereignIntegration struct {
+	// The object creation date, in epoch (Unix) time
+	CreatedAt nrtime.EpochSeconds `json:"createdAt"`
+	// The cloud service integration identifier.
+	ID int `json:"id,omitempty"`
+	// [DEPRECATED] Multiple polling interval is no longer supported, use only metrics_polling_interval
+	InventoryPollingInterval int `json:"inventoryPollingInterval,omitempty"`
+	// The parent linked account identifier.
+	LinkedAccount CloudLinkedAccount `json:"linkedAccount,omitempty"`
+	// The data polling interval in seconds.
+	MetricsPollingInterval int `json:"metricsPollingInterval,omitempty"`
+	// The cloud service integration name.
+	Name string `json:"name,omitempty"`
+	// The parent NewRelic account identifier.
+	NrAccountId int `json:"nrAccountId"`
+	// The cloud service used in the integration.
+	Service CloudService `json:"service,omitempty"`
+	// The object last update date, in epoch (Unix) time
+	UpdatedAt nrtime.EpochSeconds `json:"updatedAt"`
+}
+
+func (x *CloudAwsMsElasticacheEuSovereignIntegration) ImplementsCloudIntegration() {}
+
+// CloudAwsMsElasticacheEuSovereignIntegrationInput - Fetch ElastiCache EU Sovereign entities
+type CloudAwsMsElasticacheEuSovereignIntegrationInput struct {
+	// [DEPRECATED] Multiple polling interval is no longer supported, use only metrics_polling_interval
+	InventoryPollingInterval int `json:"inventoryPollingInterval,omitempty"`
+	// The linked account identifier.
+	LinkedAccountId int `json:"linkedAccountId"`
+	// The data polling interval in seconds.
+	MetricsPollingInterval int `json:"metricsPollingInterval,omitempty"`
+}
+
+// CloudAwsTagsGlobalEuSovereignIntegration - Fetch tags for all AWS EU Sovereign integrations Integration
+type CloudAwsTagsGlobalEuSovereignIntegration struct {
+	// The object creation date, in epoch (Unix) time
+	CreatedAt nrtime.EpochSeconds `json:"createdAt"`
+	// The cloud service integration identifier.
+	ID int `json:"id,omitempty"`
+	// [DEPRECATED] Multiple polling interval is no longer supported, use only metrics_polling_interval
+	InventoryPollingInterval int `json:"inventoryPollingInterval,omitempty"`
+	// The parent linked account identifier.
+	LinkedAccount CloudLinkedAccount `json:"linkedAccount,omitempty"`
+	// The data polling interval in seconds.
+	MetricsPollingInterval int `json:"metricsPollingInterval,omitempty"`
+	// The cloud service integration name.
+	Name string `json:"name,omitempty"`
+	// The parent NewRelic account identifier.
+	NrAccountId int `json:"nrAccountId"`
+	// The cloud service used in the integration.
+	Service CloudService `json:"service,omitempty"`
+	// The object last update date, in epoch (Unix) time
+	UpdatedAt nrtime.EpochSeconds `json:"updatedAt"`
+}
+
+func (x *CloudAwsTagsGlobalEuSovereignIntegration) ImplementsCloudIntegration() {}
+
+// CloudAwsTagsGlobalEuSovereignIntegrationInput - Fetch tags for all AWS EU Sovereign integrations
+type CloudAwsTagsGlobalEuSovereignIntegrationInput struct {
+	// [DEPRECATED] Multiple polling interval is no longer supported, use only metrics_polling_interval
+	InventoryPollingInterval int `json:"inventoryPollingInterval,omitempty"`
+	// The linked account identifier.
+	LinkedAccountId int `json:"linkedAccountId"`
+	// The data polling interval in seconds.
+	MetricsPollingInterval int `json:"metricsPollingInterval,omitempty"`
+}
+
+// CloudAwsEuSovereignDisableIntegrationsInput - List of integrations
+// EU Sovereign only supports: billing, cloudtrail, xray
+type CloudAwsEuSovereignDisableIntegrationsInput struct {
+	// Billing integration
+	Billing []CloudDisableAccountIntegrationInput `json:"billing,omitempty"`
+	// CloudTrail integration
+	Cloudtrail []CloudDisableAccountIntegrationInput `json:"cloudtrail,omitempty"`
+	// X-Ray integration
+	AwsXray []CloudDisableAccountIntegrationInput `json:"awsXray,omitempty"`
+}
+
+// CloudAwsEuSovereignIntegrationsInput - List of integrations
+// EU Sovereign only supports: billing, cloudtrail, awsXray
+type CloudAwsEuSovereignIntegrationsInput struct {
+	// Billing integration
+	Billing []CloudBillingIntegrationInput `json:"billing,omitempty"`
+	// CloudTrail integration
+	Cloudtrail []CloudCloudtrailIntegrationInput `json:"cloudtrail,omitempty"`
+	// X-Ray integration
+	AwsXray []CloudAwsXrayIntegrationInput `json:"awsXray,omitempty"`
 }
 
 // CloudAwsGovcloudDisableIntegrationsInput - List of integrations
@@ -2466,11 +2642,19 @@ func (x *CloudAzureMonitorIntegration) ImplementsCloudIntegration() {}
 // CloudAzureMonitorIntegrationInput - Azure Monitor metrics
 type CloudAzureMonitorIntegrationInput struct {
 	// Specify if integration is active
-	Enabled bool `json:"enabled,omitempty"`
+	Enabled *bool `json:"enabled,omitempty"`
 	// Specify resource tags (in 'key:value' form) associated with the resources that you want to exclude from monitoring. Exclusion takes precedence over inclusion.
-	ExcludeTags []string `json:"excludeTags,omitempty"`
+	// A nil pointer omits the field, leaving the configured tags unchanged; a pointer to an empty
+	// slice sends [], which clears them.
+	// This change has been made manually out of Tutone's purview, as a pointer override with primitive datatypes is not supported by Tutone.
+	// DO NOT DISCARD THIS CHANGE when a refetch of this package is performed using Tutone.
+	ExcludeTags *[]string `json:"excludeTags,omitempty"`
 	// Specify resource tags (in 'key:value' form) associated with the resources that you want to monitor. If empty, all resources will be monitored.
-	IncludeTags []string `json:"includeTags,omitempty"`
+	// A nil pointer omits the field, leaving the configured tags unchanged; a pointer to an empty
+	// slice sends [], which clears them.
+	// This change has been made manually out of Tutone's purview, as a pointer override with primitive datatypes is not supported by Tutone.
+	// DO NOT DISCARD THIS CHANGE when a refetch of this package is performed using Tutone.
+	IncludeTags *[]string `json:"includeTags,omitempty"`
 	// The polling interval for metadata and tags, in seconds.
 	InventoryPollingInterval int `json:"inventoryPollingInterval,omitempty"`
 	// The linked account identifier.
@@ -3345,6 +3529,8 @@ func (x *CloudDisableIntegrationPayload) UnmarshalJSON(b []byte) error {
 type CloudDisableIntegrationsInput struct {
 	// Aws provider
 	Aws CloudAwsDisableIntegrationsInput `json:"aws,omitempty"`
+	// AwsEuSovereign provider
+	AwsEuSovereign CloudAwsEuSovereignDisableIntegrationsInput `json:"awsEuSovereign,omitempty"`
 	// AwsGovcloud provider
 	AwsGovcloud CloudAwsGovcloudDisableIntegrationsInput `json:"awsGovcloud,omitempty"`
 	// Azure provider
@@ -3945,6 +4131,41 @@ type CloudGcpAlloydbIntegrationInput struct {
 	MetricsPollingInterval int `json:"metricsPollingInterval,omitempty"`
 }
 
+// CloudGcpGenericIntegration - Generic GCP DM integration used for API Gateway, Firebase
+// Authentication, Firebase Vertex AI, Firebase App Hosting, Istio, Managed Kafka,
+// Memorystore, Edge Container, and Gemini Enterprise, none of which have a dedicated integration
+// type in the schema.
+type CloudGcpGenericIntegration struct {
+	// The object creation date, in epoch (Unix) time
+	CreatedAt nrtime.EpochSeconds `json:"createdAt"`
+	// The cloud service integration identifier.
+	ID int `json:"id,omitempty"`
+	// The parent linked account identifier.
+	LinkedAccount CloudLinkedAccount `json:"linkedAccount,omitempty"`
+	// The data polling interval in seconds.
+	MetricsPollingInterval int `json:"metricsPollingInterval,omitempty"`
+	// The cloud service integration name.
+	Name string `json:"name,omitempty"`
+	// The parent NewRelic account identifier.
+	NrAccountId int `json:"nrAccountId"`
+	// The cloud service used in the integration.
+	Service CloudService `json:"service,omitempty"`
+	// The object last update date, in epoch (Unix) time
+	UpdatedAt nrtime.EpochSeconds `json:"updatedAt"`
+}
+
+func (x *CloudGcpGenericIntegration) ImplementsCloudIntegration() {}
+
+// CloudGcpGenericIntegrationInput - Generic GCP DM integration input used for API Gateway,
+// Firebase Authentication, Firebase Vertex AI, Firebase App Hosting, Istio, Managed Kafka,
+// Memorystore, Edge Container, and Gemini Enterprise (Dimensional Metrics only).
+type CloudGcpGenericIntegrationInput struct {
+	// The linked account identifier.
+	LinkedAccountId int `json:"linkedAccountId"`
+	// The data polling interval in seconds.
+	MetricsPollingInterval int `json:"metricsPollingInterval,omitempty"`
+}
+
 // CloudGcpAppengineIntegration - App Engine Integration
 type CloudGcpAppengineIntegration struct {
 	// The object creation date, in epoch (Unix) time
@@ -4247,6 +4468,24 @@ type CloudGcpDisableIntegrationsInput struct {
 	GcpVms []CloudDisableAccountIntegrationInput `json:"gcpVms,omitempty"`
 	// VPC Access integration
 	GcpVpcaccess []CloudDisableAccountIntegrationInput `json:"gcpVpcaccess,omitempty"`
+	// API Gateway integration (Dimensional Metrics only)
+	GcpApiGateway []CloudDisableAccountIntegrationInput `json:"gcpApiGateway,omitempty"`
+	// Firebase Authentication integration (Dimensional Metrics only)
+	GcpFirebaseAuth []CloudDisableAccountIntegrationInput `json:"gcpFirebaseAuth,omitempty"`
+	// Firebase Vertex AI integration (Dimensional Metrics only)
+	GcpFirebaseVertexAi []CloudDisableAccountIntegrationInput `json:"gcpFirebaseVertexAi,omitempty"`
+	// Firebase App Hosting integration (Dimensional Metrics only)
+	GcpFirebaseAppHosting []CloudDisableAccountIntegrationInput `json:"gcpFirebaseAppHosting,omitempty"`
+	// Istio integration (Dimensional Metrics only)
+	GcpIstio []CloudDisableAccountIntegrationInput `json:"gcpIstio,omitempty"`
+	// Managed Kafka integration (Dimensional Metrics only)
+	GcpManagedKafka []CloudDisableAccountIntegrationInput `json:"gcpManagedKafka,omitempty"`
+	// Memorystore integration (Dimensional Metrics only)
+	GcpMemoryStore []CloudDisableAccountIntegrationInput `json:"gcpMemoryStore,omitempty"`
+	// Edge Container integration (Dimensional Metrics only)
+	GcpEdgeContainer []CloudDisableAccountIntegrationInput `json:"gcpEdgeContainer,omitempty"`
+	// Gemini Enterprise integration (Dimensional Metrics only)
+	GcpGeminiEnterprise []CloudDisableAccountIntegrationInput `json:"gcpGeminiEnterprise,omitempty"`
 }
 
 // CloudGcpFirebasedatabaseIntegration - Firebase Database Integration
@@ -4475,6 +4714,24 @@ type CloudGcpIntegrationsInput struct {
 	GcpVms []CloudGcpVmsIntegrationInput `json:"gcpVms,omitempty"`
 	// VPC Access integration
 	GcpVpcaccess []CloudGcpVpcaccessIntegrationInput `json:"gcpVpcaccess,omitempty"`
+	// API Gateway integration (Dimensional Metrics only)
+	GcpApiGateway []CloudGcpGenericIntegrationInput `json:"gcpApiGateway,omitempty"`
+	// Firebase Authentication integration (Dimensional Metrics only)
+	GcpFirebaseAuth []CloudGcpGenericIntegrationInput `json:"gcpFirebaseAuth,omitempty"`
+	// Firebase Vertex AI integration (Dimensional Metrics only)
+	GcpFirebaseVertexAi []CloudGcpGenericIntegrationInput `json:"gcpFirebaseVertexAi,omitempty"`
+	// Firebase App Hosting integration (Dimensional Metrics only)
+	GcpFirebaseAppHosting []CloudGcpGenericIntegrationInput `json:"gcpFirebaseAppHosting,omitempty"`
+	// Istio integration (Dimensional Metrics only)
+	GcpIstio []CloudGcpGenericIntegrationInput `json:"gcpIstio,omitempty"`
+	// Managed Kafka integration (Dimensional Metrics only)
+	GcpManagedKafka []CloudGcpGenericIntegrationInput `json:"gcpManagedKafka,omitempty"`
+	// Memorystore integration (Dimensional Metrics only)
+	GcpMemoryStore []CloudGcpGenericIntegrationInput `json:"gcpMemoryStore,omitempty"`
+	// Edge Container integration (Dimensional Metrics only)
+	GcpEdgeContainer []CloudGcpGenericIntegrationInput `json:"gcpEdgeContainer,omitempty"`
+	// Gemini Enterprise integration (Dimensional Metrics only)
+	GcpGeminiEnterprise []CloudGcpGenericIntegrationInput `json:"gcpGeminiEnterprise,omitempty"`
 }
 
 // CloudGcpInterconnectIntegration - Interconnect Integration
@@ -4551,6 +4808,9 @@ type CloudGcpLinkAccountInput struct {
 	Name string `json:"name"`
 	// The GCP project identifier.
 	ProjectId string `json:"projectId"`
+	// The authentication reference ID obtained from CloudAuthenticateIntegration.
+	// Required for GCP Dimensional Metrics (WIF) account linking; omit for legacy service-account key auth.
+	AuthReferenceId string `json:"authReferenceId,omitempty"`
 }
 
 // CloudGcpLoadbalancingIntegration - Cloud Load Balancing Integration
@@ -5091,6 +5351,8 @@ type CloudIntegrationMutationError struct {
 type CloudIntegrationsInput struct {
 	// Aws provider
 	Aws CloudAwsIntegrationsInput `json:"aws,omitempty"`
+	// AwsEuSovereign provider
+	AwsEuSovereign CloudAwsEuSovereignIntegrationsInput `json:"awsEuSovereign,omitempty"`
 	// AwsGovcloud provider
 	AwsGovcloud CloudAwsGovcloudIntegrationsInput `json:"awsGovcloud,omitempty"`
 	// Azure provider
@@ -5293,6 +5555,8 @@ type CloudLinkAccountPayload struct {
 type CloudLinkCloudAccountsInput struct {
 	// Aws provider
 	Aws []CloudAwsLinkAccountInput `json:"aws,omitempty"`
+	// AwsEuSovereign provider
+	AwsEuSovereign []CloudAwsEuSovereignLinkAccountInput `json:"awsEuSovereign,omitempty"`
 	// AwsGovCloud provider
 	AwsGovcloud []CloudAwsGovCloudLinkAccountInput `json:"awsGovcloud,omitempty"`
 	// Azure provider
@@ -5319,6 +5583,8 @@ type CloudLinkedAccount struct {
 	Integration CloudIntegrationInterface `json:"integration"`
 	// Get details of all cloud service integrations.
 	Integrations []CloudIntegrationInterface `json:"integrations"`
+	// Indicates whether this linked account uses dimensional metrics.
+	HasDimensionalMetrics bool `json:"hasDimensionalMetrics,omitempty"`
 	// Indicate how the metrics will be collected (PUSH/PULL)
 	MetricCollectionMode CloudMetricCollectionMode `json:"metricCollectionMode"`
 	// The linked account name in NewRelic.
@@ -5402,6 +5668,11 @@ func (x *CloudLinkedAccount) UnmarshalJSON(b []byte) error {
 					x.Integrations = append(x.Integrations, *xxx)
 				}
 			}
+		case "hasDimensionalMetrics":
+			err = json.Unmarshal(*v, &x.HasDimensionalMetrics)
+			if err != nil {
+				return err
+			}
 		case "metricCollectionMode":
 			err = json.Unmarshal(*v, &x.MetricCollectionMode)
 			if err != nil {
@@ -5474,10 +5745,27 @@ type CloudOciLinkAccountInput struct {
 	OciDomainURL string `json:"ociDomainUrl"`
 	// The home region of the tenancy.
 	OciHomeRegion string `json:"ociHomeRegion"`
+	// Optional value propagated as the ext_resource_tag claim on the RPST. Customers use this for tag-based resource scoping in their IAM policies. Ignored for UPST.
+	ResourceTag string `json:"resourceTag,omitempty"`
 	// The OCI tenant identifier.
 	TenantId string `json:"tenantId"`
+	// The OCI WIF trust type. Defaults to UPST for backward compatibility.
+	TrustType CloudOciTrustType `json:"trustType,omitempty"`
 	// The user secret OCID.
 	UserVaultOcid string `json:"userVaultOcid"`
+}
+
+// CloudOciTrustType - OCI WIF trust type. UPST impersonates a service user; RPST uses claim-based ephemeral principals.
+type CloudOciTrustType string
+
+var CloudOciTrustTypeTypes = struct {
+	// Resource Principal Session Token — exchange grants an ephemeral identityfederateddomainapp principal. Customer IAM policies authorize via JWT claims (ext_account_id, ext_tenancy_id, ext_resource_tag) instead of a service-user group, enabling multi-account scoping and bypassing OCI's per-policy statement limit.
+	RPST CloudOciTrustType
+	// User Principal Session Token — exchange grants impersonation of a dedicated OCI service user. Default for backward compatibility with existing integrations.
+	UPST CloudOciTrustType
+}{
+	RPST: "RPST",
+	UPST: "UPST",
 }
 
 // CloudOciLogsIntegration - Fetch Metadata and Tags for OCI Logs integrations Integration
@@ -5856,6 +6144,8 @@ type CloudService struct {
 	Icon string `json:"icon"`
 	// Shows if the cloud service is enabled for integrating.
 	IsEnabled bool `json:"isEnabled"`
+	// Whether this service supports entity synthesis (default: true)
+	IsEntitySupported bool `json:"isEntitySupported"`
 	// The cloud service name.
 	Name string `json:"name"`
 	// The cloud provider.
@@ -5902,6 +6192,11 @@ func (x *CloudService) UnmarshalJSON(b []byte) error {
 			}
 		case "isEnabled":
 			err = json.Unmarshal(*v, &x.IsEnabled)
+			if err != nil {
+				return err
+			}
+		case "isEntitySupported":
+			err = json.Unmarshal(*v, &x.IsEntitySupported)
 			if err != nil {
 				return err
 			}
@@ -6150,6 +6445,8 @@ type CloudUpdateAccountPayload struct {
 type CloudUpdateCloudAccountsInput struct {
 	// Aws provider
 	Aws []CloudAwsUpdateAccountInput `json:"aws,omitempty"`
+	// AwsEuSovereign provider
+	AwsEuSovereign []CloudAwsEuSovereignUpdateAccountInput `json:"awsEuSovereign,omitempty"`
 	// AwsGovCloud provider
 	AwsGovcloud []CloudAwsGovCloudUpdateAccountInput `json:"awsGovcloud,omitempty"`
 	// Azure provider
@@ -6409,6 +6706,16 @@ func UnmarshalCloudIntegrationInterface(b []byte) (*CloudIntegrationInterface, e
 			var xxx CloudIntegrationInterface = &interfaceType
 
 			return &xxx, nil
+		case "CloudAwsMetadataEuSovereignIntegration":
+			var interfaceType CloudAwsMetadataEuSovereignIntegration
+			err = json.Unmarshal(b, &interfaceType)
+			if err != nil {
+				return nil, err
+			}
+
+			var xxx CloudIntegrationInterface = &interfaceType
+
+			return &xxx, nil
 		case "CloudAwsMqIntegration":
 			var interfaceType CloudAwsMqIntegration
 			err = json.Unmarshal(b, &interfaceType)
@@ -6421,6 +6728,16 @@ func UnmarshalCloudIntegrationInterface(b []byte) (*CloudIntegrationInterface, e
 			return &xxx, nil
 		case "CloudAwsMsElasticacheIntegration":
 			var interfaceType CloudAwsMsElasticacheIntegration
+			err = json.Unmarshal(b, &interfaceType)
+			if err != nil {
+				return nil, err
+			}
+
+			var xxx CloudIntegrationInterface = &interfaceType
+
+			return &xxx, nil
+		case "CloudAwsMsElasticacheEuSovereignIntegration":
+			var interfaceType CloudAwsMsElasticacheEuSovereignIntegration
 			err = json.Unmarshal(b, &interfaceType)
 			if err != nil {
 				return nil, err
@@ -6481,6 +6798,16 @@ func UnmarshalCloudIntegrationInterface(b []byte) (*CloudIntegrationInterface, e
 			return &xxx, nil
 		case "CloudAwsTagsGlobalIntegration":
 			var interfaceType CloudAwsTagsGlobalIntegration
+			err = json.Unmarshal(b, &interfaceType)
+			if err != nil {
+				return nil, err
+			}
+
+			var xxx CloudIntegrationInterface = &interfaceType
+
+			return &xxx, nil
+		case "CloudAwsTagsGlobalEuSovereignIntegration":
+			var interfaceType CloudAwsTagsGlobalEuSovereignIntegration
 			err = json.Unmarshal(b, &interfaceType)
 			if err != nil {
 				return nil, err
@@ -7278,6 +7605,16 @@ func UnmarshalCloudIntegrationInterface(b []byte) (*CloudIntegrationInterface, e
 			var xxx CloudIntegrationInterface = &interfaceType
 
 			return &xxx, nil
+		case "CloudGcpGenericIntegration":
+			var interfaceType CloudGcpGenericIntegration
+			err = json.Unmarshal(b, &interfaceType)
+			if err != nil {
+				return nil, err
+			}
+
+			var xxx CloudIntegrationInterface = &interfaceType
+
+			return &xxx, nil
 		case "CloudHealthIntegration":
 			var interfaceType CloudHealthIntegration
 			err = json.Unmarshal(b, &interfaceType)
@@ -7500,6 +7837,16 @@ func UnmarshalCloudProviderInterface(b []byte) (*CloudProviderInterface, error) 
 		}
 
 		switch typeName {
+		case "CloudAwsEuSovereignProvider":
+			var interfaceType CloudAwsEuSovereignProvider
+			err = json.Unmarshal(b, &interfaceType)
+			if err != nil {
+				return nil, err
+			}
+
+			var xxx CloudProviderInterface = &interfaceType
+
+			return &xxx, nil
 		case "CloudAwsGovCloudProvider":
 			var interfaceType CloudAwsGovCloudProvider
 			err = json.Unmarshal(b, &interfaceType)

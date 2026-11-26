@@ -5,12 +5,15 @@ import (
 	"time"
 
 	"github.com/newrelic/newrelic-client-go/v2/pkg/entityrelationship"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/pathpoint"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/users"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/workflowautomation"
 
 	"github.com/newrelic/newrelic-client-go/v2/pkg/accountmanagement"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/accounts"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/agent"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/agentapplications"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/aimonitoring"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/alerts"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/apiaccess"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/apm"
@@ -20,23 +23,31 @@ import (
 	"github.com/newrelic/newrelic-client-go/v2/pkg/config"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/customeradministration"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/dashboards"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/datamanagement"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/edge"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/entities"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/events"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/eventstometrics"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/federatedlogs"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/fleetcontrol"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/installevents"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/keytransaction"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/logconfigurations"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/logging"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/logs"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/maintenancewindow"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/nerdgraph"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/nerdstorage"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/notebooks"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/notifications"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/nrdb"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/nrqldroprules"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/nrqlmacros"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/organization"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/pipelinecontrol"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/plugins"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/pruningrules"
+	"github.com/newrelic/newrelic-client-go/v2/pkg/servicearchintelligence"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/servicelevel"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/synthetics"
 	"github.com/newrelic/newrelic-client-go/v2/pkg/usermanagement"
@@ -50,6 +61,7 @@ type NewRelic struct {
 	Accounts                accounts.Accounts
 	Agent                   agent.Agent
 	AgentApplications       agentapplications.AgentApplications
+	AIMonitoring            aimonitoring.Aimonitoring
 	Alerts                  alerts.Alerts
 	APIAccess               apiaccess.APIAccess
 	APM                     apm.APM
@@ -58,21 +70,29 @@ type NewRelic struct {
 	Cloud                   cloud.Cloud
 	CustomerAdministration  customeradministration.Customeradministration
 	Dashboards              dashboards.Dashboards
+	DataManagement          datamanagement.Datamanagement
 	Edge                    edge.Edge
 	Entities                entities.Entities
 	Events                  events.Events
 	EventsToMetrics         eventstometrics.EventsToMetrics
+	Federatedlogs           federatedlogs.Federatedlogs
+	FleetControl            fleetcontrol.Fleetcontrol
 	InstallEvents           installevents.Installevents
 	Logs                    logs.Logs
 	Logconfigurations       logconfigurations.Logconfigurations
+	MaintenanceWindow       maintenancewindow.Maintenancewindow
 	NerdGraph               nerdgraph.NerdGraph
 	NerdStorage             nerdstorage.NerdStorage
+	Notebooks               notebooks.Notebooks
+	Nrqlmacros              nrqlmacros.Nrqlmacros
 	Notifications           notifications.Notifications
 	Nrdb                    nrdb.Nrdb
 	Nrqldroprules           nrqldroprules.Nrqldroprules
 	Organization            organization.OrganizationManagement
 	Pipelinecontrol         pipelinecontrol.Pipelinecontrol
+	Pruningrules            pruningrules.Pruningrules
 	Plugins                 plugins.Plugins
+	Scorecards              servicearchintelligence.Scorecards
 	ServiceLevel            servicelevel.Servicelevel
 	Synthetics              synthetics.Synthetics
 	UserManagement          usermanagement.Usermanagement
@@ -81,6 +101,8 @@ type NewRelic struct {
 	KeyTransaction          keytransaction.Keytransaction
 	EntityRelationship      entityrelationship.Entityrelationship
 	Users                   users.Users
+	WorkflowAutomation      workflowautomation.Workflowautomation
+	PathPoint               pathpoint.Pathpoint
 
 	config config.Config
 }
@@ -101,6 +123,7 @@ func New(opts ...ConfigOption) (*NewRelic, error) {
 		Accounts:                accounts.New(cfg),
 		Agent:                   agent.New(cfg),
 		AgentApplications:       agentapplications.New(cfg),
+		AIMonitoring:            aimonitoring.New(cfg),
 		Alerts:                  alerts.New(cfg),
 		APIAccess:               apiaccess.New(cfg),
 		APM:                     apm.New(cfg),
@@ -109,21 +132,29 @@ func New(opts ...ConfigOption) (*NewRelic, error) {
 		Cloud:                   cloud.New(cfg),
 		CustomerAdministration:  customeradministration.New(cfg),
 		Dashboards:              dashboards.New(cfg),
+		DataManagement:          datamanagement.New(cfg),
 		Edge:                    edge.New(cfg),
 		Entities:                entities.New(cfg),
 		Events:                  events.New(cfg),
 		EventsToMetrics:         eventstometrics.New(cfg),
+		Federatedlogs:           federatedlogs.New(cfg),
+		FleetControl:            fleetcontrol.New(cfg),
 		InstallEvents:           installevents.New(cfg),
 		Logs:                    logs.New(cfg),
 		Logconfigurations:       logconfigurations.New(cfg),
+		MaintenanceWindow:       maintenancewindow.New(cfg),
 		NerdGraph:               nerdgraph.New(cfg),
 		NerdStorage:             nerdstorage.New(cfg),
+		Notebooks:               notebooks.New(cfg),
+		Nrqlmacros:              nrqlmacros.New(cfg),
 		Notifications:           notifications.New(cfg),
 		Nrdb:                    nrdb.New(cfg),
 		Nrqldroprules:           nrqldroprules.New(cfg),
 		Organization:            organization.New(cfg),
 		Pipelinecontrol:         pipelinecontrol.New(cfg),
+		Pruningrules:            pruningrules.New(cfg),
 		Plugins:                 plugins.New(cfg),
+		Scorecards:              servicearchintelligence.New(cfg),
 		ServiceLevel:            servicelevel.New(cfg),
 		Synthetics:              synthetics.New(cfg),
 		UserManagement:          usermanagement.New(cfg),
@@ -132,6 +163,8 @@ func New(opts ...ConfigOption) (*NewRelic, error) {
 		KeyTransaction:          keytransaction.New(cfg),
 		EntityRelationship:      entityrelationship.New(cfg),
 		Users:                   users.New(cfg),
+		WorkflowAutomation:      workflowautomation.New(cfg),
+		PathPoint:               pathpoint.New(cfg),
 	}
 
 	return nr, nil
