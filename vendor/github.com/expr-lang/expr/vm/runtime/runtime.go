@@ -42,6 +42,9 @@ func Fetch(from, i any) any {
 
 	switch v.Kind() {
 	case reflect.Array, reflect.Slice, reflect.String:
+		if _, ok := i.(string); ok {
+			panic(fmt.Sprintf("cannot fetch %v from %T", i, from))
+		}
 		index := ToInt(i)
 		l := v.Len()
 		if index < 0 {
@@ -70,7 +73,10 @@ func Fetch(from, i any) any {
 		}
 
 	case reflect.Struct:
-		fieldName := i.(string)
+		fieldName, ok := i.(string)
+		if !ok {
+			break
+		}
 		t := v.Type()
 		key := fieldCacheKey{
 			t: t,
@@ -79,23 +85,15 @@ func Fetch(from, i any) any {
 		if cv, ok := fieldCache.Load(key); ok {
 			return v.FieldByIndex(cv.([]int)).Interface()
 		}
-		field, ok := t.FieldByNameFunc(func(name string) bool {
-			field, _ := t.FieldByName(name)
-			switch field.Tag.Get("expr") {
-			case "-":
-				return false
-			case fieldName:
-				return true
-			default:
-				return name == fieldName
-			}
-		})
-		if ok {
-			value := v.FieldByIndex(field.Index)
-			if value.IsValid() {
-				fieldCache.Store(key, field.Index)
-				return value.Interface()
-			}
+		if value, field, ok := findStructField(v, fieldName); ok {
+			fieldCache.Store(key, field.Index)
+			return value.Interface()
+		}
+		// Field isn't found via standard Go promotion. Try to find it
+		// by traversing embedded interface values whose concrete types
+		// may contain the requested field.
+		if result, found := FetchFromEmbeddedInterfaces(v, fieldName); found {
+			return result
 		}
 	}
 	panic(fmt.Sprintf("cannot fetch %v from %T", i, from))
@@ -141,6 +139,59 @@ func fieldByIndex(v reflect.Value, field *Field) reflect.Value {
 		v = v.Field(x)
 	}
 	return v
+}
+
+func findStructField(v reflect.Value, fieldName string) (reflect.Value, reflect.StructField, bool) {
+	t := v.Type()
+	field, ok := t.FieldByNameFunc(func(name string) bool {
+		sf, _ := t.FieldByName(name)
+		switch sf.Tag.Get("expr") {
+		case "-":
+			return false
+		case fieldName:
+			return true
+		default:
+			return name == fieldName
+		}
+	})
+	if ok && field.IsExported() {
+		value := v.FieldByIndex(field.Index)
+		if value.IsValid() {
+			return value, field, true
+		}
+	}
+	return reflect.Value{}, reflect.StructField{}, false
+}
+
+// FetchFromEmbeddedInterfaces looks up fieldName on the concrete types held by
+// anonymous (embedded) interface fields of the struct value v, recursing through
+// embedded structs to reach further embedded interfaces. It is shared by Fetch
+// and the builtin get() so that both resolve such fields consistently.
+func FetchFromEmbeddedInterfaces(v reflect.Value, fieldName string) (any, bool) {
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.Anonymous {
+			continue
+		}
+		fv := deref.Value(v.Field(i))
+		if fv.Kind() != reflect.Struct {
+			continue
+		}
+		// Embedded interfaces need an explicit field lookup on the concrete
+		// value. Embedded structs are already covered by Go's standard field
+		// promotion, so we only recurse into them to find further embedded
+		// interfaces.
+		if deref.Type(f.Type).Kind() == reflect.Interface {
+			if value, _, ok := findStructField(fv, fieldName); ok {
+				return value.Interface(), true
+			}
+		}
+		if result, found := FetchFromEmbeddedInterfaces(fv, fieldName); found {
+			return result, true
+		}
+	}
+	return nil, false
 }
 
 type Method struct {

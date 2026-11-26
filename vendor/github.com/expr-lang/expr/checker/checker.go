@@ -15,15 +15,16 @@ import (
 )
 
 var (
-	anyType      = reflect.TypeOf(new(any)).Elem()
-	boolType     = reflect.TypeOf(true)
-	intType      = reflect.TypeOf(0)
-	floatType    = reflect.TypeOf(float64(0))
-	stringType   = reflect.TypeOf("")
-	arrayType    = reflect.TypeOf([]any{})
-	mapType      = reflect.TypeOf(map[string]any{})
-	timeType     = reflect.TypeOf(time.Time{})
-	durationType = reflect.TypeOf(time.Duration(0))
+	anyType       = reflect.TypeOf(new(any)).Elem()
+	boolType      = reflect.TypeOf(true)
+	intType       = reflect.TypeOf(0)
+	floatType     = reflect.TypeOf(float64(0))
+	stringType    = reflect.TypeOf("")
+	arrayType     = reflect.TypeOf([]any{})
+	mapType       = reflect.TypeOf(map[string]any{})
+	timeType      = reflect.TypeOf(time.Time{})
+	durationType  = reflect.TypeOf(time.Duration(0))
+	byteSliceType = reflect.TypeOf([]byte(nil))
 
 	anyTypeSlice = []reflect.Type{anyType}
 )
@@ -55,6 +56,13 @@ type Checker struct {
 	varScopes       []varScope
 	err             *file.Error
 	needsReset      bool
+
+	// An overloaded function checks its arguments once per overload, so
+	// nested calls would take exponential time to check. While overloads
+	// are being tried (overloads > 0), visited caches the natures of call
+	// and builtin nodes for the rest of the pass.
+	overloads int
+	visited   map[ast.Node]Nature
 }
 
 type predicateScope struct {
@@ -163,6 +171,10 @@ func (v *Checker) reset(config *conf.Config) {
 		v.predicateScopes = v.predicateScopes[:0]
 		v.varScopes = v.varScopes[:0]
 		v.err = nil
+		v.overloads = 0
+		for k := range v.visited {
+			delete(v.visited, k)
+		}
 	}
 	v.needsReset = true
 
@@ -194,6 +206,8 @@ func (v *Checker) visit(node ast.Node) Nature {
 		nt = v.config.NtCache.FromType(boolType)
 	case *ast.StringNode:
 		nt = v.config.NtCache.FromType(stringType)
+	case *ast.BytesNode:
+		nt = v.config.NtCache.FromType(byteSliceType)
 	case *ast.ConstantNode:
 		nt = v.config.NtCache.FromType(reflect.TypeOf(n.Value))
 	case *ast.UnaryNode:
@@ -207,9 +221,21 @@ func (v *Checker) visit(node ast.Node) Nature {
 	case *ast.SliceNode:
 		nt = v.sliceNode(n)
 	case *ast.CallNode:
+		if v.overloads > 0 {
+			if cached, ok := v.visited[n]; ok {
+				return cached
+			}
+		}
 		nt = v.callNode(n)
+		v.remember(n, nt)
 	case *ast.BuiltinNode:
+		if v.overloads > 0 {
+			if cached, ok := v.visited[n]; ok {
+				return cached
+			}
+		}
 		nt = v.builtinNode(n)
+		v.remember(n, nt)
 	case *ast.PredicateNode:
 		nt = v.predicateNode(n)
 	case *ast.PointerNode:
@@ -233,6 +259,18 @@ func (v *Checker) visit(node ast.Node) Nature {
 	return nt
 }
 
+// remember caches the nature of a call node while overloads are being
+// tried, so that trying the next overload doesn't check it again.
+func (v *Checker) remember(node ast.Node, nt Nature) {
+	if v.overloads == 0 {
+		return
+	}
+	if v.visited == nil {
+		v.visited = make(map[ast.Node]Nature)
+	}
+	v.visited[node] = nt
+}
+
 func (v *Checker) error(node ast.Node, format string, args ...any) Nature {
 	if v.err == nil { // show first error
 		v.err = &file.Error{
@@ -249,7 +287,7 @@ func (v *Checker) identifierNode(node *ast.IdentifierNode) Nature {
 			return v.varScopes[i].nature
 		}
 	}
-	if node.Value == "$env" {
+	if node.Value == "$env" && !v.config.Disabled["$env"] {
 		return Nature{}
 	}
 
@@ -511,7 +549,7 @@ func (v *Checker) chainNode(node *ast.ChainNode) Nature {
 
 func (v *Checker) memberNode(node *ast.MemberNode) Nature {
 	// $env variable
-	if an, ok := node.Node.(*ast.IdentifierNode); ok && an.Value == "$env" {
+	if an, ok := node.Node.(*ast.IdentifierNode); ok && an.Value == "$env" && !v.config.Disabled["$env"] {
 		if name, ok := node.Property.(*ast.StringNode); ok {
 			strict := v.config.Strict
 			if node.Optional {
@@ -575,6 +613,15 @@ func (v *Checker) memberNode(node *ast.MemberNode) Nature {
 		}
 		return base.Elem(&v.config.NtCache)
 
+	case reflect.Interface:
+		// For non-any interface types, we don't know the concrete type at
+		// compile time. Allow field (non-method) access and defer resolution
+		// to runtime, where the concrete type can be inspected.
+		if name, ok := node.Property.(*ast.StringNode); ok && node.Method {
+			return v.error(node, "type %v has no method %v", base.String(), name.Value)
+		}
+		return Nature{}
+
 	case reflect.Struct:
 		if name, ok := node.Property.(*ast.StringNode); ok {
 			propertyName := name.Value
@@ -610,7 +657,12 @@ func (v *Checker) sliceNode(node *ast.SliceNode) Nature {
 	case reflect.String, reflect.Array, reflect.Slice:
 		// ok
 	default:
-		return v.error(node, "cannot slice %s", nt.String())
+		// Optional chaining only guards against a nil value, so it must not
+		// hide the error for a type that can never be sliced.
+		if !node.Optional || !nt.Nil {
+			return v.error(node, "cannot slice %s", nt.String())
+		}
+		nt = Nature{}
 	}
 
 	if node.From != nil {
@@ -646,6 +698,11 @@ func (v *Checker) callNode(node *ast.CallNode) Nature {
 	// with new correct function return type.
 	if typ := node.Type(); typ != nil && typ != anyType {
 		return *node.Nature()
+	}
+
+	// $env is not callable.
+	if id, ok := node.Callee.(*ast.IdentifierNode); ok && id.Value == "$env" && !v.config.Disabled["$env"] {
+		return v.error(node, "%s is not callable", v.config.Env.String())
 	}
 
 	nt := v.visit(node.Callee)
@@ -890,7 +947,10 @@ func (v *Checker) builtinNode(node *ast.BuiltinNode) Nature {
 		v.end()
 
 		if len(node.Arguments) == 3 {
-			_ = v.visit(node.Arguments[2])
+			order := v.visit(node.Arguments[2])
+			if !order.IsString() && !order.IsUnknown(&v.config.NtCache) {
+				return v.error(node.Arguments[2], "sortBy order argument must be a string (got %v)", order.String())
+			}
 		}
 
 		if predicate.IsFunc() &&
@@ -954,7 +1014,7 @@ func (v *Checker) checkBuiltinGet(node *ast.BuiltinNode) Nature {
 	prop := v.visit(node.Arguments[1])
 	prop = prop.Deref(&v.config.NtCache)
 
-	if id, ok := node.Arguments[0].(*ast.IdentifierNode); ok && id.Value == "$env" {
+	if id, ok := node.Arguments[0].(*ast.IdentifierNode); ok && id.Value == "$env" && !v.config.Disabled["$env"] {
 		if s, ok := node.Arguments[1].(*ast.StringNode); ok {
 			if nt, ok := v.config.Env.Get(&v.config.NtCache, s.Value); ok {
 				return nt
@@ -1008,6 +1068,10 @@ func (v *Checker) checkFunction(f *builtin.Function, node ast.Node, arguments []
 		}
 		// No type was specified, so we assume the function returns any.
 		return nt
+	}
+	if len(f.Types) > 1 {
+		v.overloads++
+		defer func() { v.overloads-- }()
 	}
 	var lastErr *file.Error
 	for _, t := range f.Types {
@@ -1112,7 +1176,7 @@ func (v *Checker) checkArguments(
 		if isVariadic && i >= fnNumIn-1 {
 			// For variadic arguments fn(xs ...int), go replaces type of xs (int) with ([]int).
 			// As we compare arguments one by one, we need underling type.
-			in = fn.InElem(&v.config.NtCache, fnNumIn-1)
+			in = fn.InElem(&v.config.NtCache, fnNumIn-1+fnInOffset)
 		} else {
 			in = fn.In(&v.config.NtCache, i+fnInOffset)
 		}

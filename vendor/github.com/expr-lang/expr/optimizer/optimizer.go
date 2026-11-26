@@ -40,8 +40,11 @@ func Optimize(node *Node, config *conf.Config) error {
 	Walk(node, &filterLast{})
 	Walk(node, &filterFirst{})
 	Walk(node, &predicateCombination{})
+	Walk(node, &sumRange{})
 	Walk(node, &sumArray{})
 	Walk(node, &sumMap{})
+	Walk(node, &countAny{})
+	Walk(node, &countThreshold{})
 	return nil
 }
 
@@ -73,7 +76,6 @@ func patchWithType(node *Node, newNode Node) {
 }
 
 func patchCopyType(node *Node, newNode Node) {
-	t := (*node).Type()
-	newNode.SetType(t)
+	newNode.SetNature(*(*node).Nature())
 	Patch(node, newNode)
 }
