@@ -297,6 +297,10 @@ type AlertsMutingRuleScheduleInput struct {
 type AlertsPoliciesSearchCriteriaInput struct {
 	// The list of policy ids to return.
 	IDs []string `json:"ids"`
+	// Exact name of the policy.
+	Name string `json:"name,omitempty"`
+	// String to partially match a policy name.
+	NameLike string `json:"nameLike,omitempty"`
 }
 
 // AlertsPoliciesSearchResultSet - Collection of policies with pagination information.
@@ -313,6 +317,8 @@ type AlertsPoliciesSearchResultSet struct {
 type AlertsPolicy struct {
 	// Account ID of the policy.
 	AccountID int `json:"accountId"`
+	// The entity GUID for the policy.
+	EntityGuid string `json:"entityGuid"`
 	// Primary key for policies.
 	ID string `json:"id"`
 	// Determines how incidents are created for critical violations of the conditions contained in the policy.

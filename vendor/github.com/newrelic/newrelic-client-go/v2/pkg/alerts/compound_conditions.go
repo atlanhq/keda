@@ -17,6 +17,9 @@ type CompoundCondition struct {
 	RunbookURL            string               `json:"runbookUrl,omitempty"`
 	ThresholdDuration     int                  `json:"thresholdDuration,omitempty"`
 	TriggerExpression     string               `json:"triggerExpression,omitempty"`
+	EntityGuid            string               `json:"entityGuid,omitempty"`
+	Description           string               `json:"description,omitempty"`
+	TitleTemplate         string               `json:"titleTemplate,omitempty"`
 }
 
 // ComponentCondition represents a component condition within a compound condition.
@@ -34,6 +37,8 @@ type CompoundConditionCreateInput struct {
 	RunbookURL            *string                   `json:"runbookUrl"`
 	ThresholdDuration     *int                      `json:"thresholdDuration"`
 	TriggerExpression     string                    `json:"triggerExpression"`
+	Description           *string                   `json:"description,omitempty"`
+	TitleTemplate         *string                   `json:"titleTemplate,omitempty"`
 }
 
 // CompoundConditionUpdateInput represents the input for updating a compound condition.
@@ -46,6 +51,8 @@ type CompoundConditionUpdateInput struct {
 	RunbookURL            *string                   `json:"runbookUrl"`
 	ThresholdDuration     *int                      `json:"thresholdDuration"`
 	TriggerExpression     *string                   `json:"triggerExpression"`
+	Description           *string                   `json:"description,omitempty"`
+	TitleTemplate         *string                   `json:"titleTemplate,omitempty"`
 }
 
 // ComponentConditionInput represents the input for a component condition within a compound condition.
@@ -271,12 +278,15 @@ const (
 			id
 			alias
 		}
+		description
 		enabled
+		entityGuid
 		facetMatchingBehavior
 		name
 		policyId
 		runbookUrl
 		thresholdDuration
+		titleTemplate
 		triggerExpression
 	`
 
