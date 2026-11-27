@@ -152,8 +152,13 @@ func CreateClientMiddleware(middleware CustomClientMiddleware) ClientMiddleware 
 					post.CallCompleted(csCtx, err)
 				}
 				if isHdrs {
-					hdrmd, _ := cs.Header()
-					hdrs.HeadersReceived(csCtx, metadata.Join(hdrmd, cs.Trailer()))
+					// Only retrieve headers and trailers if the stream completed successfully
+					// or with io.EOF. If the stream was cancelled or had an error before
+					// completion, headers/trailers may not be available.
+					if err == nil || errors.Is(err, io.EOF) {
+						hdrmd, _ := cs.Header()
+						hdrs.HeadersReceived(csCtx, metadata.Join(hdrmd, cs.Trailer()))
+					}
 				}
 			}
 			go func() {
@@ -169,6 +174,19 @@ func CreateClientMiddleware(middleware CustomClientMiddleware) ClientMiddleware 
 				ClientStream: cs,
 				desc:         desc,
 				finishFn:     finishFunc,
+			}
+			if isHdrs {
+				// Deliver response headers to the middleware as soon as they
+				// are first retrieved via Header(), rather than waiting for
+				// the stream to finish. This is necessary for streaming RPCs
+				// like Handshake where the caller may inspect headers (e.g.
+				// Set-Cookie) and issue subsequent RPCs before the stream
+				// reaches io.EOF (e.g. when the server sends a response
+				// payload that causes Recv to return a message instead of
+				// EOF). See GH-755.
+				newCS.onHeaders = func(md metadata.MD) {
+					hdrs.HeadersReceived(csCtx, md)
+				}
 			}
 			// The `ClientStream` interface allows one to omit calling `Recv` if it's
 			// known that the result will be `io.EOF`. See
@@ -188,12 +206,24 @@ type clientStream struct {
 	grpc.ClientStream
 	desc     *grpc.StreamDesc
 	finishFn func(error)
+
+	// onHeaders, when non-nil, is invoked at most once with the response
+	// metadata the first time Header() returns successfully. It allows
+	// middleware (e.g. cookie middleware) to observe server headers as
+	// soon as they arrive on streaming RPCs, rather than waiting for the
+	// stream to finish via finishFn. See GH-755.
+	onHeaders       func(md metadata.MD)
+	headersObserved atomic.Bool
 }
 
 func (cs *clientStream) Header() (metadata.MD, error) {
 	md, err := cs.ClientStream.Header()
 	if err != nil {
 		cs.finishFn(err)
+		return md, err
+	}
+	if cs.onHeaders != nil && cs.headersObserved.CompareAndSwap(false, true) {
+		cs.onHeaders(md)
 	}
 	return md, err
 }

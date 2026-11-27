@@ -114,6 +114,9 @@ func (blk fileBlock) NewMessage() (*Message, error) {
 		// messages produced prior to version 0.15.0
 		prefix = 4
 	}
+	if int(blk.meta)-prefix < 4 {
+		return nil, fmt.Errorf("arrow/ipc: invalid file block metadata length %d for prefix length %d", blk.meta, prefix)
+	}
 
 	// drop buf-size already known from blk.Meta
 	meta = memory.SliceBuffer(meta, prefix, int(blk.meta)-prefix)
@@ -843,8 +846,7 @@ func concreteTypeFromFB(typ flatbuf.Type, data flatbuffers.Table, children []arr
 
 		var dt flatbuf.Map
 		dt.Init(data.Bytes, data.Pos)
-		ret := arrow.MapOf(pairType.Field(0).Type, pairType.Field(1).Type)
-		ret.SetItemNullable(pairType.Field(1).Nullable)
+		ret := arrow.MapOfFields(pairType.Field(0), pairType.Field(1))
 		ret.KeysSorted = dt.KeysSorted()
 		return ret, nil
 
@@ -1141,13 +1143,15 @@ func writeFBBuilder(b *flatbuffers.Builder, mem memory.Allocator) *memory.Buffer
 	return buf
 }
 
-func writeMessageFB(b *flatbuffers.Builder, mem memory.Allocator, hdrType flatbuf.MessageHeader, hdr flatbuffers.UOffsetT, bodyLen int64) *memory.Buffer {
+func writeMessageFB(b *flatbuffers.Builder, mem memory.Allocator, hdrType flatbuf.MessageHeader, hdr flatbuffers.UOffsetT, bodyLen int64, customMetadata arrow.Metadata) *memory.Buffer {
+	metaFB := metadataToFB(b, customMetadata, flatbuf.MessageStartCustomMetadataVector)
 
 	flatbuf.MessageStart(b)
 	flatbuf.MessageAddVersion(b, flatbuf.MetadataVersion(currentMetadataVersion))
 	flatbuf.MessageAddHeaderType(b, hdrType)
 	flatbuf.MessageAddHeader(b, hdr)
 	flatbuf.MessageAddBodyLength(b, bodyLen)
+	flatbuf.MessageAddCustomMetadata(b, metaFB)
 	msg := flatbuf.MessageEnd(b)
 	b.Finish(msg)
 
@@ -1157,7 +1161,7 @@ func writeMessageFB(b *flatbuffers.Builder, mem memory.Allocator, hdrType flatbu
 func writeSchemaMessage(schema *arrow.Schema, mem memory.Allocator, dict *dictutils.Mapper) *memory.Buffer {
 	b := flatbuffers.NewBuilder(1024)
 	schemaFB := schemaToFB(b, schema, dict)
-	return writeMessageFB(b, mem, flatbuf.MessageHeaderSchema, schemaFB, 0)
+	return writeMessageFB(b, mem, flatbuf.MessageHeaderSchema, schemaFB, 0, arrow.Metadata{})
 }
 
 func writeFileFooter(schema *arrow.Schema, dicts, recs []dataBlock, w io.Writer) error {
@@ -1184,10 +1188,10 @@ func writeFileFooter(schema *arrow.Schema, dicts, recs []dataBlock, w io.Writer)
 	return err
 }
 
-func writeRecordMessage(mem memory.Allocator, size, bodyLength int64, fields []fieldMetadata, meta []bufferMetadata, codec flatbuf.CompressionType, variadicCounts []int64) *memory.Buffer {
+func writeRecordMessage(mem memory.Allocator, size, bodyLength int64, fields []fieldMetadata, meta []bufferMetadata, codec flatbuf.CompressionType, variadicCounts []int64, customMetadata arrow.Metadata) *memory.Buffer {
 	b := flatbuffers.NewBuilder(0)
 	recFB := recordToFB(b, size, bodyLength, fields, meta, codec, variadicCounts)
-	return writeMessageFB(b, mem, flatbuf.MessageHeaderRecordBatch, recFB, bodyLength)
+	return writeMessageFB(b, mem, flatbuf.MessageHeaderRecordBatch, recFB, bodyLength, customMetadata)
 }
 
 func writeDictionaryMessage(mem memory.Allocator, id int64, isDelta bool, size, bodyLength int64, fields []fieldMetadata, meta []bufferMetadata, codec flatbuf.CompressionType, variadicCounts []int64) *memory.Buffer {
@@ -1199,7 +1203,7 @@ func writeDictionaryMessage(mem memory.Allocator, id int64, isDelta bool, size, 
 	flatbuf.DictionaryBatchAddData(b, recFB)
 	flatbuf.DictionaryBatchAddIsDelta(b, isDelta)
 	dictFB := flatbuf.DictionaryBatchEnd(b)
-	return writeMessageFB(b, mem, flatbuf.MessageHeaderDictionaryBatch, dictFB, bodyLength)
+	return writeMessageFB(b, mem, flatbuf.MessageHeaderDictionaryBatch, dictFB, bodyLength, arrow.Metadata{})
 }
 
 func recordToFB(b *flatbuffers.Builder, size, bodyLength int64, fields []fieldMetadata, meta []bufferMetadata, codec flatbuf.CompressionType, variadicCounts []int64) flatbuffers.UOffsetT {
