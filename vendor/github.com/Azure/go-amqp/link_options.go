@@ -44,6 +44,16 @@ type SenderOptions struct {
 	// Properties sets an entry in the link properties map sent to the server.
 	Properties map[string]any
 
+	// OnLinkStateProperties is called when a flow frame with link state properties is received.
+	OnLinkStateProperties func(map[string]any)
+
+	// OnDeliveryStateChanged is called when the peer changes the delivery state of a sent message.
+	// state is the new delivery state reported by the peer.
+	//
+	// This callback is invoked from the link's mux goroutine.
+	// Blocking operations must not be performed inside this callback.
+	OnDeliveryStateChanged func(state DeliveryState)
+
 	// RequestedReceiverSettleMode sets the requested receiver settlement mode.
 	//
 	// If a settlement mode is explicitly set and the server does not
@@ -148,6 +158,20 @@ type ReceiverOptions struct {
 	// Properties sets an entry in the link properties map sent to the server.
 	Properties map[string]any
 
+	// OnLinkStateProperties is called when a flow frame with link state properties is received.
+	OnLinkStateProperties func(map[string]any)
+
+	// OnDeliveryStateChanged is called when the peer changes the delivery state of a received message.
+	// msg is the message whose delivery state changed; state is the new delivery state.
+	//
+	// The msg pointer is a copy of the originally received message, including its delivery tag and
+	// settlement handle. User code must not call AcceptMessage/RejectMessage/etc. on msg if the
+	// message has already been settled via a previous disposition call.
+	//
+	// This callback is invoked from the link's mux goroutine.
+	// Blocking operations must not be performed inside this callback.
+	OnDeliveryStateChanged func(msg *Message, state DeliveryState)
+
 	// RequestedSenderSettleMode sets the requested sender settlement mode.
 	//
 	// If a settlement mode is explicitly set and the server does not
@@ -183,6 +207,11 @@ type ReceiverOptions struct {
 	//
 	// Default: 0.
 	SourceExpiryTimeout uint32
+
+	// SourceDistributionMode sets the distribution mode on the source.
+	//
+	// Default: SourceDistributionModeMove (messages are consumed).
+	SourceDistributionMode SourceDistributionMode
 }
 
 // LinkFilter is an advanced API for setting non-standard source filters.

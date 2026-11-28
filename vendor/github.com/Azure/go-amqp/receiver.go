@@ -40,9 +40,18 @@ type Receiver struct {
 	settlementCount   uint32     // the count of settled messages
 	settlementCountMu sync.Mutex // must be held when accessing settlementCount
 
-	autoSendFlow bool     // automatically send flow frames as credit becomes available
-	inFlight     inFlight // used to track message disposition when rcv-settle-mode == second
-	creditor     creditor // manages credits via calls to IssueCredit/DrainCredit
+	autoSendFlow          bool                 // automatically send flow frames as credit becomes available
+	inFlight              inFlight             // used to track message disposition when rcv-settle-mode == second
+	creditor              creditor             // manages credits via calls to IssueCredit/DrainCredit
+	onLinkStateProperties func(map[string]any) // callback for when link props are set in the flow frame
+
+	// onDeliveryStateChanged is the user-supplied callback for peer-initiated delivery state changes.
+	onDeliveryStateChanged func(*Message, DeliveryState)
+	// incomingDeliveries tracks unsettled received messages by delivery ID.
+	// It is only populated when onDeliveryStateChanged is set.
+	// Access must be guarded by incomingDeliveriesMu.
+	incomingDeliveries   map[uint32]*Message
+	incomingDeliveriesMu sync.Mutex
 }
 
 // IssueCredit adds credits to be requested in the next flow request.
@@ -318,6 +327,15 @@ func (r *Receiver) messageDisposition(ctx context.Context, msg *Message, state e
 
 	debug.Assert(r != nil)
 
+	// Remove from incoming delivery tracking so that a subsequent peer disposition for this
+	// delivery does not trigger the OnDeliveryStateChanged callback after the user has already
+	// settled the message.
+	if r.onDeliveryStateChanged != nil {
+		r.incomingDeliveriesMu.Lock()
+		delete(r.incomingDeliveries, msg.deliveryID)
+		r.incomingDeliveriesMu.Unlock()
+	}
+
 	// NOTE: we MUST add to the in-flight map before sending the disposition. if not, it's possible
 	// to receive the ack'ing disposition frame *before* the in-flight map has been updated which
 	// will cause the below <-wait to never trigger.
@@ -499,6 +517,15 @@ func newReceiver(source string, session *Session, opts *ReceiverOptions) (*Recei
 	if opts.SourceExpiryTimeout != 0 {
 		r.l.source.Timeout = opts.SourceExpiryTimeout
 	}
+	if opts.SourceDistributionMode != "" {
+		r.l.source.DistributionMode = opts.SourceDistributionMode
+	}
+	r.onLinkStateProperties = opts.OnLinkStateProperties
+	if opts.OnDeliveryStateChanged != nil {
+		r.onDeliveryStateChanged = opts.OnDeliveryStateChanged
+		r.incomingDeliveries = make(map[uint32]*Message)
+		r.l.trackIncomingDeliveries = true
+	}
 	return r, nil
 }
 
@@ -550,6 +577,21 @@ func (r *Receiver) mux(hooks receiverTestHooks) {
 	defer func() {
 		// unblock any in flight message dispositions
 		r.inFlight.clear(r.l.doneErr)
+
+		// When a link shuts down, any messages stored in incomingDeliveries that never received
+		// a peer Disposition frame would keep their *Message pointers alive indefinitely,
+		// causing a memory leak. Replacing the map with make(map[uint32]*Message)
+		// on defer releases all those references,
+		// allowing the GC to reclaim them. Using make(...)
+		// instead of nil also prevents nil-map panics in case concurrent code
+		// (guarded by the mutex) accesses the map after the mux loop exits.
+		// In essence: it's a defensive memory cleanup that prevents leaked message
+		// references when the link closes.
+		if r.onDeliveryStateChanged != nil {
+			r.incomingDeliveriesMu.Lock()
+			r.incomingDeliveries = make(map[uint32]*Message)
+			r.incomingDeliveriesMu.Unlock()
+		}
 
 		if !r.autoSendFlow {
 			// unblock any pending drain requests
@@ -710,6 +752,14 @@ func (r *Receiver) muxHandleFrame(fr frames.FrameBody) error {
 
 	// flow control frame
 	case *frames.PerformFlow:
+		if fr.Properties != nil && r.onLinkStateProperties != nil {
+			props := make(map[string]any)
+			for k, v := range fr.Properties {
+				props[string(k)] = v
+			}
+			r.onLinkStateProperties(props)
+		}
+
 		if !fr.Echo {
 			// if the 'drain' flag has been set in the frame sent to the _receiver_ then
 			// we signal whomever is waiting (the service has seen and acknowledged our drain)
@@ -759,6 +809,26 @@ func (r *Receiver) muxHandleFrame(fr frames.FrameBody) error {
 			msg.onSettlement()
 		})
 		r.onSettlement(count)
+
+		// fire the peer-initiated delivery state change callback for any tracked deliveries
+		// that were not already handled by the in-flight RSM==second path.
+		if r.onDeliveryStateChanged != nil {
+			end := fr.First
+			if fr.Last != nil {
+				end = *fr.Last
+			}
+			for deliveryID := fr.First; deliveryID <= end; deliveryID++ {
+				r.incomingDeliveriesMu.Lock()
+				msg, ok := r.incomingDeliveries[deliveryID]
+				if ok {
+					delete(r.incomingDeliveries, deliveryID)
+				}
+				r.incomingDeliveriesMu.Unlock()
+				if ok {
+					r.onDeliveryStateChanged(msg, fr.State)
+				}
+			}
+		}
 
 	default:
 		return r.l.muxHandleFrame(fr)
@@ -864,6 +934,15 @@ func (r *Receiver) muxReceive(fr frames.PerformTransfer) {
 		r.addUnsettled()
 		r.msg.rcv = r
 		debug.Log(3, "RX (Receiver %p): add unsettled delivery ID %d", r, r.msg.deliveryID)
+	}
+
+	// Record a shallow copy of the message for peer-initiated delivery state change notifications.
+	// The copy is made before the queue enqueue so that we capture rcv and deliveryID.
+	if r.onDeliveryStateChanged != nil && !r.msg.settled {
+		msgCopy := r.msg
+		r.incomingDeliveriesMu.Lock()
+		r.incomingDeliveries[r.msg.deliveryID] = &msgCopy
+		r.incomingDeliveriesMu.Unlock()
 	}
 
 	q := r.messagesQ.Acquire()
