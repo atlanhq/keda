@@ -150,16 +150,21 @@ type BasicAuthValidator interface {
 
 func createServerBearerTokenUnaryInterceptor(validator BasicAuthValidator) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		var auth string
+		var scheme, credential string
 		md, ok := metadata.FromIncomingContext(ctx)
 		if ok {
 			vals := md.Get(basicAuthHeader)
-			if len(vals) > 0 && strings.HasPrefix(vals[0], bearerTokenPrefix) {
-				auth = vals[0][len(bearerTokenPrefix)+1:]
+			if len(vals) > 0 {
+				scheme, credential, _ = strings.Cut(strings.TrimSpace(vals[0]), " ")
+				credential = strings.TrimLeft(credential, " ")
 			}
 		}
 
-		identity, err := validator.IsValid(auth)
+		if scheme != bearerTokenPrefix || credential == "" {
+			return nil, status.Error(codes.Unauthenticated, "must authenticate first")
+		}
+
+		identity, err := validator.IsValid(credential)
 		if err != nil {
 			return nil, err
 		}
@@ -170,43 +175,50 @@ func createServerBearerTokenUnaryInterceptor(validator BasicAuthValidator) grpc.
 
 func createServerBearerTokenStreamInterceptor(validator BasicAuthValidator) grpc.StreamServerInterceptor {
 	return func(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		var auth []string
+		var scheme, credential string
 		md, ok := metadata.FromIncomingContext(stream.Context())
 		if ok {
-			auth = md.Get(basicAuthHeader)
+			auth := md.Get(basicAuthHeader)
 			if len(auth) > 0 {
-				auth = strings.Split(auth[0], " ")
+				s := strings.TrimSpace(auth[0])
+				scheme, credential, _ = strings.Cut(s, " ")
+				credential = strings.TrimLeft(credential, " ") // only trim SP per HTTP auth format, keep trailing spaces.
 			}
 		}
 
-		if len(auth) == 0 {
+		if scheme == "" || credential == "" {
 			return status.Error(codes.Unauthenticated, "must authenticate first")
 		}
 
 		if strings.HasSuffix(info.FullMethod, "/Handshake") {
-			if auth[0] == basicAuthPrefix {
-				val, err := base64.RawStdEncoding.DecodeString(auth[1])
+			if scheme == basicAuthPrefix {
+				val, err := base64.RawStdEncoding.DecodeString(credential)
 				if err != nil {
-					val, err = base64.StdEncoding.DecodeString(auth[1])
+					val, err = base64.StdEncoding.DecodeString(credential)
 					if err != nil {
 						return status.Errorf(codes.Unauthenticated, "invalid basic auth encoding: %s", err)
 					}
 				}
 
-				creds := strings.SplitN(string(val), ":", 2)
-				token, err := validator.Validate(creds[0], creds[1])
+				username, password, found := strings.Cut(string(val), ":")
+				if !found {
+					return status.Error(codes.Unauthenticated, "invalid basic auth credentials")
+				}
+				token, err := validator.Validate(username, password)
 				if err != nil {
 					return err
 				}
 
-				stream.SetTrailer(metadata.New(map[string]string{basicAuthHeader: strings.Join([]string{bearerTokenPrefix, token}, " ")}))
+				stream.SetTrailer(metadata.New(map[string]string{
+					basicAuthHeader: bearerTokenPrefix + " " + token,
+				}))
 				return handler(srv, stream)
 			}
 			return status.Errorf(codes.Unauthenticated, "only Basic Auth implemented")
 		}
 
-		if auth[0] == bearerTokenPrefix {
-			identity, err := validator.IsValid(auth[1])
+		if scheme == bearerTokenPrefix {
+			identity, err := validator.IsValid(credential)
 			if err != nil {
 				return err
 			}
